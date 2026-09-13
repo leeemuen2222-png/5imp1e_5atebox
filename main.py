@@ -5,15 +5,15 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QRectF, QPointF, Signal, QSize, QTimer
-from PySide6.QtGui import QColor, QPainter, QPen, QBrush, QFont, QPainterPath, QPixmap
+from PySide6.QtGui import QColor, QPainter, QPen, QBrush, QFont, QPainterPath, QPixmap, QIntValidator
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel,
     QPushButton, QFrame, QButtonGroup, QStackedWidget, QSizePolicy,
-    QGraphicsDropShadowEffect
+    QGraphicsDropShadowEffect, QLineEdit
 )
 
 APP_NAME = "5imp1e 5atebox"
-APP_VERSION = "0.6.2"
+APP_VERSION = "0.6.3"
 BASE_DIR = Path(__file__).resolve().parent
 RESOURCE_DIR = BASE_DIR / "resource"
 
@@ -124,6 +124,8 @@ class TarotStage(QWidget):
         # Real shuffle state.
         self.shuffle_rounds = 3
         self.shuffle_round = 0
+        self.cut_groups = 2
+        self.shuffle_stop_requested = False
         self.round_input = []
         self.left_pile = []
         self.right_pile = []
@@ -166,11 +168,14 @@ class TarotStage(QWidget):
         self.manual_take_duration = 0.52
         self.manual_rest_gather_duration = 0.72
 
-        # Manual spread physics. The landed position remains the physical base pose;
-        # transient offsets let a fast cursor brush nearby cards aside without
-        # changing which card they actually are or permanently rearranging the deck.
+        # Manual spread physics. Fast cursor motion can brush cards aside.
+        # Cards no longer return all the way to their original landing pose: each
+        # disturbed card keeps a random 40%-80% of its furthest displacement.
         self.scatter_velocity = {}
         self.scatter_offset = {}
+        self.scatter_rest_offset = {}
+        self.scatter_peak_offset = {}
+        self.scatter_retention = {}
         self._last_mouse_pos = None
         self._last_mouse_time = 0.0
         self._last_tick_time = time.perf_counter()
@@ -205,7 +210,78 @@ class TarotStage(QWidget):
         if not self._timer.isActive():
             self._timer.start()
 
-    def start_shuffle(self, allow_reversed=True, major_only=False):
+    def _apply_multi_cut(self, order, groups):
+        """Cut the physical deck into N contiguous packets, then re-stack them.
+
+        Internal packet order is preserved.  Only packet order changes, so this is a
+        real cut rather than an extra random.shuffle().
+        """
+        order = list(order)
+        n = len(order)
+        groups = max(1, min(int(groups), n)) if n else 1
+        if groups <= 1 or n <= 1:
+            return order
+
+        # Produce non-empty packet sizes around an even split, with small natural jitter.
+        remaining = n
+        sizes = []
+        for i in range(groups - 1):
+            left_groups = groups - i
+            ideal = remaining / left_groups
+            jitter = random.gauss(0.0, max(0.6, ideal * 0.12))
+            size = int(round(ideal + jitter))
+            min_size = 1
+            max_size = remaining - (left_groups - 1)
+            size = max(min_size, min(max_size, size))
+            sizes.append(size)
+            remaining -= size
+        sizes.append(remaining)
+
+        packets = []
+        pos = 0
+        for size in sizes:
+            packets.append(order[pos:pos + size])
+            pos += size
+
+        # A cut normally relocates whole packets.  Use a random rotation and, for
+        # 3+ groups, occasionally swap two neighboring packets for a hand-cut feel.
+        shift = random.randrange(1, len(packets)) if len(packets) > 1 else 0
+        packets = packets[shift:] + packets[:shift]
+        if len(packets) >= 3 and random.random() < 0.45:
+            i = random.randrange(0, len(packets) - 1)
+            packets[i], packets[i + 1] = packets[i + 1], packets[i]
+
+        out = []
+        for packet in packets:
+            out.extend(packet)
+        return out
+
+    def request_stop_shuffle(self):
+        """Ask the physical shuffle to stop at the nearest safe point."""
+        shuffle_states = {"gather", "split", "riffle", "square"}
+        if self.state not in shuffle_states:
+            return False
+
+        # Before cards start interleaving there is no partial physical order to
+        # preserve, so stopping can be immediate.
+        if self.state in {"gather", "split"}:
+            self.shuffle_stop_requested = False
+            if not self.major_only:
+                self.deck_order = self.active_order[:]
+            self.state = "shuffled"
+            self.state_started = time.perf_counter()
+            self.animationStatus.emit("洗牌已终止 · 当前牌序已保留")
+            self.shuffleFinished.emit()
+            self.update()
+            return True
+
+        # During an actual riffle, finish the cards already in motion and stop once
+        # the deck is squared.  This prevents cards from snapping/disappearing.
+        self.shuffle_stop_requested = True
+        self.animationStatus.emit("终止已请求 · 将在本次交错整理完成后停止")
+        return True
+
+    def start_shuffle(self, allow_reversed=True, major_only=False, riffle_rounds=3, cut_groups=2):
         if self.state not in ("idle", "done", "shuffled"):
             return
         if len(self.cards) < 22:
@@ -218,6 +294,9 @@ class TarotStage(QWidget):
         self.manual_mode = False
         self.allow_reversed = allow_reversed
         self.major_only = major_only
+        self.shuffle_rounds = max(1, min(50, int(riffle_rounds)))
+        self.cut_groups = max(1, min(20, int(cut_groups)))
+        self.shuffle_stop_requested = False
 
         # Start from the current physical order for a full deck. For a major-only
         # reading, retain the relative physical order of major cards.
@@ -230,6 +309,12 @@ class TarotStage(QWidget):
             seen = set(self.deck_order)
             self.active_order = self.deck_order[:] + [cid for cid in pool if cid not in seen]
             self.active_order = [cid for cid in self.active_order if cid in set(pool)]
+
+        # Apply the requested physical multi-cut before riffle shuffles.  Packets
+        # stay intact; only their stack order changes.
+        self.active_order = self._apply_multi_cut(self.active_order, self.cut_groups)
+        if not self.major_only:
+            self.deck_order = self.active_order[:]
 
         # Reversal is a property of the physical card, not of the final draw.
         # We rotate a random subset before shuffling, then that orientation travels
@@ -251,13 +336,13 @@ class TarotStage(QWidget):
         self.round_input = self.active_order[:]
         self.state = "gather"
         self.state_started = time.perf_counter()
-        self.animationStatus.emit("正在收拢实体牌组")
+        self.animationStatus.emit(f"正在切牌 · {self.cut_groups} 组 / Riffle {self.shuffle_rounds} 次")
         self._ensure_timer()
         self.update()
 
     def start(self, count=3, allow_reversed=True, major_only=False):
         # Backward-compatible alias: start now performs shuffling only.
-        self.start_shuffle(allow_reversed=allow_reversed, major_only=major_only)
+        self.start_shuffle(allow_reversed=allow_reversed, major_only=major_only, riffle_rounds=self.shuffle_rounds, cut_groups=self.cut_groups)
 
     def draw_from_deck(self, count=3, major_only=False):
         if self.state not in ("idle", "shuffled", "done"):
@@ -351,6 +436,9 @@ class TarotStage(QWidget):
         self.scatter_pose = {}
         self.scatter_velocity = {}
         self.scatter_offset = {}
+        self.scatter_rest_offset = {}
+        self.scatter_peak_offset = {}
+        self.scatter_retention = {}
         n = max(1, len(self.scatter_order))
 
         # Keep the cards small enough that nearly every one remains visually exposed.
@@ -413,6 +501,9 @@ class TarotStage(QWidget):
             }
             self.scatter_velocity[cid] = QPointF(0.0, 0.0)
             self.scatter_offset[cid] = QPointF(0.0, 0.0)
+            self.scatter_rest_offset[cid] = QPointF(0.0, 0.0)
+            self.scatter_peak_offset[cid] = QPointF(0.0, 0.0)
+            self.scatter_retention[cid] = random.uniform(0.40, 0.80)
             max_end = max(max_end, delay + duration)
         self.scatter_drop_total = max_end + .12
         self._last_mouse_pos = None
@@ -454,30 +545,60 @@ class TarotStage(QWidget):
             return False
         active = False
         selected = set(self.selected_indices)
-        # Gentle spring back + strong damping: cards are brushed away briefly rather
-        # than drifting forever or losing their recognizable landing position.
-        spring = 24.0
-        damping = math.exp(-8.0 * dt)
+
+        # Cards settle toward a retained offset instead of returning to their
+        # original landing point.  The retained offset follows 40%-80% of the
+        # furthest displacement reached from the original pose.
+        spring = 26.0
+        damping = math.exp(-6.8 * dt)
+        snap_distance = 0.22
+        snap_speed = 5.0
+
         for cid in self.scatter_order:
             if cid in selected:
                 continue
             off = self.scatter_offset.get(cid, QPointF())
             vel = self.scatter_velocity.get(cid, QPointF())
-            vx = vel.x() - off.x() * spring * dt
-            vy = vel.y() - off.y() * spring * dt
+            rest = self.scatter_rest_offset.get(cid, QPointF())
+            peak = self.scatter_peak_offset.get(cid, QPointF())
+            retention = self.scatter_retention.get(cid, 0.60)
+
+            # While the card is still travelling outward, keep updating the
+            # furthest point and move its future resting place to 40%-80% of it.
+            off_mag = math.hypot(off.x(), off.y())
+            peak_mag = math.hypot(peak.x(), peak.y())
+            if off_mag > peak_mag + 0.10:
+                peak = QPointF(off)
+                rest = QPointF(off.x() * retention, off.y() * retention)
+                self.scatter_peak_offset[cid] = peak
+                self.scatter_rest_offset[cid] = rest
+
+            dx = off.x() - rest.x()
+            dy = off.y() - rest.y()
+            vx = vel.x() - dx * spring * dt
+            vy = vel.y() - dy * spring * dt
             vx *= damping
             vy *= damping
             ox = off.x() + vx * dt
             oy = off.y() + vy * dt
-            # Limit displacement so cards still look like part of the spread.
+
+            # Keep the spread readable even after repeated cursor brushes.
             mag = math.hypot(ox, oy)
-            if mag > 42.0:
-                scale = 42.0 / mag
-                ox *= scale; oy *= scale
+            if mag > 52.0:
+                scale = 52.0 / mag
+                ox *= scale
+                oy *= scale
+
+            # Snap to the retained position, not to zero.
+            if math.hypot(ox - rest.x(), oy - rest.y()) <= snap_distance and math.hypot(vx, vy) <= snap_speed:
+                ox, oy = rest.x(), rest.y()
+                vx = vy = 0.0
+            else:
+                active = True
+
             self.scatter_velocity[cid] = QPointF(vx, vy)
             self.scatter_offset[cid] = QPointF(ox, oy)
-            if abs(vx) + abs(vy) > 2.0 or abs(ox) + abs(oy) > .7:
-                active = True
+
         return active
 
     def _repel_scatter_from_cursor(self, pos, cursor_speed):
@@ -508,6 +629,8 @@ class TarotStage(QWidget):
                 vel.x() + nx * strength * weight,
                 vel.y() + ny * strength * weight,
             )
+            # Each fresh brush leaves a slightly different amount of displacement.
+            self.scatter_retention[cid] = random.uniform(0.40, 0.80)
 
     def _manual_card_hit(self, pos):
         selected = set(self.selected_indices)
@@ -629,7 +752,13 @@ class TarotStage(QWidget):
                 if not self.major_only:
                     self.deck_order = self.active_order[:]
                 self.shuffle_round += 1
-                if self.shuffle_round < self.shuffle_rounds:
+                if self.shuffle_stop_requested:
+                    self.shuffle_stop_requested = False
+                    self.state = "shuffled"
+                    self.state_started = now
+                    self.animationStatus.emit(f"洗牌已终止 · 已完成 {self.shuffle_round} 次 Riffle")
+                    self.shuffleFinished.emit()
+                elif self.shuffle_round < self.shuffle_rounds:
                     self._prepare_riffle_round()
                     self.state = "split"
                     self.state_started = now
@@ -1434,6 +1563,13 @@ class TarotPage(QWidget):
         self.shuffle_button.setFixedSize(92, 44)
         action_col.addWidget(self.shuffle_button)
 
+        self.stop_shuffle_button = QPushButton("终止洗牌")
+        self.stop_shuffle_button.setObjectName("dangerChipButton")
+        self.stop_shuffle_button.setCursor(Qt.PointingHandCursor)
+        self.stop_shuffle_button.setFixedSize(104, 44)
+        self.stop_shuffle_button.setEnabled(False)
+        action_col.addWidget(self.stop_shuffle_button)
+
         self.draw_button = QPushButton("抽取")
         self.draw_button.setObjectName("primaryButton")
         self.draw_button.setCursor(Qt.PointingHandCursor)
@@ -1468,6 +1604,27 @@ class TarotPage(QWidget):
             cfg.addWidget(b)
         self.count_group.idClicked.connect(self._set_count)
 
+        cfg.addSpacing(10)
+        riffle_label = QLabel("Riffle 次数")
+        riffle_label.setObjectName("settingNote")
+        cfg.addWidget(riffle_label)
+        self.riffle_input = QLineEdit("3")
+        self.riffle_input.setObjectName("numberInput")
+        self.riffle_input.setAlignment(Qt.AlignCenter)
+        self.riffle_input.setValidator(QIntValidator(1, 50, self))
+        self.riffle_input.setFixedSize(54, 36)
+        cfg.addWidget(self.riffle_input)
+
+        cut_label = QLabel("Cut 组数")
+        cut_label.setObjectName("settingNote")
+        cfg.addWidget(cut_label)
+        self.cut_input = QLineEdit("2")
+        self.cut_input.setObjectName("numberInput")
+        self.cut_input.setAlignment(Qt.AlignCenter)
+        self.cut_input.setValidator(QIntValidator(1, 20, self))
+        self.cut_input.setFixedSize(54, 36)
+        cfg.addWidget(self.cut_input)
+
         cfg.addStretch(1)
         self.reverse_chip = MiniSwitch("允许逆位", True)
         self.major_chip = MiniSwitch("仅大阿卡纳", False)
@@ -1489,6 +1646,7 @@ class TarotPage(QWidget):
         outer.addLayout(status_row)
 
         self.shuffle_button.clicked.connect(self._shuffle_clicked)
+        self.stop_shuffle_button.clicked.connect(self._stop_shuffle_clicked)
         self.draw_button.clicked.connect(self._draw_clicked)
         self.manual_button.clicked.connect(self._manual_clicked)
         self.stage.animationStatus.connect(self.status.setText)
@@ -1506,15 +1664,41 @@ class TarotPage(QWidget):
             b.setEnabled(enabled)
         self.reverse_chip.setEnabled(enabled)
         self.major_chip.setEnabled(enabled)
+        self.riffle_input.setEnabled(enabled)
+        self.cut_input.setEnabled(enabled)
+        # Stop is intentionally the inverse during a running shuffle.
+        shuffle_running = self.stage.state in ("gather", "split", "riffle", "square")
+        self.stop_shuffle_button.setEnabled(shuffle_running)
 
     def _shuffle_clicked(self):
         if self.stage.state not in ("idle", "done", "shuffled"):
             return
+        try:
+            riffles = int(self.riffle_input.text() or "3")
+        except ValueError:
+            riffles = 3
+        try:
+            cut_groups = int(self.cut_input.text() or "2")
+        except ValueError:
+            cut_groups = 2
+        riffles = max(1, min(50, riffles))
+        cut_groups = max(1, min(20, cut_groups))
+        self.riffle_input.setText(str(riffles))
+        self.cut_input.setText(str(cut_groups))
+
         self._set_controls_enabled(False)
         self.stage.start_shuffle(
             allow_reversed=self.reverse_chip.isChecked(),
             major_only=self.major_chip.isChecked(),
+            riffle_rounds=riffles,
+            cut_groups=cut_groups,
         )
+        self.stop_shuffle_button.setEnabled(self.stage.state in ("gather", "split", "riffle", "square"))
+
+    def _stop_shuffle_clicked(self):
+        if self.stage.request_stop_shuffle():
+            # Keep regular controls locked until the stage emits shuffleFinished.
+            self.stop_shuffle_button.setEnabled(False)
 
     def _shuffle_finished(self):
         self._set_controls_enabled(True)
@@ -1855,6 +2039,26 @@ QPushButton#chipButton:checked {
     background: #1a1a1a;
     border-color: #4b4b4b;
 }
+QPushButton#dangerChipButton {
+    background: #121010;
+    color: #a9a1a1;
+    border: 1px solid #342828;
+    border-radius: 10px;
+    padding: 0 14px;
+}
+QPushButton#dangerChipButton:hover { color: #ededed; border-color: #5a3b3b; }
+QPushButton#dangerChipButton:disabled { color: #4b4545; border-color: #242020; background: #0d0c0c; }
+QLineEdit#numberInput {
+    background: #0c0c0c;
+    color: #e2e2e2;
+    border: 1px solid #303030;
+    border-radius: 8px;
+    padding: 2px 6px;
+    selection-background-color: #303030;
+}
+QLineEdit#numberInput:focus { border-color: #666666; }
+QLineEdit#numberInput:disabled { color: #555555; border-color: #202020; }
+
 QPushButton#primaryButton {
     color: #080808;
     background: #e8e8e8;
