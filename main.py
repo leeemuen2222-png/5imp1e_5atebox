@@ -126,6 +126,14 @@ class TarotStage(QWidget):
         self.shuffle_round = 0
         self.cut_groups = 2
         self.shuffle_stop_requested = False
+        # Multi-cut is animated as real persistent card packets.  Each packet keeps
+        # the same PhysicalCard ids and internal order from split -> movement -> restack.
+        self.cut_packets = []
+        self.cut_packet_order = []
+        self.cut_output = []
+        self.cut_card_packet = {}
+        self.cut_card_rank = {}
+        self.cut_target_rank = {}
         self.round_input = []
         self.left_pile = []
         self.right_pile = []
@@ -137,6 +145,9 @@ class TarotStage(QWidget):
 
         # Timings deliberately favor visible physical motion over speed.
         self.gather_duration = 0.52
+        self.cut_spread_duration = 0.82
+        self.cut_packet_gap = 0.11
+        self.cut_packet_move_duration = 0.46
         self.split_duration = 0.62
         self.release_gap = 0.018
         self.release_move_duration = 0.30
@@ -256,15 +267,101 @@ class TarotStage(QWidget):
             out.extend(packet)
         return out
 
+    def _prepare_multi_cut_plan(self, order, groups):
+        """Build an explicit packet plan for the visible multi-cut animation.
+
+        The deck is split into exactly ``groups`` contiguous physical packets.  We
+        retain every PhysicalCard id inside its packet and preserve packet-internal
+        order.  A packet-level rotation (plus the same occasional neighbor swap)
+        determines the final stack order.
+        """
+        order = list(order)
+        n = len(order)
+        groups = max(1, min(int(groups), n)) if n else 1
+        if not order:
+            self.cut_packets = []
+            self.cut_packet_order = []
+            self.cut_output = []
+            self.cut_card_packet = {}
+            self.cut_card_rank = {}
+            self.cut_target_rank = {}
+            return
+
+        remaining = n
+        sizes = []
+        for i in range(groups - 1):
+            left_groups = groups - i
+            ideal = remaining / left_groups
+            jitter = random.gauss(0.0, max(0.6, ideal * 0.12))
+            size = int(round(ideal + jitter))
+            size = max(1, min(remaining - (left_groups - 1), size))
+            sizes.append(size)
+            remaining -= size
+        sizes.append(remaining)
+
+        packets = []
+        pos = 0
+        for size in sizes:
+            packets.append(order[pos:pos + size])
+            pos += size
+
+        packet_order = list(range(len(packets)))
+        if len(packet_order) > 1:
+            shift = random.randrange(1, len(packet_order))
+            packet_order = packet_order[shift:] + packet_order[:shift]
+        if len(packet_order) >= 3 and random.random() < 0.45:
+            i = random.randrange(0, len(packet_order) - 1)
+            packet_order[i], packet_order[i + 1] = packet_order[i + 1], packet_order[i]
+
+        output = []
+        for pi in packet_order:
+            output.extend(packets[pi])
+
+        self.cut_packets = packets
+        self.cut_packet_order = packet_order
+        self.cut_output = output
+        self.cut_card_packet = {}
+        self.cut_card_rank = {}
+        self.cut_target_rank = {}
+        for pi, packet in enumerate(packets):
+            for rank, cid in enumerate(packet):
+                self.cut_card_packet[cid] = pi
+                self.cut_card_rank[cid] = rank
+        for rank, cid in enumerate(output):
+            self.cut_target_rank[cid] = rank
+
+    def _cut_group_rect(self, packet_index):
+        """Visible table position of one cut packet; supports up to 20 groups."""
+        count = max(1, len(self.cut_packets))
+        cols = min(5, count)
+        rows = int(math.ceil(count / cols))
+        area = QRectF(self.width() * .08, self.height() * .18, self.width() * .84, self.height() * .48)
+        cell_w = area.width() / cols
+        cell_h = area.height() / rows
+        row = packet_index // cols
+        col = packet_index % cols
+        # Keep 2:3 card proportion while leaving unmistakable gaps between groups.
+        cw = min(82.0, max(42.0, cell_w * .48))
+        ch = cw * 1.52
+        if ch > cell_h * .72:
+            ch = max(62.0, cell_h * .72)
+            cw = ch / 1.52
+        cx = area.left() + (col + .5) * cell_w
+        cy = area.top() + (row + .5) * cell_h
+        return QRectF(cx - cw/2, cy - ch/2, cw, ch)
+
+    def _cut_restack_total_duration(self):
+        return max(.46, (max(1, len(self.cut_packet_order)) - 1) * self.cut_packet_gap + self.cut_packet_move_duration)
+
     def request_stop_shuffle(self):
         """Ask the physical shuffle to stop at the nearest safe point."""
-        shuffle_states = {"gather", "split", "riffle", "square"}
+        shuffle_states = {"gather", "cut_spread", "cut_restack", "split", "riffle", "square"}
         if self.state not in shuffle_states:
             return False
 
         # Before cards start interleaving there is no partial physical order to
         # preserve, so stopping can be immediate.
-        if self.state in {"gather", "split"}:
+        if self.state in {"gather"}:
             self.shuffle_stop_requested = False
             if not self.major_only:
                 self.deck_order = self.active_order[:]
@@ -275,10 +372,13 @@ class TarotStage(QWidget):
             self.update()
             return True
 
-        # During an actual riffle, finish the cards already in motion and stop once
-        # the deck is squared.  This prevents cards from snapping/disappearing.
+        # During a visible cut/riffle, finish the current physical operation first.
+        # This prevents bound cards from snapping or disappearing mid-movement.
         self.shuffle_stop_requested = True
-        self.animationStatus.emit("终止已请求 · 将在本次交错整理完成后停止")
+        if self.state in {"cut_spread", "cut_restack"}:
+            self.animationStatus.emit("终止已请求 · 将在当前 Cut 重新叠放完成后停止")
+        else:
+            self.animationStatus.emit("终止已请求 · 将在本次交错整理完成后停止")
         return True
 
     def start_shuffle(self, allow_reversed=True, major_only=False, riffle_rounds=3, cut_groups=2):
@@ -310,11 +410,10 @@ class TarotStage(QWidget):
             self.active_order = self.deck_order[:] + [cid for cid in pool if cid not in seen]
             self.active_order = [cid for cid in self.active_order if cid in set(pool)]
 
-        # Apply the requested physical multi-cut before riffle shuffles.  Packets
-        # stay intact; only their stack order changes.
-        self.active_order = self._apply_multi_cut(self.active_order, self.cut_groups)
-        if not self.major_only:
-            self.deck_order = self.active_order[:]
+        # Build, but do not instantly apply, the requested physical multi-cut.
+        # The cut is committed only after the user has actually seen all N bound
+        # packets separate and re-stack on screen.
+        self._prepare_multi_cut_plan(self.active_order, self.cut_groups)
 
         # Reversal is a property of the physical card, not of the final draw.
         # We rotate a random subset before shuffling, then that orientation travels
@@ -725,10 +824,43 @@ class TarotStage(QWidget):
         if self.state == "gather":
             animation_active = True
             if elapsed >= self.gather_duration:
-                self._prepare_riffle_round()
-                self.state = "split"
+                if self.cut_groups > 1 and self.cut_packets:
+                    self.state = "cut_spread"
+                    self.state_started = now
+                    self.animationStatus.emit(f"Cut · 正在展开 {len(self.cut_packets)} 组实体牌堆")
+                else:
+                    self.active_order = self.cut_output[:] if self.cut_output else self.active_order
+                    if not self.major_only:
+                        self.deck_order = self.active_order[:]
+                    self._prepare_riffle_round()
+                    self.state = "split"
+                    self.state_started = now
+                    self.animationStatus.emit(f"真实洗牌 {self.shuffle_round + 1}/{self.shuffle_rounds} · Riffle 切半")
+
+        elif self.state == "cut_spread":
+            animation_active = True
+            if elapsed >= self.cut_spread_duration:
+                self.state = "cut_restack"
                 self.state_started = now
-                self.animationStatus.emit(f"真实洗牌 {self.shuffle_round + 1}/{self.shuffle_rounds} · 切牌")
+                self.animationStatus.emit(f"Cut · {len(self.cut_packets)} 组按新顺序逐组叠回")
+
+        elif self.state == "cut_restack":
+            animation_active = True
+            if elapsed >= self._cut_restack_total_duration():
+                self.active_order = self.cut_output[:] if self.cut_output else self.active_order
+                if not self.major_only:
+                    self.deck_order = self.active_order[:]
+                if self.shuffle_stop_requested:
+                    self.shuffle_stop_requested = False
+                    self.state = "shuffled"
+                    self.state_started = now
+                    self.animationStatus.emit(f"洗牌已终止 · Cut {self.cut_groups} 组已完成并保留")
+                    self.shuffleFinished.emit()
+                else:
+                    self._prepare_riffle_round()
+                    self.state = "split"
+                    self.state_started = now
+                    self.animationStatus.emit(f"真实洗牌 {self.shuffle_round + 1}/{self.shuffle_rounds} · Riffle 切半")
 
         elif self.state == "split":
             animation_active = True
@@ -1249,6 +1381,82 @@ class TarotStage(QWidget):
             self._paint_progress(p, q, "GATHER PHYSICAL DECK")
             return
 
+        if self.state == "cut_spread":
+            q = self._ease_in_out(min(1.0, elapsed / self.cut_spread_duration))
+            deck = self._deck_rect()
+            # Every card remains permanently tied to its packet.  The exact number
+            # entered by the user is therefore visible as that many separate stacks.
+            for pi, packet in enumerate(self.cut_packets):
+                target_base = self._cut_group_rect(pi)
+                for rank, cid in enumerate(packet):
+                    source_rank = self.active_order.index(cid)
+                    source, _ = self._stack_pose(deck, source_rank, len(self.active_order), 0.0, .035)
+                    target, _ = self._stack_pose(target_base, rank, len(packet), ((pi % 3) - 1) * 1.8, .10)
+                    r = QRectF(
+                        self._lerp(source.left(), target.left(), q),
+                        self._lerp(source.top(), target.top(), q) - math.sin(q * math.pi) * (8.0 + (pi % 4) * 2.0),
+                        self._lerp(source.width(), target.width(), q),
+                        self._lerp(source.height(), target.height(), q),
+                    )
+                    rot = self._lerp(0.0, ((pi % 3) - 1) * 1.8, q)
+                    self._paint_physical_back(p, cid, r, rot, 255, False)
+            self._paint_progress(p, q, f"CUT · {len(self.cut_packets)} GROUPS")
+            return
+
+        if self.state == "cut_restack":
+            deck = self._deck_rect()
+            total = self._cut_restack_total_duration()
+            landed_packets = []
+            moving_packets = []
+            waiting_packets = []
+            for seq, pi in enumerate(self.cut_packet_order):
+                start_t = seq * self.cut_packet_gap
+                local = (elapsed - start_t) / self.cut_packet_move_duration
+                if local >= 1.0:
+                    landed_packets.append((seq, pi, 1.0))
+                elif local > 0.0:
+                    moving_packets.append((seq, pi, local))
+                else:
+                    waiting_packets.append((seq, pi, 0.0))
+
+            # Waiting packets stay fully visible in their numbered cut positions.
+            for seq, pi, _ in waiting_packets:
+                packet = self.cut_packets[pi]
+                base = self._cut_group_rect(pi)
+                for rank, cid in enumerate(packet):
+                    r, rot = self._stack_pose(base, rank, len(packet), ((pi % 3) - 1) * 1.8, .10)
+                    self._paint_physical_back(p, cid, r, rot, 255, False)
+
+            # Already landed packets are painted in final physical deck order.
+            for seq, pi, _ in landed_packets:
+                packet = self.cut_packets[pi]
+                for cid in packet:
+                    target_rank = self.cut_target_rank[cid]
+                    r, rot = self._stack_pose(deck, target_rank, len(self.cut_output), 0.0, .035)
+                    self._paint_physical_back(p, cid, r, rot, 255, False)
+
+            # The currently moving packet(s) travel as intact bound stacks.
+            for seq, pi, local in moving_packets:
+                e = self._ease_in_out(local)
+                packet = self.cut_packets[pi]
+                base = self._cut_group_rect(pi)
+                for rank, cid in enumerate(packet):
+                    src, src_rot = self._stack_pose(base, rank, len(packet), ((pi % 3) - 1) * 1.8, .10)
+                    target_rank = self.cut_target_rank[cid]
+                    dst, _ = self._stack_pose(deck, target_rank, len(self.cut_output), 0.0, .035)
+                    r = QRectF(
+                        self._lerp(src.left(), dst.left(), e),
+                        self._lerp(src.top(), dst.top(), e) - math.sin(e * math.pi) * 24.0,
+                        self._lerp(src.width(), dst.width(), e),
+                        self._lerp(src.height(), dst.height(), e),
+                    )
+                    rot = self._lerp(src_rot, 0.0, e)
+                    self._paint_physical_back(p, cid, r, rot, 255, False)
+
+            prog = min(1.0, elapsed / max(.001, total))
+            self._paint_progress(p, prog, f"RESTACK · {len(self.cut_packets)} GROUPS")
+            return
+
         if self.state == "split":
             q = self._ease_in_out(min(1.0, elapsed / self.split_duration))
             deck = self._deck_rect()
@@ -1269,7 +1477,7 @@ class TarotStage(QWidget):
                 )
                 rot = self._lerp(0.0, rot_t, q)
                 self._paint_physical_back(p, cid, r, rot, 255, False)
-            self._paint_progress(p, q, f"CUT · {self.shuffle_round + 1}/{self.shuffle_rounds}")
+            self._paint_progress(p, q, f"RIFFLE SPLIT · {self.shuffle_round + 1}/{self.shuffle_rounds}")
             return
 
         if self.state == "riffle":
@@ -1667,7 +1875,7 @@ class TarotPage(QWidget):
         self.riffle_input.setEnabled(enabled)
         self.cut_input.setEnabled(enabled)
         # Stop is intentionally the inverse during a running shuffle.
-        shuffle_running = self.stage.state in ("gather", "split", "riffle", "square")
+        shuffle_running = self.stage.state in ("gather", "cut_spread", "cut_restack", "split", "riffle", "square")
         self.stop_shuffle_button.setEnabled(shuffle_running)
 
     def _shuffle_clicked(self):
