@@ -481,11 +481,16 @@ class TarotStage(QWidget):
         return active
 
     def _repel_scatter_from_cursor(self, pos, cursor_speed):
-        if cursor_speed < 520.0:
+        # Require a deliberate, fairly quick mouse sweep before cards react.
+        # Just crossing the threshold produces only a small nudge; faster motion
+        # increases both the affected radius and the impulse strength.
+        repel_threshold = 800.0
+        if cursor_speed < repel_threshold:
             return
         selected = set(self.selected_indices)
-        radius = min(170.0, 92.0 + cursor_speed * .035)
-        strength = min(980.0, 280.0 + (cursor_speed - 520.0) * .48)
+        excess_speed = cursor_speed - repel_threshold
+        radius = min(185.0, 88.0 + excess_speed * .045)
+        strength = min(1350.0, 120.0 + excess_speed * .78)
         for cid in self.scatter_order:
             if cid in selected:
                 continue
