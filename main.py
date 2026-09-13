@@ -10,11 +10,11 @@ from PySide6.QtGui import QColor, QPainter, QPen, QBrush, QFont, QPainterPath, Q
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel,
     QPushButton, QFrame, QButtonGroup, QStackedWidget, QSizePolicy,
-    QGraphicsDropShadowEffect, QLineEdit, QCheckBox, QComboBox, QGridLayout, QScrollArea
+    QGraphicsDropShadowEffect, QLineEdit, QCheckBox, QComboBox, QGridLayout, QScrollArea, QBoxLayout
 )
 
 APP_NAME = "5imp1e 5atebox"
-APP_VERSION = "0.8.7"
+APP_VERSION = "0.9.2"
 APP_SETTINGS = {
     "language": "zh",
     "mark_back": False,
@@ -1442,20 +1442,43 @@ class TarotStage(QWidget):
         return QRectF(rect.center().x()-w/2, rect.center().y()-h/2, w, h)
 
     def _spread_label_rects(self, slots):
-        """Find readable label positions without covering cards or other labels."""
+        """Keep every spread label close to the card it describes.
+
+        The old fallback could throw a crowded label all the way to the edge of the
+        stage, which made Celtic-Cross labels look detached from their cards.  This
+        version always searches locally around the corresponding card and chooses
+        the least-overlapping nearby position when no completely empty slot exists.
+        """
         card_boxes = [self._visual_card_bounds(r, i).adjusted(-5,-5,5,5) for i,r in enumerate(slots)]
         used=[]; result=[]
-        bounds = QRectF(8, 8, max(10, self.width()-16), max(10, self.height()-42))
+        bounds = QRectF(10, 10, max(20, self.width()-20), max(20, self.height()-48))
+
+        def overlap_area(a, b):
+            inter = a.intersected(b)
+            return max(0.0, inter.width()) * max(0.0, inter.height()) if not inter.isEmpty() else 0.0
+
         for i, r in enumerate(slots):
             vb = self._visual_card_bounds(r, i)
-            label_w = max(76.0, min(150.0, vb.width()*1.35))
-            label_h = 27.0
+            label_w = max(72.0, min(136.0, vb.width()*1.22))
+            label_h = 25.0
             gap = 8.0
-            # Crossing / crowded cards prefer side labels; ordinary cards prefer below.
             rot = abs(self._slot_rotation(i)) % 180.0
-            directions = ("right","left","below","above") if 55 <= rot <= 125 else ("below","above","right","left")
-            chosen=None
-            for step in (1.0, 1.7, 2.5, 3.4):
+
+            # Crossing cards should read naturally: the horizontal card gets a side
+            # label, while the vertical card prefers below/above.  Other cards keep
+            # the conventional below-first ordering.
+            is_crossing = any(j != i and abs(slots[j].center().x()-r.center().x()) < 3.0 and abs(slots[j].center().y()-r.center().y()) < 3.0 for j in range(len(slots)))
+            if is_crossing and 55 <= rot <= 125:
+                directions = ("right", "left", "above", "below")
+            elif is_crossing:
+                directions = ("below", "above", "left", "right")
+            elif 55 <= rot <= 125:
+                directions = ("right", "left", "below", "above")
+            else:
+                directions = ("below", "above", "right", "left")
+
+            candidates=[]
+            for step in (1.0, 1.45, 1.95, 2.55):
                 for d in directions:
                     if d == "below":
                         cand=QRectF(vb.center().x()-label_w/2, vb.bottom()+gap*step, label_w, label_h)
@@ -1467,21 +1490,18 @@ class TarotStage(QWidget):
                         cand=QRectF(vb.left()-gap*step-label_w, vb.center().y()-label_h/2, label_w, label_h)
                     cand.moveLeft(max(bounds.left(), min(cand.left(), bounds.right()-cand.width())))
                     cand.moveTop(max(bounds.top(), min(cand.top(), bounds.bottom()-cand.height())))
-                    if any(cand.intersects(b) for b in card_boxes):
-                        continue
-                    if any(cand.intersects(u.adjusted(-4,-2,4,2)) for u in used):
-                        continue
-                    chosen=cand; break
-                if chosen is not None: break
-            if chosen is None:
-                # Last resort: place in the nearest open stage edge strip instead
-                # of drawing directly over a card.
-                y=max(bounds.top(), min(vb.center().y()-label_h/2, bounds.bottom()-label_h))
-                if vb.center().x() < self.width()/2:
-                    chosen=QRectF(bounds.left(), y, label_w, label_h)
-                else:
-                    chosen=QRectF(bounds.right()-label_w, y, label_w, label_h)
-            used.append(chosen); result.append(chosen)
+
+                    card_penalty = sum(overlap_area(cand, b) for b in card_boxes)
+                    label_penalty = sum(overlap_area(cand, u.adjusted(-4,-2,4,2)) for u in used)
+                    distance = math.hypot(cand.center().x()-vb.center().x(), cand.center().y()-vb.center().y())
+                    # Card overlap matters most, then label overlap. Distance keeps
+                    # the label visually attached to its own card.
+                    score = card_penalty*12.0 + label_penalty*20.0 + distance*0.10
+                    candidates.append((score, cand))
+
+            chosen=min(candidates, key=lambda item:item[0])[1] if candidates else QRectF(vb.center().x()-label_w/2, vb.bottom()+gap, label_w, label_h)
+            used.append(chosen)
+            result.append(chosen)
         return result
 
     def _idle_geometry(self, i, count=None):
@@ -2624,8 +2644,10 @@ class CustomTarotPage(QWidget):
         head_text = QVBoxLayout(); head_text.setSpacing(3)
         eyebrow = QLabel("TAROT / PHYSICAL DECK"); eyebrow.setObjectName("kicker")
         title = QLabel(TXT("自定义塔罗牌抽取", "Custom Tarot Draw")); title.setObjectName("pageTitle")
-        desc = QLabel(TXT("自由设置抽牌数量、洗牌方式与自己选择模式。每一张卡面与卡背都保持物理绑定。",
-                          "Freely set draw count, shuffle behavior, and manual selection mode. Every face remains physically bound to its card back."))
+        desc = QLabel(TXT(
+            f"当前版本 v{APP_VERSION} · 已加载卡牌：Rider–Waite–Smith（RWS）官方卡面",
+            f"Current version v{APP_VERSION} · Loaded deck: Rider–Waite–Smith (RWS) official artwork"
+        ))
         desc.setObjectName("pageDesc"); desc.setWordWrap(True)
         head_text.addWidget(eyebrow); head_text.addWidget(title); head_text.addWidget(desc)
         head.addLayout(head_text, 1)
@@ -2988,93 +3010,265 @@ class TarotPage(QWidget):
         self.tab_group.idClicked.connect(self.pages.setCurrentIndex)
 
 
+
+class ResponsiveSettingRow(QWidget):
+    """A setting row that changes between horizontal and vertical layout.
+
+    This avoids relying on fixed pixel heights. Text is allowed to wrap naturally,
+    and controls move underneath the description when the available width becomes
+    narrow.
+    """
+    def __init__(self, title_text, note_text, control, parent=None):
+        super().__init__(parent)
+        self.control = control
+        self._vertical_mode = None
+
+        self.row = QBoxLayout(QBoxLayout.Direction.LeftToRight, self)
+        self.row.setContentsMargins(6, 10, 6, 10)
+        self.row.setSpacing(20)
+
+        self.text_box = QWidget(self)
+        self.text_layout = QVBoxLayout(self.text_box)
+        self.text_layout.setContentsMargins(0, 0, 0, 0)
+        self.text_layout.setSpacing(5)
+
+        self.title_label = QLabel(title_text)
+        self.title_label.setObjectName("settingTitle")
+        self.title_label.setWordWrap(True)
+        self.title_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+
+        self.note_label = QLabel(note_text)
+        self.note_label.setObjectName("settingNote")
+        self.note_label.setWordWrap(True)
+        self.note_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+
+        self.text_layout.addWidget(self.title_label)
+        self.text_layout.addWidget(self.note_label)
+
+        self.control.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+
+        self.row.addWidget(self.text_box, 1)
+        self.row.addWidget(self.control, 0, Qt.AlignRight | Qt.AlignVCenter)
+        self._update_direction()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_direction()
+
+    def _update_direction(self):
+        # Use the row's actual live width, rather than a hard-coded window size.
+        vertical = self.width() < 760
+        if vertical == self._vertical_mode:
+            return
+        self._vertical_mode = vertical
+        if vertical:
+            self.row.setDirection(QBoxLayout.Direction.TopToBottom)
+            self.row.setAlignment(self.control, Qt.AlignLeft | Qt.AlignTop)
+        else:
+            self.row.setDirection(QBoxLayout.Direction.LeftToRight)
+            self.row.setAlignment(self.control, Qt.AlignRight | Qt.AlignVCenter)
+        self.updateGeometry()
+
+
 class SettingsPage(QWidget):
     settingsChanged = Signal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(48, 38, 48, 38)
-        layout.setSpacing(18)
-        kicker = QLabel("5IMP1E 5ATEBOX / SETTINGS"); kicker.setObjectName("kicker")
-        title = QLabel(TXT("设置", "Settings")); title.setObjectName("pageTitle")
-        desc = QLabel(TXT("界面、塔罗洗牌、自己选择与实体卡牌设置。", "Interface, tarot shuffle, manual-choice, and physical-card settings.")); desc.setObjectName("pageDesc")
-        layout.addWidget(kicker); layout.addWidget(title); layout.addWidget(desc)
+
+        # The settings page is deliberately scrollable. Its content therefore keeps
+        # its natural height at every resolution instead of being compressed until
+        # labels overlap each other.
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        scroll = QScrollArea(self)
+        scroll.setObjectName("settingsScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        root.addWidget(scroll)
+
+        content = QWidget()
+        content.setObjectName("settingsContent")
+        content.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        scroll.setWidget(content)
+
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(48, 38, 48, 42)
+        layout.setSpacing(16)
+
+        kicker = QLabel("5IMP1E 5ATEBOX / SETTINGS")
+        kicker.setObjectName("kicker")
+        title = QLabel(TXT("设置", "Settings"))
+        title.setObjectName("pageTitle")
+        desc = QLabel(TXT(
+            "界面、塔罗洗牌、自己选择与实体卡牌设置。",
+            "Interface, tarot shuffle, manual-choice, and physical-card settings."
+        ))
+        desc.setObjectName("pageDesc")
+        desc.setWordWrap(True)
+        desc.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+
+        layout.addWidget(kicker)
+        layout.addWidget(title)
+        layout.addWidget(desc)
+
+        def category(zh, en):
+            lab = QLabel(TXT(zh, en))
+            lab.setObjectName("settingCategory")
+            lab.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+            return lab
+
+        def make_panel():
+            panel = QFrame()
+            panel.setObjectName("configPanel")
+            panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+            form = QVBoxLayout(panel)
+            form.setContentsMargins(22, 10, 22, 10)
+            form.setSpacing(0)
+            return panel, form
+
+        def divider(form):
+            form.addWidget(AccentLine())
 
         # ---- Interface ----
-        interface_title = QLabel(TXT("界面", "INTERFACE")); interface_title.setObjectName("settingCategory")
-        layout.addWidget(interface_title)
-        interface_panel = QFrame(); interface_panel.setObjectName("configPanel")
-        interface_form = QVBoxLayout(interface_panel); interface_form.setContentsMargins(22,18,22,18); interface_form.setSpacing(14)
-        lang_row = QHBoxLayout(); lang_text = QVBoxLayout()
-        lang_title = QLabel(TXT("语言", "Language")); lang_title.setObjectName("settingTitle")
-        lang_note = QLabel(TXT("切换整个程序的界面语言", "Change the interface language for the entire app")); lang_note.setObjectName("settingNote")
-        lang_text.addWidget(lang_title); lang_text.addWidget(lang_note)
-        self.language_combo = QComboBox(); self.language_combo.setObjectName("settingCombo")
-        self.language_combo.addItem(TXT("简体中文", "Chinese (Simplified)"), "zh"); self.language_combo.addItem("English", "en")
-        idx=self.language_combo.findData(APP_SETTINGS.get("language","zh")); self.language_combo.setCurrentIndex(max(0,idx))
-        lang_row.addLayout(lang_text,1); lang_row.addWidget(self.language_combo); interface_form.addLayout(lang_row)
+        layout.addSpacing(4)
+        layout.addWidget(category("界面", "INTERFACE"))
+        interface_panel, interface_form = make_panel()
+
+        self.language_combo = QComboBox()
+        self.language_combo.setObjectName("settingCombo")
+        self.language_combo.setMinimumWidth(220)
+        self.language_combo.addItem(TXT("简体中文", "Chinese (Simplified)"), "zh")
+        self.language_combo.addItem("English", "en")
+        idx = self.language_combo.findData(APP_SETTINGS.get("language", "zh"))
+        self.language_combo.setCurrentIndex(max(0, idx))
+
+        interface_form.addWidget(ResponsiveSettingRow(
+            TXT("语言", "Language"),
+            TXT("切换整个程序的界面语言。", "Change the interface language for the entire app."),
+            self.language_combo
+        ))
         layout.addWidget(interface_panel)
 
-        # ---- Tarot / Shuffle ----
-        tarot_title = QLabel(TXT("塔罗牌与洗牌", "TAROT & SHUFFLE")); tarot_title.setObjectName("settingCategory")
-        layout.addWidget(tarot_title)
-        tarot_panel = QFrame(); tarot_panel.setObjectName("configPanel")
-        tarot_form = QVBoxLayout(tarot_panel); tarot_form.setContentsMargins(22,18,22,18); tarot_form.setSpacing(14)
+        # ---- Tarot & Shuffle ----
+        layout.addSpacing(4)
+        layout.addWidget(category("塔罗牌与洗牌", "TAROT & SHUFFLE"))
+        tarot_panel, tarot_form = make_panel()
 
-        rev_row=QHBoxLayout(); rev_text=QVBoxLayout()
-        rev_title=QLabel(TXT("允许逆位", "Allow Reversed Cards")); rev_title.setObjectName("settingTitle")
-        rev_note=QLabel(TXT("默认开启。关闭后所有新一轮洗牌与自己选择都只使用正位。", "Enabled by default. When off, new shuffles and manual selections use upright cards only.")); rev_note.setObjectName("settingNote"); rev_note.setWordWrap(True)
-        rev_text.addWidget(rev_title); rev_text.addWidget(rev_note)
-        self.reverse_check=QCheckBox(TXT("启用逆位", "Enable reversed cards")); self.reverse_check.setChecked(bool(APP_SETTINGS.get("allow_reversed",True)))
-        rev_row.addLayout(rev_text,1); rev_row.addWidget(self.reverse_check); tarot_form.addLayout(rev_row)
-        tarot_form.addWidget(AccentLine())
+        self.reverse_check = QCheckBox(TXT("启用逆位", "Enable reversed cards"))
+        self.reverse_check.setChecked(bool(APP_SETTINGS.get("allow_reversed", True)))
 
-        shuffle_row=QHBoxLayout(); shuffle_text=QVBoxLayout()
-        shuffle_title=QLabel(TXT("洗牌参数", "Shuffle Parameters")); shuffle_title.setObjectName("settingTitle")
-        shuffle_note=QLabel(TXT("Riffle 1–50 次；Cut 1–20 组。所有塔罗页面共用。", "Riffle: 1–50 rounds; Cut: 1–20 groups. Shared by all Tarot pages.")); shuffle_note.setObjectName("settingNote")
-        shuffle_text.addWidget(shuffle_title); shuffle_text.addWidget(shuffle_note); shuffle_row.addLayout(shuffle_text,1)
-        riffle_label=QLabel(TXT("Riffle 次数", "Riffle Count")); riffle_label.setObjectName("settingNote"); shuffle_row.addWidget(riffle_label)
-        self.riffle_input=QLineEdit(str(APP_SETTINGS.get("riffle_rounds",3))); self.riffle_input.setObjectName("numberInput"); self.riffle_input.setValidator(QIntValidator(1,50,self)); self.riffle_input.setAlignment(Qt.AlignCenter); self.riffle_input.setFixedSize(56,34); shuffle_row.addWidget(self.riffle_input)
-        cut_label=QLabel(TXT("Cut 组数", "Cut Groups")); cut_label.setObjectName("settingNote"); shuffle_row.addWidget(cut_label)
-        self.cut_input=QLineEdit(str(APP_SETTINGS.get("cut_groups",2))); self.cut_input.setObjectName("numberInput"); self.cut_input.setValidator(QIntValidator(1,20,self)); self.cut_input.setAlignment(Qt.AlignCenter); self.cut_input.setFixedSize(56,34); shuffle_row.addWidget(self.cut_input)
-        tarot_form.addLayout(shuffle_row)
+        tarot_form.addWidget(ResponsiveSettingRow(
+            TXT("允许逆位", "Allow Reversed Cards"),
+            TXT(
+                "默认开启。关闭后所有新一轮洗牌与自己选择都只使用正位。",
+                "Enabled by default. When disabled, newly started shuffles and manual selections use upright cards only."
+            ),
+            self.reverse_check
+        ))
+        divider(tarot_form)
+
+        shuffle_controls = QWidget()
+        shuffle_controls.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+        sc = QGridLayout(shuffle_controls)
+        sc.setContentsMargins(0, 0, 0, 0)
+        sc.setHorizontalSpacing(9)
+        sc.setVerticalSpacing(7)
+
+        riffle_label = QLabel(TXT("Riffle 次数", "Riffle Count"))
+        riffle_label.setObjectName("settingNote")
+        self.riffle_input = QLineEdit(str(APP_SETTINGS.get("riffle_rounds", 3)))
+        self.riffle_input.setObjectName("numberInput")
+        self.riffle_input.setValidator(QIntValidator(1, 50, self))
+        self.riffle_input.setAlignment(Qt.AlignCenter)
+        self.riffle_input.setFixedWidth(60)
+
+        cut_label = QLabel(TXT("Cut 组数", "Cut Groups"))
+        cut_label.setObjectName("settingNote")
+        self.cut_input = QLineEdit(str(APP_SETTINGS.get("cut_groups", 2)))
+        self.cut_input.setObjectName("numberInput")
+        self.cut_input.setValidator(QIntValidator(1, 20, self))
+        self.cut_input.setAlignment(Qt.AlignCenter)
+        self.cut_input.setFixedWidth(60)
+
+        sc.addWidget(riffle_label, 0, 0)
+        sc.addWidget(self.riffle_input, 0, 1)
+        sc.addWidget(cut_label, 1, 0)
+        sc.addWidget(self.cut_input, 1, 1)
+
+        tarot_form.addWidget(ResponsiveSettingRow(
+            TXT("洗牌参数", "Shuffle Parameters"),
+            TXT(
+                "Riffle 可设置 1–50 次；Cut 可设置 1–20 组。所有塔罗牌页面共同使用这些数值。",
+                "Riffle can be set from 1–50 rounds and Cut from 1–20 groups. These values are shared by all Tarot pages."
+            ),
+            shuffle_controls
+        ))
         layout.addWidget(tarot_panel)
 
-        # ---- Manual choice ----
-        manual_title=QLabel(TXT("自己选择", "MANUAL CHOICE")); manual_title.setObjectName("settingCategory")
-        layout.addWidget(manual_title)
-        manual_panel=QFrame(); manual_panel.setObjectName("configPanel")
-        manual_form=QVBoxLayout(manual_panel); manual_form.setContentsMargins(22,18,22,18); manual_form.setSpacing(14)
+        # ---- Manual Choice ----
+        layout.addSpacing(4)
+        layout.addWidget(category("自己选择", "MANUAL CHOICE"))
+        manual_panel, manual_form = make_panel()
 
-        custom_row=QHBoxLayout(); custom_text=QVBoxLayout()
-        custom_title=QLabel(TXT("自定义塔罗牌抽取", "Custom Tarot Draw")); custom_title.setObjectName("settingTitle")
-        custom_note=QLabel(TXT("仅控制“自定义塔罗牌抽取”页面的自己选择展示方式。", "Controls manual-choice presentation only on the Custom Tarot Draw page.")); custom_note.setObjectName("settingNote"); custom_note.setWordWrap(True)
-        custom_text.addWidget(custom_title); custom_text.addWidget(custom_note)
-        self.custom_mode_combo=QComboBox(); self.custom_mode_combo.setObjectName("settingCombo"); self.custom_mode_combo.addItem(TXT("牌雨", "Card Rain"),"rain"); self.custom_mode_combo.addItem(TXT("扇形展开", "Fan Spread"),"fan")
-        idx=self.custom_mode_combo.findData(APP_SETTINGS.get("custom_manual_mode","rain")); self.custom_mode_combo.setCurrentIndex(max(0,idx))
-        custom_row.addLayout(custom_text,1); custom_row.addWidget(self.custom_mode_combo); manual_form.addLayout(custom_row)
-        manual_form.addWidget(AccentLine())
+        self.custom_mode_combo = QComboBox()
+        self.custom_mode_combo.setObjectName("settingCombo")
+        self.custom_mode_combo.setMinimumWidth(220)
+        self.custom_mode_combo.addItem(TXT("牌雨", "Card Rain"), "rain")
+        self.custom_mode_combo.addItem(TXT("扇形展开", "Fan Spread"), "fan")
+        idx = self.custom_mode_combo.findData(APP_SETTINGS.get("custom_manual_mode", "rain"))
+        self.custom_mode_combo.setCurrentIndex(max(0, idx))
 
-        default_row=QHBoxLayout(); default_text=QVBoxLayout()
-        default_title=QLabel(TXT("经典牌阵及其他模式", "Classic Spreads & Other Modes")); default_title.setObjectName("settingTitle")
-        default_note=QLabel(TXT("默认使用扇形展开。以后新增的非自定义自己选择模式也使用此选项。", "Defaults to Fan Spread. Future non-custom manual-choice modes also use this option.")); default_note.setObjectName("settingNote"); default_note.setWordWrap(True)
-        default_text.addWidget(default_title); default_text.addWidget(default_note)
-        self.default_mode_combo=QComboBox(); self.default_mode_combo.setObjectName("settingCombo"); self.default_mode_combo.addItem(TXT("扇形展开", "Fan Spread"),"fan"); self.default_mode_combo.addItem(TXT("牌雨", "Card Rain"),"rain")
-        idx=self.default_mode_combo.findData(APP_SETTINGS.get("default_manual_mode","fan")); self.default_mode_combo.setCurrentIndex(max(0,idx))
-        default_row.addLayout(default_text,1); default_row.addWidget(self.default_mode_combo); manual_form.addLayout(default_row)
+        manual_form.addWidget(ResponsiveSettingRow(
+            TXT("自定义塔罗牌抽取", "Custom Tarot Draw"),
+            TXT(
+                "仅控制“自定义塔罗牌抽取”页面中的自己选择展示方式。",
+                "Controls the manual-choice presentation used only on the Custom Tarot Draw page."
+            ),
+            self.custom_mode_combo
+        ))
+        divider(manual_form)
+
+        self.default_mode_combo = QComboBox()
+        self.default_mode_combo.setObjectName("settingCombo")
+        self.default_mode_combo.setMinimumWidth(220)
+        self.default_mode_combo.addItem(TXT("扇形展开", "Fan Spread"), "fan")
+        self.default_mode_combo.addItem(TXT("牌雨", "Card Rain"), "rain")
+        idx = self.default_mode_combo.findData(APP_SETTINGS.get("default_manual_mode", "fan"))
+        self.default_mode_combo.setCurrentIndex(max(0, idx))
+
+        manual_form.addWidget(ResponsiveSettingRow(
+            TXT("经典牌阵及其他模式", "Classic Spreads & Other Modes"),
+            TXT(
+                "默认使用扇形展开。以后新增的非自定义“自己选择”模式也使用此选项。",
+                "Defaults to Fan Spread. Future non-custom manual-choice modes also use this option."
+            ),
+            self.default_mode_combo
+        ))
         layout.addWidget(manual_panel)
 
-        # ---- Physical cards ----
-        physical_title=QLabel(TXT("实体卡牌", "PHYSICAL CARDS")); physical_title.setObjectName("settingCategory")
-        layout.addWidget(physical_title)
-        physical_panel=QFrame(); physical_panel.setObjectName("configPanel")
-        physical_form=QVBoxLayout(physical_panel); physical_form.setContentsMargins(22,18,22,18); physical_form.setSpacing(14)
-        mark_row=QHBoxLayout(); mark_text=QVBoxLayout()
-        mark_title=QLabel(TXT("卡背标记", "Card-back Marking")); mark_title.setObjectName("settingTitle")
-        mark_note=QLabel(TXT("开启后右键可见卡牌，将该实体卡背标记为红色；再次右键取消。标记会跟随该实体牌通过 Cut、Riffle、抽取与翻牌。", "Right-click a visible card to mark that physical card's back red; right-click again to remove it. The mark follows the card through cuts, riffles, draws, and reveals.")); mark_note.setObjectName("settingNote"); mark_note.setWordWrap(True)
-        mark_text.addWidget(mark_title); mark_text.addWidget(mark_note)
-        self.mark_check=QCheckBox(TXT("启用卡背红色标记", "Enable red card-back marks")); self.mark_check.setChecked(bool(APP_SETTINGS.get("mark_back",False)))
-        mark_row.addLayout(mark_text,1); mark_row.addWidget(self.mark_check); physical_form.addLayout(mark_row)
+        # ---- Physical Cards ----
+        layout.addSpacing(4)
+        layout.addWidget(category("实体卡牌", "PHYSICAL CARDS"))
+        physical_panel, physical_form = make_panel()
+
+        self.mark_check = QCheckBox(TXT(
+            "启用卡背红色标记",
+            "Enable red card-back marks"
+        ))
+        self.mark_check.setChecked(bool(APP_SETTINGS.get("mark_back", False)))
+
+        physical_form.addWidget(ResponsiveSettingRow(
+            TXT("卡背标记", "Card-back Marking"),
+            TXT(
+                "开启后右键可见卡牌，将该实体卡背标记为红色；再次右键取消。标记会跟随该实体牌通过 Cut、Riffle、抽取与翻牌。",
+                "Right-click a visible card to mark that physical card's back red; right-click again to remove it. The mark follows the card through cuts, riffles, draws, and reveals."
+            ),
+            self.mark_check
+        ))
         layout.addWidget(physical_panel)
         layout.addStretch(1)
 
@@ -3092,13 +3286,22 @@ class SettingsPage(QWidget):
         APP_SETTINGS["allow_reversed"] = self.reverse_check.isChecked()
         APP_SETTINGS["custom_manual_mode"] = self.custom_mode_combo.currentData() or "rain"
         APP_SETTINGS["default_manual_mode"] = self.default_mode_combo.currentData() or "fan"
-        try: riffles=int(self.riffle_input.text() or APP_SETTINGS.get("riffle_rounds",3))
-        except ValueError: riffles=3
-        try: cuts=int(self.cut_input.text() or APP_SETTINGS.get("cut_groups",2))
-        except ValueError: cuts=2
-        riffles=max(1,min(50,riffles)); cuts=max(1,min(20,cuts))
-        APP_SETTINGS["riffle_rounds"] = riffles; APP_SETTINGS["cut_groups"] = cuts
-        self.riffle_input.setText(str(riffles)); self.cut_input.setText(str(cuts))
+
+        try:
+            riffles = int(self.riffle_input.text() or APP_SETTINGS.get("riffle_rounds", 3))
+        except ValueError:
+            riffles = 3
+        try:
+            cuts = int(self.cut_input.text() or APP_SETTINGS.get("cut_groups", 2))
+        except ValueError:
+            cuts = 2
+
+        riffles = max(1, min(50, riffles))
+        cuts = max(1, min(20, cuts))
+        APP_SETTINGS["riffle_rounds"] = riffles
+        APP_SETTINGS["cut_groups"] = cuts
+        self.riffle_input.setText(str(riffles))
+        self.cut_input.setText(str(cuts))
         self.settingsChanged.emit()
 
 
@@ -3497,6 +3700,8 @@ QLabel#pageTitle {
     font-size: 30px;
     font-weight: 600;
 }
+QScrollArea#settingsScroll { background: transparent; border: none; }
+QWidget#settingsContent { background: #070707; }
 QFrame#configPanel {
     background: #0d0d0d;
     border: 1px solid #242424;
