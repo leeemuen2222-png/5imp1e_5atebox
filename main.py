@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "5imp1e 5atebox"
-APP_VERSION = "0.6.1"
+APP_VERSION = "0.6.2"
 BASE_DIR = Path(__file__).resolve().parent
 RESOURCE_DIR = BASE_DIR / "resource"
 
@@ -166,6 +166,15 @@ class TarotStage(QWidget):
         self.manual_take_duration = 0.52
         self.manual_rest_gather_duration = 0.72
 
+        # Manual spread physics. The landed position remains the physical base pose;
+        # transient offsets let a fast cursor brush nearby cards aside without
+        # changing which card they actually are or permanently rearranging the deck.
+        self.scatter_velocity = {}
+        self.scatter_offset = {}
+        self._last_mouse_pos = None
+        self._last_mouse_time = 0.0
+        self._last_tick_time = time.perf_counter()
+
     @staticmethod
     def _is_major(stem):
         name = stem.split("_", 1)[1] if "_" in stem else stem
@@ -289,7 +298,7 @@ class TarotStage(QWidget):
         self.update()
 
     def start_manual(self, count=3, allow_reversed=True):
-        if self.state not in ("idle", "done", "await_reveal"):
+        if self.state not in ("idle", "done", "shuffled", "await_reveal"):
             return
         if len(self.cards) < 78:
             self.animationStatus.emit("自己选择模式需要完整的 78 张牌。")
@@ -299,7 +308,13 @@ class TarotStage(QWidget):
         self.draw_count = max(1, min(int(count), 8))
         self.allow_reversed = allow_reversed
         self.major_only = False
-        self.active_order = self.deck_order[:] if self.deck_order else list(range(len(self.cards)))
+        # Manual choice always represents a complete physical 78-card deck. If a
+        # previous reading removed cards, return every card to the table first.
+        current = self.deck_order[:]
+        seen = set(current)
+        current.extend(cid for cid in range(len(self.cards)) if cid not in seen)
+        self.deck_order = current
+        self.active_order = current[:]
 
         for cid in self.active_order:
             self.cards[cid].reversed = bool(random.getrandbits(1)) if allow_reversed else False
@@ -325,27 +340,66 @@ class TarotStage(QWidget):
         self.update()
 
     def _prepare_scatter_layout(self):
-        self.scatter_pose = {}
-        n = max(1, len(self.scatter_order))
-        cw = max(42.0, min(58.0, self.width() * .046))
-        ch = cw * 1.58
-        left = max(22.0, self.width() * .035)
-        right = max(left + cw + 10.0, self.width() - left - cw)
-        top = max(26.0, self.height() * .11)
-        bottom = max(top + ch + 10.0, self.height() * .78 - ch)
+        """Create a readable but still irregular 78-card tabletop spread.
 
+        Instead of picking 78 unrelated coordinates (which can hide large parts of
+        the deck), build a jittered grid, shuffle card-to-cell assignment, and then
+        add overlap/rotation. Every physical card therefore has a visibly traceable
+        landing place while the result still feels like a handful of cards thrown
+        onto a table.
+        """
+        self.scatter_pose = {}
+        self.scatter_velocity = {}
+        self.scatter_offset = {}
+        n = max(1, len(self.scatter_order))
+
+        # Keep the cards small enough that nearly every one remains visually exposed.
+        cw = max(34.0, min(47.0, self.width() * .038))
+        ch = cw * 1.58
+        left = max(18.0, self.width() * .025)
+        right = max(left + cw + 10.0, self.width() - left - cw - 18.0)
+        top = max(28.0, self.height() * .09)
+        bottom = max(top + ch + 12.0, self.height() * .76 - ch)
+
+        # 13 x 6 exactly fits 78 cards. For other deck sizes, derive a similar grid.
+        cols = 13 if n >= 70 else max(5, int(math.ceil(math.sqrt(n * 2.1))))
+        rows = int(math.ceil(n / cols))
+        cell_w = (right - left) / max(1, cols - 1)
+        cell_h = (bottom - top) / max(1, rows - 1)
+        cells = []
+        for row in range(rows):
+            for col in range(cols):
+                if len(cells) >= n:
+                    break
+                # Stagger alternate rows to avoid an obviously rectangular layout.
+                stagger = (cell_w * .34) if row % 2 else 0.0
+                x = left + col * cell_w + stagger
+                if x > right:
+                    x -= cell_w * .68
+                y = top + row * cell_h
+                cells.append((x, y))
+
+        random.shuffle(cells)
         max_end = 0.0
         for i, cid in enumerate(self.scatter_order):
-            # Broadly uniform scatter with intentional overlap. Each card receives a
-            # persistent physical pose so hit testing and later pickup use the same card.
-            x = random.uniform(left, right)
-            y = random.uniform(top, bottom)
-            final_rot = random.uniform(-32.0, 32.0)
-            delay = i * 0.011 + random.uniform(0.0, 0.045)
-            duration = random.uniform(0.62, 1.04)
-            start_x = x + random.uniform(-150.0, 150.0)
-            start_y = -ch - random.uniform(30.0, 260.0)
-            start_rot = final_rot + random.uniform(-110.0, 110.0)
+            bx, by = cells[i]
+            x = bx + random.uniform(-cell_w * .28, cell_w * .28)
+            y = by + random.uniform(-cell_h * .25, cell_h * .25)
+            x = max(left - cw*.12, min(right, x))
+            y = max(top, min(bottom, y))
+            final_rot = random.uniform(-27.0, 27.0)
+
+            # Drop in visibly separated waves. Cards originate well above the table
+            # and fan across the width, so the user can follow where the deck lands.
+            wave = i // max(1, cols)
+            delay = wave * .105 + (i % cols) * .016 + random.uniform(0.0, .035)
+            duration = random.uniform(.88, 1.28)
+            start_x = x + random.uniform(-110.0, 110.0)
+            start_y = -ch - random.uniform(70.0, 360.0)
+            start_rot = final_rot + random.uniform(-150.0, 150.0)
+            drift = random.uniform(-36.0, 36.0)
+            bounce = random.uniform(10.0, 22.0)
+
             self.scatter_pose[cid] = {
                 "rect": QRectF(x, y, cw, ch),
                 "rot": final_rot,
@@ -354,9 +408,15 @@ class TarotStage(QWidget):
                 "start_x": start_x,
                 "start_y": start_y,
                 "start_rot": start_rot,
+                "drift": drift,
+                "bounce": bounce,
             }
+            self.scatter_velocity[cid] = QPointF(0.0, 0.0)
+            self.scatter_offset[cid] = QPointF(0.0, 0.0)
             max_end = max(max_end, delay + duration)
-        self.scatter_drop_total = max_end + .08
+        self.scatter_drop_total = max_end + .12
+        self._last_mouse_pos = None
+        self._last_mouse_time = 0.0
 
     def _scatter_card_pose(self, cid, elapsed):
         d = self.scatter_pose[cid]
@@ -365,19 +425,84 @@ class TarotStage(QWidget):
         if q <= 0:
             return QRectF(d["start_x"], d["start_y"], target.width(), target.height()), d["start_rot"], 0.0
         if q >= 1:
-            return QRectF(target), d["rot"], 1.0
+            off = self.scatter_offset.get(cid, QPointF())
+            return target.translated(off.x(), off.y()), d["rot"], 1.0
 
-        # Gravity-like acceleration, followed by a small damped landing bounce.
-        fall = min(1.0, q / .82)
-        ef = fall * fall
-        x = self._lerp(d["start_x"], target.left(), self._ease_in_out(fall))
-        y = self._lerp(d["start_y"], target.top(), ef)
-        if q > .82:
-            b = (q - .82) / .18
-            y = target.top() - math.sin(b * math.pi) * (1.0 - b) * 16.0
-        x += math.sin(q * math.pi) * random.Random(cid * 7919).uniform(-18.0, 18.0)
+        # Accelerating fall, sideways air drift, then a damped tabletop bounce.
+        fall = min(1.0, q / .80)
+        gravity = fall * fall
+        sx = d["start_x"]
+        tx = target.left()
+        x = self._lerp(sx, tx, self._ease_in_out(fall))
+        x += math.sin(fall * math.pi) * d["drift"]
+        y = self._lerp(d["start_y"], target.top(), gravity)
+        if q > .80:
+            b = (q - .80) / .20
+            # One obvious impact hop followed by a tiny second settling oscillation.
+            y = target.top() - math.sin(b * math.pi) * (1.0 - b) * d["bounce"]
+            y += math.sin(b * math.pi * 2.0) * (1.0 - b) * 3.0
         rot = self._lerp(d["start_rot"], d["rot"], self._ease_in_out(q))
         return QRectF(x, y, target.width(), target.height()), rot, q
+
+    def _effective_scatter_rect(self, cid):
+        d = self.scatter_pose[cid]
+        off = self.scatter_offset.get(cid, QPointF())
+        return d["rect"].translated(off.x(), off.y())
+
+    def _update_scatter_physics(self, dt):
+        if not self.scatter_pose:
+            return False
+        active = False
+        selected = set(self.selected_indices)
+        # Gentle spring back + strong damping: cards are brushed away briefly rather
+        # than drifting forever or losing their recognizable landing position.
+        spring = 24.0
+        damping = math.exp(-8.0 * dt)
+        for cid in self.scatter_order:
+            if cid in selected:
+                continue
+            off = self.scatter_offset.get(cid, QPointF())
+            vel = self.scatter_velocity.get(cid, QPointF())
+            vx = vel.x() - off.x() * spring * dt
+            vy = vel.y() - off.y() * spring * dt
+            vx *= damping
+            vy *= damping
+            ox = off.x() + vx * dt
+            oy = off.y() + vy * dt
+            # Limit displacement so cards still look like part of the spread.
+            mag = math.hypot(ox, oy)
+            if mag > 42.0:
+                scale = 42.0 / mag
+                ox *= scale; oy *= scale
+            self.scatter_velocity[cid] = QPointF(vx, vy)
+            self.scatter_offset[cid] = QPointF(ox, oy)
+            if abs(vx) + abs(vy) > 2.0 or abs(ox) + abs(oy) > .7:
+                active = True
+        return active
+
+    def _repel_scatter_from_cursor(self, pos, cursor_speed):
+        if cursor_speed < 520.0:
+            return
+        selected = set(self.selected_indices)
+        radius = min(170.0, 92.0 + cursor_speed * .035)
+        strength = min(980.0, 280.0 + (cursor_speed - 520.0) * .48)
+        for cid in self.scatter_order:
+            if cid in selected:
+                continue
+            rect = self._effective_scatter_rect(cid)
+            c = rect.center()
+            dx = c.x() - pos.x()
+            dy = c.y() - pos.y()
+            dist = math.hypot(dx, dy)
+            if dist <= 1.0 or dist >= radius:
+                continue
+            weight = (1.0 - dist / radius) ** 1.7
+            nx, ny = dx / dist, dy / dist
+            vel = self.scatter_velocity.get(cid, QPointF())
+            self.scatter_velocity[cid] = QPointF(
+                vel.x() + nx * strength * weight,
+                vel.y() + ny * strength * weight,
+            )
 
     def _manual_card_hit(self, pos):
         selected = set(self.selected_indices)
@@ -388,7 +513,7 @@ class TarotStage(QWidget):
             d = self.scatter_pose.get(cid)
             if not d:
                 continue
-            rect = d["rect"]
+            rect = self._effective_scatter_rect(cid)
             c = rect.center()
             a = math.radians(-d["rot"])
             dx, dy = pos.x() - c.x(), pos.y() - c.y()
@@ -462,19 +587,12 @@ class TarotStage(QWidget):
     def _tick(self):
         now = time.perf_counter()
         elapsed = now - self.state_started
+        dt = max(0.0, min(.05, now - self._last_tick_time))
+        self._last_tick_time = now
         animation_active = False
-
-        if self.state == "shuffled":
-            order = self.active_order if self.active_order else self.deck_order
-            deck = self._deck_rect()
-            for i, cid in enumerate(order):
-                r, rot = self._stack_pose(deck, i, len(order), 0.0, .035)
-                self._paint_physical_back(p, cid, r, rot, 255, False)
-            p.setPen(QColor("#777777"))
-            p.setFont(QFont("Segoe UI", 10))
-            p.drawText(QRectF(0, self.height()-36, self.width(), 24), Qt.AlignCenter,
-                       "洗牌完成 · 按“抽取”从当前牌顶取牌")
-            return
+        if self.state == "self_select":
+            if self._update_scatter_physics(dt):
+                animation_active = True
 
         if self.state == "gather":
             animation_active = True
@@ -548,6 +666,11 @@ class TarotStage(QWidget):
             for slot in finished_slots:
                 self.manual_take_started.pop(slot, None)
             if len(self.selected_indices) >= self.draw_count and not self.manual_take_started:
+                # Commit the manual choices to the same physical deck model used by
+                # shuffle/draw: picked cards leave the remaining deck immediately.
+                selected_set = set(self.selected_indices)
+                self.deck_order = [cid for cid in self.scatter_order if cid not in selected_set]
+                self.active_order = self.deck_order[:]
                 self.state = "manual_gather_rest"
                 self.state_started = now
                 self.animationStatus.emit("选择完成 · 正在整理剩余牌组")
@@ -860,6 +983,16 @@ class TarotStage(QWidget):
         slots = self._result_slots() if self.state in ("await_reveal", "done") else []
         hit = -1
         if self.state == "self_select":
+            now = time.perf_counter()
+            if self._last_mouse_pos is not None and self._last_mouse_time > 0:
+                dt = max(.001, now - self._last_mouse_time)
+                dxm = pos.x() - self._last_mouse_pos.x()
+                dym = pos.y() - self._last_mouse_pos.y()
+                speed = math.hypot(dxm, dym) / dt
+                self._repel_scatter_from_cursor(pos, speed)
+            self._last_mouse_pos = QPointF(pos)
+            self._last_mouse_time = now
+
             cid = self._manual_card_hit(pos)
             self.setCursor(Qt.PointingHandCursor if cid >= 0 and len(self.selected_indices) < self.draw_count else Qt.ArrowCursor)
             self.hovered_slot = -1
@@ -949,6 +1082,18 @@ class TarotStage(QWidget):
             p.setFont(QFont("Segoe UI", 10))
             p.drawText(QRectF(0, self.height()-36, self.width(), 24), Qt.AlignCenter,
                        "先洗牌，再按“抽取”；也可以直接从当前牌序抽取")
+            return
+
+        if self.state == "shuffled":
+            order = self.active_order if self.active_order else self.deck_order
+            deck = self._deck_rect()
+            for i, cid in enumerate(order):
+                r, rot = self._stack_pose(deck, i, len(order), 0.0, .035)
+                self._paint_physical_back(p, cid, r, rot, 255, False)
+            p.setPen(QColor("#777777"))
+            p.setFont(QFont("Segoe UI", 10))
+            p.drawText(QRectF(0, self.height()-36, self.width(), 24), Qt.AlignCenter,
+                       "洗牌完成 · 可再次洗牌、自己选择，或按“抽取”")
             return
 
         if self.state == "gather":
@@ -1052,7 +1197,7 @@ class TarotStage(QWidget):
                 for cid in self.scatter_order:
                     if cid not in selected:
                         d = self.scatter_pose[cid]
-                        self._paint_physical_back(p, cid, d["rect"], d["rot"], 250, False)
+                        self._paint_physical_back(p, cid, self._effective_scatter_rect(cid), d["rot"], 250, False)
 
                 # Picked cards travel independently to their result slots, allowing
                 # rapid selection without serializing the pickup animations.
@@ -1062,7 +1207,7 @@ class TarotStage(QWidget):
                     if slot in self.manual_take_started:
                         q = min(1.0, max(0.0, (now2 - self.manual_take_started[slot]) / self.manual_take_duration))
                         e = self._ease_in_out(q)
-                        src = d["rect"]; dst = slots[slot]
+                        src = self._effective_scatter_rect(cid); dst = slots[slot]
                         r = QRectF(
                             self._lerp(src.left(), dst.left(), e),
                             self._lerp(src.top(), dst.top(), e) - math.sin(e * math.pi) * 46.0,
@@ -1089,7 +1234,7 @@ class TarotStage(QWidget):
                 d = self.scatter_pose[cid]
                 depth = rank / max(1, len(remaining)-1)
                 dst = target.translated((depth-.5)*5.5, (depth-.5)*14.0)
-                src = d["rect"]
+                src = self._effective_scatter_rect(cid)
                 r = QRectF(
                     self._lerp(src.left(), dst.left(), q),
                     self._lerp(src.top(), dst.top(), q) - math.sin(q*math.pi)*20.0,
@@ -1382,11 +1527,17 @@ class TarotPage(QWidget):
     def _manual_clicked(self):
         if self.stage.state not in ("idle", "done", "shuffled"):
             return
+        previous_state = self.stage.state
         self._set_controls_enabled(False)
         self.stage.start_manual(
             count=self.selected_count,
             allow_reversed=self.reverse_chip.isChecked(),
         )
+        # Defensive recovery: if manual mode could not start for any reason,
+        # never leave the whole control strip disabled.
+        if self.stage.state == previous_state:
+            self._set_controls_enabled(True)
+            self.status.setText("自己选择未能启动，请重试。")
 
     def _finished(self, names):
         self._set_controls_enabled(True)
