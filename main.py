@@ -2,18 +2,19 @@ import sys
 import math
 import random
 import time
+import re
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QRectF, QPointF, Signal, QSize, QTimer
+from PySide6.QtCore import Qt, QRectF, QPointF, Signal, QSize, QTimer, QEvent
 from PySide6.QtGui import QColor, QPainter, QPen, QBrush, QFont, QPainterPath, QPixmap, QIntValidator
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel,
     QPushButton, QFrame, QButtonGroup, QStackedWidget, QSizePolicy,
-    QGraphicsDropShadowEffect, QLineEdit, QCheckBox, QComboBox
+    QGraphicsDropShadowEffect, QLineEdit, QCheckBox, QComboBox, QGridLayout, QScrollArea
 )
 
 APP_NAME = "5imp1e 5atebox"
-APP_VERSION = "0.8.0"
+APP_VERSION = "0.8.1"
 APP_SETTINGS = {"language": "zh", "mark_back": False}
 
 def TXT(zh, en):
@@ -157,7 +158,7 @@ class TarotStage(QWidget):
         self.release_gap = 0.018
         self.release_move_duration = 0.30
         self.square_duration = 0.48
-        self.deal_duration = 0.58
+        self.deal_duration = 0.78
         self.deal_gap = 0.08
         self.flip_duration = 0.52
 
@@ -1212,6 +1213,30 @@ class TarotStage(QWidget):
             return self.spread_slots[index][4]
         return 0.0
 
+    def _slot_contains(self, pos, rect, index, pad=5.0):
+        """Hit-test a possibly rotated result card in its own local coordinates."""
+        rot = self._slot_rotation(index)
+        c = rect.center()
+        if abs(rot) < 0.01:
+            return rect.adjusted(-pad, -pad, pad, pad).contains(pos)
+        a = math.radians(-rot)
+        dx, dy = pos.x() - c.x(), pos.y() - c.y()
+        rx = dx * math.cos(a) - dy * math.sin(a) + c.x()
+        ry = dx * math.sin(a) + dy * math.cos(a) + c.y()
+        return rect.adjusted(-pad, -pad, pad, pad).contains(QPointF(rx, ry))
+
+    def _spread_label_rect(self, index, rect):
+        """Place labels outside the visible rotated card bounds to prevent overlap."""
+        rot = abs(self._slot_rotation(index)) % 180.0
+        if 70.0 <= rot <= 110.0:
+            # A horizontal crossing card is much wider than its unrotated QRectF.
+            visual_w = rect.height()
+            visual_h = rect.width()
+            return QRectF(rect.center().x() - visual_w * .50,
+                          rect.center().y() + visual_h * .50 + 7,
+                          visual_w, 24)
+        return QRectF(rect.left() - 22, rect.bottom() + 5, rect.width() + 44, 28)
+
     def _idle_geometry(self, i, count=None):
         n = max(1, count if count is not None else len(self.active_order))
         t = i/(n-1) if n > 1 else .5
@@ -1410,7 +1435,11 @@ class TarotStage(QWidget):
         y = self._lerp(deck.top(), slot.top(), q) - math.sin(q*math.pi)*34.0
         w = self._lerp(deck.width(), slot.width(), q)
         h = self._lerp(deck.height(), slot.height(), q)
-        rot = self._lerp(-4.0, 0.0, q)
+        # Rotate continuously into the real spread orientation. In the Celtic
+        # Cross this makes the Challenge card visibly travel and turn through 90°
+        # instead of teleporting sideways after it lands.
+        target_rot = self._slot_rotation(index)
+        rot = self._lerp(-4.0, target_rot, q)
         return QRectF(x, y, w, h), rot
 
     def _riffle_pose(self, cid, elapsed):
@@ -1494,8 +1523,11 @@ class TarotStage(QWidget):
             self.update()
             super().mouseMoveEvent(event)
             return
-        for i, r in enumerate(slots):
-            if r.adjusted(-5, -5, 5, 5).contains(pos):
+        # Paint order places later spread cards on top. Hit-test in reverse so
+        # crossing cards (notably Celtic Cross card 2) remain independently usable.
+        for i in range(len(slots) - 1, -1, -1):
+            r = slots[i]
+            if self._slot_contains(pos, r, i, 5.0):
                 hit = i
                 break
         if hit != self.hovered_slot:
@@ -1533,8 +1565,10 @@ class TarotStage(QWidget):
                 if order and self._deck_rect().adjusted(-8,-8,8,8).contains(event.position()):
                     cid = order[-1]
             elif self.state in ("await_reveal", "done"):
-                for i, r in enumerate(self._result_slots()):
-                    if r.adjusted(-5, -5, 5, 5).contains(event.position()) and i < len(self.selected_indices):
+                _slots = self._result_slots()
+                for i in range(len(_slots) - 1, -1, -1):
+                    r = _slots[i]
+                    if i < len(self.selected_indices) and self._slot_contains(event.position(), r, i, 5.0):
                         cid = self.selected_indices[i]
                         break
             if cid >= 0:
@@ -1570,8 +1604,10 @@ class TarotStage(QWidget):
 
         if event.button() == Qt.LeftButton and self.state in ("await_reveal", "done"):
             pos = event.position()
-            for i, r in enumerate(self._result_slots()):
-                if r.adjusted(-5, -5, 5, 5).contains(pos):
+            _slots = self._result_slots()
+            for i in range(len(_slots) - 1, -1, -1):
+                r = _slots[i]
+                if self._slot_contains(pos, r, i, 5.0):
                     if self.free_move_enabled:
                         self.drag_slot = i
                         self.drag_offset = QPointF(pos.x()-r.left(), pos.y()-r.top())
@@ -1890,9 +1926,9 @@ class TarotStage(QWidget):
                     e = self._ease_in_out(q)
                     src=d["rect"]; dst=slots[slot]
                     r=QRectF(self._lerp(src.left(),dst.left(),e), self._lerp(src.top(),dst.top(),e)-math.sin(e*math.pi)*46.0, self._lerp(src.width(),dst.width(),e), self._lerp(src.height(),dst.height(),e))
-                    self._paint_physical_back(p,cid,r,self._lerp(d["rot"],0.0,e),255,True)
+                    self._paint_physical_back(p,cid,r,self._lerp(d["rot"],self._slot_rotation(slot),e),255,True)
                 else:
-                    self._paint_physical_back(p,cid,slots[slot],0.0,255,True)
+                    self._paint_physical_back(p,cid,slots[slot],self._slot_rotation(slot),255,True)
             if self.manual_drag_cid >= 0:
                 self._paint_physical_back(p,self.manual_drag_cid,self.manual_drag_rect,0.0,255,True)
             p.setPen(QColor("#808080")); p.setFont(QFont("Segoe UI",10))
@@ -1933,10 +1969,10 @@ class TarotStage(QWidget):
                             self._lerp(src.width(), dst.width(), e),
                             self._lerp(src.height(), dst.height(), e),
                         )
-                        rot = self._lerp(d["rot"], 0.0, e)
+                        rot = self._lerp(d["rot"], self._slot_rotation(slot), e)
                         self._paint_physical_back(p, cid, r, rot, 255, True)
                     else:
-                        self._paint_physical_back(p, cid, slots[slot], 0.0, 255, True)
+                        self._paint_physical_back(p, cid, slots[slot], self._slot_rotation(slot), 255, True)
 
                 if self.manual_drag_cid >= 0:
                     self._paint_physical_back(p,self.manual_drag_cid,self.manual_drag_rect,0.0,255,True)
@@ -1968,7 +2004,7 @@ class TarotStage(QWidget):
                 self._paint_physical_back(p, cid, r, rot, 255, False)
                 p.restore()
             for slot, cid in enumerate(self.selected_indices):
-                self._paint_physical_back(p, cid, slots[slot], 0.0, 255, True)
+                self._paint_physical_back(p, cid, slots[slot], self._slot_rotation(slot), 255, True)
             self._paint_progress(p, q, "GATHER REMAINING CARDS")
             return
 
@@ -2013,11 +2049,16 @@ class TarotStage(QWidget):
         if self.spread_slots and self.spread_labels:
             p.save()
             p.setFont(QFont("Segoe UI", 8))
-            p.setPen(QColor("#777777"))
             for i, r in enumerate(slots):
                 if i < len(self.spread_labels):
                     txt = self.spread_labels[i]
-                    rr = QRectF(r.left()-18, r.bottom()+2, r.width()+36, 28)
+                    rr = self._spread_label_rect(i, r)
+                    # A small dark backing keeps labels readable over nearby cards
+                    # and prevents Celtic Cross Present/Challenge labels colliding.
+                    p.setPen(Qt.NoPen)
+                    p.setBrush(QColor(5, 5, 5, 215))
+                    p.drawRoundedRect(rr.adjusted(-3, -1, 3, 1), 4, 4)
+                    p.setPen(QColor("#8a8a8a"))
                     p.drawText(rr, Qt.AlignHCenter | Qt.AlignTop | Qt.TextWordWrap, txt)
             p.restore()
 
@@ -2084,6 +2125,124 @@ class MethodCard(QFrame):
     def mousePressEvent(self, event):
         if self.enabled_method and event.button() == Qt.LeftButton:
             self.clicked.emit(self.title)
+        super().mousePressEvent(event)
+
+class SpreadPreview(QWidget):
+    def __init__(self, key, parent=None):
+        super().__init__(parent)
+        self.key = key
+        self.setFixedSize(84, 58)
+
+    def _mini_card(self, p, cx, cy, w=12.0, h=18.0, rot=0.0):
+        p.save()
+        p.translate(cx, cy)
+        p.rotate(rot)
+        rect = QRectF(-w/2, -h/2, w, h)
+        p.setPen(QPen(QColor('#858585'), 1.0))
+        p.setBrush(QColor(16, 16, 16, 220))
+        p.drawRoundedRect(rect, 2.2, 2.2)
+        p.restore()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.fillRect(self.rect(), Qt.transparent)
+        box = QRectF(0.5, 0.5, self.width()-1.0, self.height()-1.0)
+        p.setPen(QPen(QColor('#303030'), 1.0))
+        p.setBrush(QColor('#121212'))
+        p.drawRoundedRect(box, 10, 10)
+        key = self.key
+
+        if key == 'single':
+            self._mini_card(p, 42, 29, 15, 23, 0)
+        elif key == 'three':
+            for x in (22, 42, 62):
+                self._mini_card(p, x, 29, 12, 20, 0)
+        elif key == 'horseshoe':
+            pts = [(14,42,-12),(25,27,-8),(37,17,-4),(49,15,0),(61,17,4),(73,27,8),(84-14,42,12)]
+            for x,y,r in pts:
+                self._mini_card(p, x, y, 8.8, 13.2, r)
+        elif key == 'celtic':
+            self._mini_card(p, 28, 30, 10, 16, 0)
+            self._mini_card(p, 28, 30, 10, 16, 90)
+            self._mini_card(p, 28, 47, 10, 16, 0)
+            self._mini_card(p, 14, 30, 10, 16, 0)
+            self._mini_card(p, 28, 13, 10, 16, 0)
+            self._mini_card(p, 42, 30, 10, 16, 0)
+            for i,y in enumerate((46,34,22,10)):
+                self._mini_card(p, 68, y, 10, 16, 0)
+        elif key == 'relationship':
+            for y in (14, 29, 44):
+                self._mini_card(p, 20, y, 9.5, 14.5, 0)
+                self._mini_card(p, 64, y, 9.5, 14.5, 0)
+            self._mini_card(p, 42, 29, 10.5, 15.5, 0)
+        elif key == 'choice':
+            self._mini_card(p, 42, 32, 10, 15, 0)
+            for x,y,r in ((28,23,-8),(18,15,-12),(10,8,-15),(56,23,8),(66,15,12),(74,8,15)):
+                self._mini_card(p, x, y, 8.5, 12.8, r)
+        elif key == 'timeline':
+            for x in (12, 28, 42, 56, 72):
+                self._mini_card(p, x, 29, 9.5, 15, 0)
+        elif key == 'annual':
+            self._mini_card(p, 42, 29, 10, 15, 0)
+            for i in range(12):
+                a = 2*math.pi*i/12.0 - math.pi/2
+                x = 42 + math.cos(a)*22
+                y = 29 + math.sin(a)*18
+                self._mini_card(p, x, y, 6.5, 10, 0)
+        elif key == 'tree':
+            pts = [(42,10),(55,18),(29,18),(29,30),(55,30),(42,36),(29,43),(55,43),(42,50),(42,58)]
+            for x,y in pts:
+                if 0 <= y <= 58:
+                    self._mini_card(p, x, y, 8.0, 11.8, 0)
+        else:
+            self._mini_card(p, 42, 29, 14, 22, 0)
+
+
+class SpreadChoiceCard(QFrame):
+    clicked = Signal(str)
+
+    def __init__(self, key, title, subtitle, parent=None):
+        super().__init__(parent)
+        self.key = key
+        self.setObjectName('spreadChoiceCard')
+        self.setProperty('checked', False)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setMinimumHeight(104)
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(12, 12, 12, 12)
+        row.setSpacing(12)
+
+        preview = SpreadPreview(key)
+        row.addWidget(preview)
+
+        text_col = QVBoxLayout()
+        text_col.setSpacing(2)
+        title_lbl = QLabel(title)
+        title_lbl.setObjectName('spreadChoiceTitle')
+        title_lbl.setWordWrap(True)
+        sub_lbl = QLabel(subtitle)
+        sub_lbl.setObjectName('spreadChoiceSubtitle')
+        sub_lbl.setWordWrap(True)
+        sub_lbl.setMinimumHeight(30)
+        text_col.addWidget(title_lbl)
+        text_col.addWidget(sub_lbl)
+        row.addLayout(text_col, 1)
+
+        arrow = QLabel('›')
+        arrow.setObjectName('spreadChoiceArrow')
+        row.addWidget(arrow)
+
+    def setSelected(self, selected):
+        self.setProperty('checked', bool(selected))
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit(self.key)
         super().mousePressEvent(event)
 
 
@@ -2252,48 +2411,115 @@ class CustomTarotPage(QWidget):
 
 
 class ClassicTarotPage(QWidget):
-    """Fixed traditional tarot layouts using the same persistent physical deck engine."""
+    """Classic spreads use a two-step flow: choose a spread, then open its table."""
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.current_spread_key = "single"
+        self.spread_cards = {}
+
         outer = QVBoxLayout(self)
         outer.setContentsMargins(34, 20, 34, 20)
         outer.setSpacing(10)
 
+        self.view_stack = QStackedWidget()
+        outer.addWidget(self.view_stack, 1)
+
+        # ---------- page 1: spread selection only ----------
+        choose_page = QWidget()
+        choose_outer = QVBoxLayout(choose_page)
+        choose_outer.setContentsMargins(0, 0, 0, 0)
+        choose_outer.setSpacing(14)
+
+        kicker = QLabel("TAROT / CLASSIC SPREADS")
+        kicker.setObjectName("kicker")
+        choose_title = QLabel(TXT("选择经典牌阵", "Choose a Classic Spread"))
+        choose_title.setObjectName("pageTitle")
+        choose_desc = QLabel(TXT(
+            "先选择牌阵。选择后才会进入独立牌桌页面；每个模块会直观展示牌阵的结构或特色。",
+            "Choose a spread first. The reading table opens on a separate page only after selection; each module previews the spread's structure or signature."
+        ))
+        choose_desc.setObjectName("pageDesc")
+        choose_desc.setWordWrap(True)
+        choose_outer.addWidget(kicker)
+        choose_outer.addWidget(choose_title)
+        choose_outer.addWidget(choose_desc)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setObjectName("spreadScroll")
+        grid_host = QWidget()
+        grid = QGridLayout(grid_host)
+        grid.setContentsMargins(0, 6, 8, 10)
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(12)
+
+        spread_info = [
+            ("single", TXT("单张牌", "Single Card"), TXT("1 张 · 聚焦核心问题", "1 card · focus the core question")),
+            ("three", TXT("三张牌阵", "Three-Card Spread"), TXT("过去 · 现在 · 未来", "Past · Present · Future")),
+            ("horseshoe", TXT("马蹄铁牌阵", "Horseshoe"), TXT("7 张弧形 · 观察整体趋势", "7-card arc · see the overall flow")),
+            ("celtic", TXT("凯尔特十字", "Celtic Cross"), TXT("10 张经典结构 · 复杂问题", "10-card classic layout · complex readings")),
+            ("relationship", TXT("关系牌阵", "Relationship Spread"), TXT("双方状态 + 关系核心", "two people + relationship core")),
+            ("choice", TXT("选择牌阵", "Choice / Two Paths"), TXT("A / B 两条路径对比", "compare Path A and Path B")),
+            ("timeline", TXT("五张时间线", "Five-Card Timeline"), TXT("过去 → 现在 → 未来", "past → present → future")),
+            ("annual", TXT("年度十三张", "13-Card Year Spread"), TXT("中央主题 + 12 个月", "year theme + 12 months")),
+            ("tree", TXT("生命之树", "Tree of Life"), TXT("卡巴拉十个质点位置", "ten sephirot positions")),
+        ]
+        for i, (key, title_txt, sub_txt) in enumerate(spread_info):
+            card = SpreadChoiceCard(key, title_txt, sub_txt)
+            card.clicked.connect(self._enter_spread)
+            self.spread_cards[key] = card
+            grid.addWidget(card, i // 3, i % 3)
+        for col in range(3):
+            grid.setColumnStretch(col, 1)
+        scroll.setWidget(grid_host)
+        choose_outer.addWidget(scroll, 1)
+        self.view_stack.addWidget(choose_page)
+
+        # ---------- page 2: reading table only ----------
+        table_page = QWidget()
+        table_outer = QVBoxLayout(table_page)
+        table_outer.setContentsMargins(0, 0, 0, 0)
+        table_outer.setSpacing(10)
+
         head = QHBoxLayout()
-        text = QVBoxLayout(); text.setSpacing(3)
-        kicker = QLabel("TAROT / CLASSIC SPREADS"); kicker.setObjectName("kicker")
-        title = QLabel(TXT("经典牌阵", "Classic Spreads")); title.setObjectName("pageTitle")
-        self.desc = QLabel(); self.desc.setObjectName("pageDesc"); self.desc.setWordWrap(True)
-        text.addWidget(kicker); text.addWidget(title); text.addWidget(self.desc)
-        head.addLayout(text, 1)
+        text_col = QVBoxLayout(); text_col.setSpacing(3)
+        top_line = QHBoxLayout(); top_line.setSpacing(8)
+        self.back_button = QPushButton(TXT("‹ 选择牌阵", "‹ Choose Spread"))
+        self.back_button.setObjectName("chipButton")
+        self.back_button.setCursor(Qt.PointingHandCursor)
+        self.back_button.setMinimumHeight(34)
+        top_line.addWidget(self.back_button, 0, Qt.AlignLeft)
+        top_line.addStretch(1)
+        text_col.addLayout(top_line)
+        reading_kicker = QLabel("TAROT / CLASSIC SPREAD / TABLE")
+        reading_kicker.setObjectName("kicker")
+        self.reading_title = QLabel()
+        self.reading_title.setObjectName("pageTitle")
+        self.reading_desc = QLabel()
+        self.reading_desc.setObjectName("pageDesc")
+        self.reading_desc.setWordWrap(True)
+        text_col.addWidget(reading_kicker)
+        text_col.addWidget(self.reading_title)
+        text_col.addWidget(self.reading_desc)
+        head.addLayout(text_col, 1)
 
         actions = QHBoxLayout(); actions.setSpacing(8)
-        self.manual_button = QPushButton(TXT("自己选择", "Choose Cards")); self.manual_button.setObjectName("chipButton"); self.manual_button.setFixedSize(112,42)
-        self.shuffle_button = QPushButton(TXT("洗牌", "Shuffle")); self.shuffle_button.setObjectName("chipButton"); self.shuffle_button.setFixedSize(88,42)
-        self.stop_button = QPushButton(TXT("终止洗牌", "Stop Shuffle")); self.stop_button.setObjectName("dangerChipButton"); self.stop_button.setFixedSize(104,42); self.stop_button.setEnabled(False)
-        self.draw_button = QPushButton(TXT("抽取", "Draw")); self.draw_button.setObjectName("primaryButton"); self.draw_button.setFixedSize(92,42)
-        for b in (self.manual_button,self.shuffle_button,self.stop_button,self.draw_button): b.setCursor(Qt.PointingHandCursor); actions.addWidget(b)
-        head.addLayout(actions); outer.addLayout(head)
+        self.manual_button = QPushButton(TXT("自己选择", "Choose Cards")); self.manual_button.setObjectName("chipButton"); self.manual_button.setMinimumSize(112,42)
+        self.shuffle_button = QPushButton(TXT("洗牌", "Shuffle")); self.shuffle_button.setObjectName("chipButton"); self.shuffle_button.setMinimumSize(88,42)
+        self.stop_button = QPushButton(TXT("终止洗牌", "Stop Shuffle")); self.stop_button.setObjectName("dangerChipButton"); self.stop_button.setMinimumSize(104,42); self.stop_button.setEnabled(False)
+        self.draw_button = QPushButton(TXT("抽取", "Draw")); self.draw_button.setObjectName("primaryButton"); self.draw_button.setMinimumSize(92,42)
+        for b in (self.manual_button,self.shuffle_button,self.stop_button,self.draw_button):
+            b.setCursor(Qt.PointingHandCursor)
+            actions.addWidget(b)
+        head.addLayout(actions)
+        table_outer.addLayout(head)
 
         config = QFrame(); config.setObjectName("configPanel")
         panel = QVBoxLayout(config); panel.setContentsMargins(16,10,16,10); panel.setSpacing(8)
         row1 = QHBoxLayout(); row1.setSpacing(9)
-        spread_label = QLabel(TXT("牌阵", "Spread")); spread_label.setObjectName("settingTitle"); row1.addWidget(spread_label)
-        self.spread_combo = QComboBox(); self.spread_combo.setObjectName("settingCombo"); self.spread_combo.setMinimumWidth(220)
-        for key, zh, en in [
-            ("single","单张牌","Single Card"),
-            ("three","三张牌阵","Three-Card Spread"),
-            ("horseshoe","马蹄铁牌阵","Horseshoe"),
-            ("celtic","凯尔特十字","Celtic Cross"),
-            ("relationship","关系牌阵","Relationship Spread"),
-            ("choice","选择牌阵","Choice / Two Paths"),
-            ("timeline","五张时间线","Five-Card Timeline"),
-            ("annual","年度十三张","13-Card Year Spread"),
-            ("tree","生命之树","Tree of Life"),
-        ]:
-            self.spread_combo.addItem(TXT(zh,en), key)
-        row1.addWidget(self.spread_combo)
-        self.count_text = QLabel(); self.count_text.setObjectName("settingNote"); row1.addWidget(self.count_text)
+        self.count_text = QLabel(); self.count_text.setObjectName("settingTitle"); row1.addWidget(self.count_text)
         row1.addStretch(1)
         riffle_label=QLabel(TXT("Riffle 次数","Riffle Count")); riffle_label.setObjectName("settingNote"); row1.addWidget(riffle_label)
         self.riffle_input=QLineEdit("3"); self.riffle_input.setObjectName("numberInput"); self.riffle_input.setValidator(QIntValidator(1,50,self)); self.riffle_input.setAlignment(Qt.AlignCenter); self.riffle_input.setFixedSize(50,34); row1.addWidget(self.riffle_input)
@@ -2312,13 +2538,19 @@ class ClassicTarotPage(QWidget):
         row2.addStretch(1)
         self.reverse=MiniSwitch(TXT("允许逆位","Allow Reversed"),True); self.major=MiniSwitch(TXT("仅大阿卡纳","Major Arcana Only"),False)
         row2.addWidget(self.reverse); row2.addWidget(self.major); panel.addLayout(row2)
-        outer.addWidget(config)
+        table_outer.addWidget(config)
 
-        self.stage=TarotStage(); self.stage.configure_runtime(APP_SETTINGS.get("language","zh"), APP_SETTINGS.get("mark_back",False)); outer.addWidget(self.stage,1)
-        stat=QHBoxLayout(); self.status=QLabel(TXT("选择一个经典牌阵开始。","Choose a classic spread to begin.")); self.status.setObjectName("statusText"); stat.addWidget(self.status); stat.addStretch(1)
-        self.card_count=QLabel(f"RESOURCE / {len(self.stage.card_files)} CARDS"); self.card_count.setObjectName("muted"); stat.addWidget(self.card_count); outer.addLayout(stat)
+        self.stage=TarotStage()
+        self.stage.configure_runtime(APP_SETTINGS.get("language","zh"), APP_SETTINGS.get("mark_back",False))
+        table_outer.addWidget(self.stage,1)
+        stat=QHBoxLayout()
+        self.status=QLabel(TXT("牌阵已就绪。","Spread ready.")); self.status.setObjectName("statusText"); self.status.setWordWrap(True)
+        stat.addWidget(self.status, 1)
+        self.card_count=QLabel(f"RESOURCE / {len(self.stage.card_files)} CARDS"); self.card_count.setObjectName("muted"); stat.addWidget(self.card_count)
+        table_outer.addLayout(stat)
+        self.view_stack.addWidget(table_page)
 
-        self.spread_combo.currentIndexChanged.connect(self._spread_changed)
+        self.back_button.clicked.connect(self._back_to_selection)
         self.shuffle_button.clicked.connect(self._shuffle)
         self.stop_button.clicked.connect(self._stop)
         self.draw_button.clicked.connect(self._draw)
@@ -2326,56 +2558,80 @@ class ClassicTarotPage(QWidget):
         self.stage.animationStatus.connect(self.status.setText)
         self.stage.shuffleFinished.connect(self._shuffle_finished)
         self.stage.animationFinished.connect(self._finished)
-        self._spread_changed()
+        self.view_stack.setCurrentIndex(0)
 
     def _definition(self, key):
-        # Positions follow the conventional physical layouts. Coordinates are
-        # normalized to the tabletop; the second Celtic-Cross card is rotated 90°.
+        # Positions follow conventional physical layouts. The Celtic Cross second
+        # card shares the center but is rotated 90 degrees as the crossing card.
         defs = {
-            "single": dict(count=1, desc=TXT("一张牌用于聚焦当前问题、每日提示或核心主题。","One card focuses the reading on the present question, daily message, or core theme."),
+            "single": dict(count=1, title=TXT("单张牌", "Single Card"), desc=TXT("一张牌用于聚焦当前问题、每日提示或核心主题。","One card focuses the reading on the present question, daily message, or core theme."),
                 slots=[(.50,.48,.105,.34,0)], labels=[TXT("核心","Core")]),
-            "three": dict(count=3, desc=TXT("最常见的三张牌阵：过去－现在－未来。","The classic three-card line: Past – Present – Future."),
+            "three": dict(count=3, title=TXT("三张牌阵", "Three-Card Spread"), desc=TXT("最常见的三张牌阵：过去－现在－未来。","The classic three-card line: Past – Present – Future."),
                 slots=[(.30,.48,.09,.30,0),(.50,.48,.09,.30,0),(.70,.48,.09,.30,0)], labels=[TXT("过去","Past"),TXT("现在","Present"),TXT("未来","Future")]),
-            "horseshoe": dict(count=7, desc=TXT("七张马蹄铁由左至右形成弧形，用于观察过去、现在、隐性影响、阻碍、外界、建议与结果。","Seven cards form a horseshoe arc for past, present, hidden influence, obstacles, environment, advice, and outcome."),
+            "horseshoe": dict(count=7, title=TXT("马蹄铁牌阵", "Horseshoe"), desc=TXT("七张马蹄铁由左至右形成弧形，用于观察过去、现在、隐性影响、阻碍、外界、建议与结果。","Seven cards form a horseshoe arc for past, present, hidden influence, obstacles, environment, advice, and outcome."),
                 slots=[(.18,.66,.067,.225,-11),(.29,.48,.067,.225,-7),(.40,.34,.067,.225,-3),(.50,.29,.067,.225,0),(.60,.34,.067,.225,3),(.71,.48,.067,.225,7),(.82,.66,.067,.225,11)],
                 labels=[TXT("过去","Past"),TXT("现在","Present"),TXT("隐性影响","Hidden"),TXT("阻碍","Obstacle"),TXT("外界","Environment"),TXT("建议","Advice"),TXT("结果","Outcome")]),
-            "celtic": dict(count=10, desc=TXT("经典凯尔特十字：中央十字描述问题本身，右侧四张牌形成纵列。","Traditional Celtic Cross: the central cross describes the situation and a four-card staff stands on the right."),
+            "celtic": dict(count=10, title=TXT("凯尔特十字", "Celtic Cross"), desc=TXT("经典凯尔特十字：中央十字描述问题本身，右侧四张牌形成纵列。","Traditional Celtic Cross: the central cross describes the situation and a four-card staff stands on the right."),
                 slots=[(.40,.48,.062,.215,0),(.40,.48,.062,.215,90),(.40,.75,.062,.215,0),(.25,.48,.062,.215,0),(.40,.20,.062,.215,0),(.55,.48,.062,.215,0),(.78,.79,.062,.215,0),(.78,.59,.062,.215,0),(.78,.39,.062,.215,0),(.78,.19,.062,.215,0)],
                 labels=[TXT("现状","Present"),TXT("挑战","Challenge"),TXT("根基","Foundation"),TXT("过去","Past"),TXT("可能","Possibility"),TXT("近期未来","Near Future"),TXT("自我","Self"),TXT("环境","Environment"),TXT("希望/恐惧","Hopes/Fears"),TXT("结果","Outcome")]),
-            "relationship": dict(count=7, desc=TXT("七张关系牌阵：左右两列分别代表双方，中央牌代表关系核心。","Seven-card relationship spread: two columns represent each person and the center card represents the relationship itself."),
+            "relationship": dict(count=7, title=TXT("关系牌阵", "Relationship Spread"), desc=TXT("七张关系牌阵：左右两列分别代表双方，中央牌代表关系核心。","Seven-card relationship spread: two columns represent each person and the center card represents the relationship itself."),
                 slots=[(.30,.24,.072,.24,0),(.30,.50,.072,.24,0),(.30,.76,.072,.24,0),(.50,.50,.072,.24,0),(.70,.24,.072,.24,0),(.70,.50,.072,.24,0),(.70,.76,.072,.24,0)],
                 labels=[TXT("你·想法","You·Mind"),TXT("你·感受","You·Heart"),TXT("你·行动","You·Action"),TXT("关系核心","Bond"),TXT("对方·想法","Other·Mind"),TXT("对方·感受","Other·Heart"),TXT("对方·行动","Other·Action")]),
-            "choice": dict(count=7, desc=TXT("选择牌阵从中央现状牌分成左右两条路径，每条路径连续三张。","A two-path choice spread: one present card branches into three cards for Path A and three for Path B."),
+            "choice": dict(count=7, title=TXT("选择牌阵", "Choice / Two Paths"), desc=TXT("选择牌阵从中央现状牌分成左右两条路径，每条路径连续三张。","A two-path choice spread: one present card branches into three cards for Path A and three for Path B."),
                 slots=[(.50,.50,.072,.24,0),(.38,.39,.072,.24,-6),(.27,.29,.072,.24,-9),(.17,.20,.072,.24,-12),(.62,.39,.072,.24,6),(.73,.29,.072,.24,9),(.83,.20,.072,.24,12)],
                 labels=[TXT("当前","Present"),TXT("A·第一步","A·Step 1"),TXT("A·发展","A·Development"),TXT("A·结果","A·Outcome"),TXT("B·第一步","B·Step 1"),TXT("B·发展","B·Development"),TXT("B·结果","B·Outcome")]),
-            "timeline": dict(count=5, desc=TXT("五张牌由左到右构成时间线，从远过去延伸到未来趋势。","Five cards form a left-to-right timeline from the deeper past to the future trend."),
+            "timeline": dict(count=5, title=TXT("五张时间线", "Five-Card Timeline"), desc=TXT("五张牌由左到右构成时间线，从远过去延伸到未来趋势。","Five cards form a left-to-right timeline from the deeper past to the future trend."),
                 slots=[(.16,.50,.075,.25,0),(.33,.50,.075,.25,0),(.50,.50,.075,.25,0),(.67,.50,.075,.25,0),(.84,.50,.075,.25,0)], labels=[TXT("远过去","Distant Past"),TXT("近期过去","Recent Past"),TXT("现在","Present"),TXT("近期未来","Near Future"),TXT("趋势","Trend")]),
-            "annual": dict(count=13, desc=TXT("十二张牌环绕中央年度主题牌；外圈按顺时针方向对应十二个月。","Twelve month cards circle a central yearly-theme card, arranged clockwise."),
-                slots=[(.50,.50,.052,.18,0)] + [(.50+math.sin(2*math.pi*i/12)*.34,.50-math.cos(2*math.pi*i/12)*.34,.048,.165,(i*30)%360 if False else 0) for i in range(12)],
+            "annual": dict(count=13, title=TXT("年度十三张", "13-Card Year Spread"), desc=TXT("十二张牌环绕中央年度主题牌；外圈按顺时针方向对应十二个月。","Twelve month cards circle a central yearly-theme card, arranged clockwise."),
+                slots=[(.50,.50,.052,.18,0)] + [(.50+math.sin(2*math.pi*i/12)*.34,.50-math.cos(2*math.pi*i/12)*.34,.048,.165,0) for i in range(12)],
                 labels=[TXT("年度主题","Year Theme")]+[TXT(f"{i}月",f"Month {i}") for i in range(1,13)]),
-            "tree": dict(count=10, desc=TXT("十张牌按照卡巴拉生命之树的十个质点位置排列。","Ten cards follow the ten sephirot of the Kabbalistic Tree of Life."),
+            "tree": dict(count=10, title=TXT("生命之树", "Tree of Life"), desc=TXT("十张牌按照卡巴拉生命之树的十个质点位置排列。","Ten cards follow the ten sephirot of the Kabbalistic Tree of Life."),
                 slots=[(.50,.12,.058,.20,0),(.66,.25,.058,.20,0),(.34,.25,.058,.20,0),(.34,.43,.058,.20,0),(.66,.43,.058,.20,0),(.50,.54,.058,.20,0),(.34,.67,.058,.20,0),(.66,.67,.058,.20,0),(.50,.79,.058,.20,0),(.50,.93,.058,.20,0)],
                 labels=["Kether","Chokmah","Binah","Chesed","Geburah","Tiphareth","Netzach","Hod","Yesod","Malkuth"]),
         }
         return defs[key]
 
-    def _spread_changed(self, *args):
-        d=self._definition(self.spread_combo.currentData())
-        self.desc.setText(d["desc"]); self.count_text.setText(TXT(f'{d["count"]} 张固定位置',f'{d["count"]} fixed positions'))
-        self.stage.configure_spread(d["slots"], d["labels"]); self.stage.configure_free_move(False); self.stage.draw_count=d["count"]
-        # Changing spread starts a fresh physical reading while preserving marks.
-        self.stage.deck_order=list(range(len(self.stage.cards))); self.stage.active_order=self.stage.deck_order[:]
-        self.stage.selected_indices=[]; self.stage.selected_reversed=[]; self.stage.revealed=[]; self.stage.flip_started_by_slot={}; self.stage.flip_target_by_slot={}; self.stage.state="idle"; self.stage.update()
+    def _enter_spread(self, key):
+        if key not in self.spread_cards:
+            key = "single"
+        self.current_spread_key = key
+        d = self._definition(key)
+        for spread_key, card in self.spread_cards.items():
+            card.setSelected(spread_key == key)
+        self.reading_title.setText(d["title"])
+        self.reading_desc.setText(d["desc"])
+        self.count_text.setText(TXT(f'{d["count"]} 张固定位置', f'{d["count"]} fixed positions'))
+        self.stage.configure_spread(d["slots"], d["labels"])
+        self.stage.configure_free_move(False)
+        self.stage.draw_count = d["count"]
+        # A new spread starts a fresh full physical deck but preserves marks bound
+        # to PhysicalCard objects.
+        self.stage.deck_order = list(range(len(self.stage.cards)))
+        self.stage.active_order = self.stage.deck_order[:]
+        self.stage.selected_indices = []
+        self.stage.selected_reversed = []
+        self.stage.revealed = []
+        self.stage.flip_started_by_slot = {}
+        self.stage.flip_target_by_slot = {}
+        self.stage.state = "idle"
+        self.stage.update()
         self.status.setText(TXT("牌阵已就绪 · 可洗牌、自动抽取或自己选择。","Spread ready · shuffle, draw automatically, or choose cards yourself."))
+        self.view_stack.setCurrentIndex(1)
+
+    def _back_to_selection(self):
+        if self.stage.state in ("showcase_front","showcase_flip","gather","cut_spread","cut_restack","split","riffle","square","deal","self_drop","fan_insert","manual_gather_rest"):
+            return
+        self.view_stack.setCurrentIndex(0)
 
     def _set_controls(self, enabled):
-        for w in (self.spread_combo,self.shuffle_button,self.draw_button,self.manual_button,self.riffle_input,self.cut_input,self.rain,self.fan,self.showcase,self.reverse,self.major): w.setEnabled(enabled)
+        for w in (self.back_button,self.shuffle_button,self.draw_button,self.manual_button,self.riffle_input,self.cut_input,self.rain,self.fan,self.showcase,self.reverse,self.major):
+            w.setEnabled(enabled)
         running=self.stage.state in ("showcase_front","showcase_flip","gather","cut_spread","cut_restack","split","riffle","square")
         self.stop_button.setEnabled(running)
 
     def _shuffle(self):
         if self.stage.state not in ("idle","done","shuffled"): return
-        d=self._definition(self.spread_combo.currentData()); self.stage.configure_spread(d["slots"],d["labels"]); self.stage.configure_free_move(False)
+        d=self._definition(self.current_spread_key); self.stage.configure_spread(d["slots"],d["labels"]); self.stage.configure_free_move(False)
         try:r=int(self.riffle_input.text() or "3")
         except:r=3
         try:c=int(self.cut_input.text() or "2")
@@ -2391,12 +2647,12 @@ class ClassicTarotPage(QWidget):
 
     def _draw(self):
         if self.stage.state not in ("idle","done","shuffled"): return
-        d=self._definition(self.spread_combo.currentData()); self.stage.configure_spread(d["slots"],d["labels"]); self.stage.configure_free_move(False); self._set_controls(False)
+        d=self._definition(self.current_spread_key); self.stage.configure_spread(d["slots"],d["labels"]); self.stage.configure_free_move(False); self._set_controls(False)
         self.stage.draw_from_deck(d["count"],self.major.isChecked())
 
     def _manual(self):
         if self.stage.state not in ("idle","done","shuffled"): return
-        d=self._definition(self.spread_combo.currentData()); self.stage.configure_spread(d["slots"],d["labels"]); self.stage.configure_free_move(False); old=self.stage.state; self._set_controls(False)
+        d=self._definition(self.current_spread_key); self.stage.configure_spread(d["slots"],d["labels"]); self.stage.configure_free_move(False); old=self.stage.state; self._set_controls(False)
         self.stage.start_manual(d["count"],self.reverse.isChecked(),"fan" if self.fan.isChecked() else "rain")
         if self.stage.state==old: self._set_controls(True)
 
@@ -2499,9 +2755,14 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(f"{APP_NAME}  ·  {APP_VERSION}")
         self.resize(1440, 900)
-        self.setMinimumSize(1180, 760)
+        self._base_window_min = QSize(1180, 760)
+        self.setMinimumSize(self._base_window_min)
         self._language = APP_SETTINGS.get("language", "zh")
+        self.ui_scale = 1.0
         self._build_ui()
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
 
     def _build_ui(self):
         root = QWidget()
@@ -2611,7 +2872,73 @@ class MainWindow(QMainWindow):
         main.addWidget(content, 1)
 
         self.nav_group.idClicked.connect(self._navigate)
-        self.setStyleSheet(STYLE)
+        self._capture_zoom_baselines()
+        self._apply_zoom()
+
+    def _capture_zoom_baselines(self):
+        """Remember the unscaled geometry of fixed/minimum-sized widgets."""
+        for w in self.findChildren(QWidget):
+            w._zoom_base_min = QSize(w.minimumSize())
+            w._zoom_base_max = QSize(w.maximumSize())
+
+    @staticmethod
+    def _scaled_size(base, scale, is_max=False):
+        w, h = base.width(), base.height()
+        # Qt's default maximum is effectively infinite and should stay that way.
+        if is_max:
+            sw = w if w >= 1000000 else max(0, int(round(w * scale)))
+            sh = h if h >= 1000000 else max(0, int(round(h * scale)))
+        else:
+            sw = max(0, int(round(w * scale)))
+            sh = max(0, int(round(h * scale)))
+        return QSize(sw, sh)
+
+    def _apply_zoom(self):
+        scale = max(.70, min(1.60, float(self.ui_scale)))
+        self.ui_scale = scale
+        self.setStyleSheet(_scaled_stylesheet(STYLE, scale))
+        for w in self.findChildren(QWidget):
+            bmin = getattr(w, "_zoom_base_min", None)
+            bmax = getattr(w, "_zoom_base_max", None)
+            if bmin is not None:
+                w.setMinimumSize(self._scaled_size(bmin, scale, False))
+            if bmax is not None:
+                w.setMaximumSize(self._scaled_size(bmax, scale, True))
+        self.setMinimumSize(self._scaled_size(self._base_window_min, scale, False))
+        self.updateGeometry()
+        self.update()
+
+    def _set_zoom(self, value):
+        value = round(max(.70, min(1.60, value)) * 10.0) / 10.0
+        if abs(value - self.ui_scale) < .001:
+            return
+        self.ui_scale = value
+        self._apply_zoom()
+
+    def eventFilter(self, obj, event):
+        # Ctrl + wheel zooms regardless of which child widget is under the cursor.
+        if event.type() == QEvent.Wheel and (event.modifiers() & Qt.ControlModifier):
+            delta = event.angleDelta().y()
+            if delta:
+                self._set_zoom(self.ui_scale + (.10 if delta > 0 else -.10))
+                return True
+        if event.type() == QEvent.KeyPress:
+            key = event.key()
+            ctrl = bool(event.modifiers() & Qt.ControlModifier)
+            focus = QApplication.focusWidget()
+            # Plus/minus also work directly when the user is not typing in an input;
+            # Ctrl+Plus/Minus always work. Ctrl+0 resets to 100%.
+            allowed = ctrl or not isinstance(focus, QLineEdit)
+            if allowed and key in (Qt.Key_Plus, Qt.Key_Equal):
+                self._set_zoom(self.ui_scale + .10)
+                return True
+            if allowed and key in (Qt.Key_Minus, Qt.Key_Underscore):
+                self._set_zoom(self.ui_scale - .10)
+                return True
+            if ctrl and key == Qt.Key_0:
+                self._set_zoom(1.0)
+                return True
+        return super().eventFilter(obj, event)
 
     def _navigate(self, idx):
         self.stack.setCurrentIndex(idx)
@@ -2640,8 +2967,11 @@ class MainWindow(QMainWindow):
 
 STYLE = r"""
 * { outline: none; }
-QMainWindow, QWidget#root, QStackedWidget#stack, QWidget {
+QMainWindow, QWidget#root, QStackedWidget#stack {
     background: #070707;
+}
+QWidget {
+    background: transparent;
     color: #d8d8d8;
     font-family: "Segoe UI", "Microsoft YaHei UI", Arial, sans-serif;
     font-size: 13px;
@@ -2754,6 +3084,35 @@ QLabel#methodSubtitle, QLabel#methodArrow {
     color: #686868;
     font-size: 11px;
 }
+QScrollArea#spreadScroll, QScrollArea#spreadScroll > QWidget > QWidget {
+    background: transparent;
+    border: none;
+}
+QLabel {
+    background: transparent;
+}
+QFrame#spreadChoiceCard {
+    background: #0d0d0d;
+    border: 1px solid #252525;
+    border-radius: 13px;
+}
+QFrame#spreadChoiceCard:hover {
+    background: #111111;
+    border-color: #383838;
+}
+QFrame#spreadChoiceCard[checked="true"] {
+    background: #171717;
+    border-color: #474747;
+}
+QLabel#spreadChoiceTitle {
+    color: #e4e4e4;
+    font-size: 13px;
+    font-weight: 600;
+}
+QLabel#spreadChoiceSubtitle, QLabel#spreadChoiceArrow {
+    color: #707070;
+    font-size: 11px;
+}
 QLabel#pageTitle {
     color: #f2f2f2;
     font-size: 30px;
@@ -2844,6 +3203,15 @@ QCheckBox#optionCheck { color: #aaa; spacing: 7px; }
 QCheckBox#optionCheck::indicator, QCheckBox::indicator { width: 16px; height: 16px; }
 QComboBox#settingCombo { background: #111; color: #ddd; border: 1px solid #303030; border-radius: 8px; padding: 7px 12px; min-width: 150px; }
 """
+
+
+def _scaled_stylesheet(style, scale):
+    """Scale pixel dimensions in the Qt stylesheet while preserving the design."""
+    def repl(match):
+        value = float(match.group(1))
+        scaled = max(1, int(round(value * scale))) if value > 0 else 0
+        return f"{scaled}px"
+    return re.sub(r"(?<![\w.])(\d+(?:\.\d+)?)px", repl, style)
 
 
 def main():
