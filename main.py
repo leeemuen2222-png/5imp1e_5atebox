@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "5imp1e 5atebox"
-APP_VERSION = "0.8.1"
+APP_VERSION = "0.8.4"
 APP_SETTINGS = {"language": "zh", "mark_back": False}
 
 def TXT(zh, en):
@@ -225,6 +225,28 @@ class TarotStage(QWidget):
         self.manual_drag_rot = 0.0
         self.manual_drag_offset = QPointF(0.0, 0.0)
 
+        # Round-to-round continuity.  Direct Draw / Choose actions do not reshuffle:
+        # the current physical order is preserved and visible cards are collected
+        # back to the top of the deck before the next action starts.
+        self.deck_shuffled_since_last_action = False
+        self.pending_action = None
+        self.recollect_order_slots = []
+        self.recollect_slot_rects = {}
+        self.recollect_duration = 0.46
+        self.recollect_gap = 0.075
+        self.recollect_idle_gap = 0.012
+
+        # Small top-right warning used when the player proceeds without reshuffling.
+        self.warning_text = ""
+        self.warning_until = 0.0
+
+        # Card-rain opening: the physical deck visibly splits into several packets
+        # before all packets release their cards together.
+        self.rain_split_duration = 0.72
+        self.rain_packets = []
+        self.rain_card_group = {}
+        self.rain_card_rank = {}
+
     def _t(self, zh, en):
         return en if self.language == "en" else zh
 
@@ -276,6 +298,137 @@ class TarotStage(QWidget):
     def _ensure_timer(self):
         if not self._timer.isActive():
             self._timer.start()
+
+    def _show_unshuffled_warning(self):
+        self.warning_text = self._t("卡堆并未重新洗牌", "Deck has not been reshuffled")
+        self.warning_until = time.perf_counter() + 2.8
+        self._ensure_timer()
+        self.update()
+
+    def _clear_result_state(self):
+        self.selected_indices = []
+        self.selected_reversed = []
+        self.revealed = []
+        self.flip_started_by_slot = {}
+        self.flip_target_by_slot = {}
+        self.free_positions.clear()
+        self.drag_slot = -1
+        self.manual_drag_cid = -1
+        self._finished_emitted = False
+
+    def _execute_pending_action(self):
+        pending = self.pending_action
+        self.pending_action = None
+        if not pending:
+            return False
+        kind, args = pending
+        # A completed direct action consumes the current shuffle state.  The next
+        # direct action will warn unless a physical shuffle occurs in between.
+        self.deck_shuffled_since_last_action = False
+        if kind == "draw":
+            self.configure_free_move(False)
+            self.draw_from_deck(*args)
+        elif kind == "manual":
+            count, allow_reversed, layout_mode, free_move = args
+            self.configure_free_move(bool(free_move))
+            self.start_manual(count, allow_reversed, layout_mode)
+        elif kind == "shuffle":
+            self.configure_free_move(False)
+            self.start_shuffle(*args)
+        return True
+
+    def request_draw(self, count=3, major_only=False):
+        return self._request_direct_action("draw", (count, major_only))
+
+    def request_manual(self, count=3, allow_reversed=True, layout_mode="rain", free_move=False):
+        return self._request_direct_action("manual", (count, allow_reversed, layout_mode, free_move))
+
+    def request_shuffle(self, allow_reversed=True, major_only=False, riffle_rounds=3, cut_groups=2, showcase=False):
+        if self.state not in ("idle", "done", "shuffled", "await_reveal"):
+            return False
+        self.pending_action = ("shuffle", (allow_reversed, major_only, riffle_rounds, cut_groups, showcase))
+        if self.selected_indices and self.state in ("done", "await_reveal"):
+            slots = self._result_slots()
+            order = sorted(range(min(len(slots), len(self.selected_indices))), key=lambda i: slots[i].center().x())
+            self.recollect_order_slots = order
+            self.recollect_slot_rects = {i: QRectF(slots[i]) for i in order}
+            self.state = "recollect_results"
+            self.state_started = time.perf_counter()
+            self.animationStatus.emit(self._t("正在收回桌面卡牌后重新洗牌", "Collecting table cards before reshuffling"))
+            self._ensure_timer(); self.update(); return True
+        return self._execute_pending_action()
+
+    def _request_direct_action(self, kind, args):
+        allowed = ("idle", "shuffled", "done", "await_reveal")
+        if self.state not in allowed:
+            return False
+        if not self.deck_shuffled_since_last_action:
+            self._show_unshuffled_warning()
+        self.pending_action = (kind, args)
+
+        # If cards from a previous reading are still on the table, collect them
+        # left-to-right and place them on top of the surviving physical deck.
+        if self.selected_indices and self.state in ("done", "await_reveal"):
+            slots = self._result_slots()
+            order = sorted(range(min(len(slots), len(self.selected_indices))),
+                           key=lambda i: slots[i].center().x())
+            self.recollect_order_slots = order
+            self.recollect_slot_rects = {i: QRectF(slots[i]) for i in order}
+            self.state = "recollect_results"
+            self.state_started = time.perf_counter()
+            self.animationStatus.emit(self._t("未重新洗牌 · 正从左到右收回桌面卡牌",
+                                              "No reshuffle · collecting table cards left to right"))
+            self._ensure_timer(); self.update()
+            return True
+
+        # The idle table shows the full deck fanned out.  Direct actions first
+        # collect that visible fan into the central stack without altering order.
+        if self.state == "idle" and self.deck_order:
+            self.state = "recollect_idle"
+            self.state_started = time.perf_counter()
+            self.animationStatus.emit(self._t("未重新洗牌 · 正按当前顺序收回卡堆",
+                                              "No reshuffle · collecting the deck in its current order"))
+            self._ensure_timer(); self.update()
+            return True
+
+        return self._execute_pending_action()
+
+    def _prepare_rain_packets(self, groups=6):
+        order = list(self.scatter_order)
+        if not order:
+            self.rain_packets = []
+            self.rain_card_group = {}
+            self.rain_card_rank = {}
+            return
+        groups = max(3, min(int(groups), 8, len(order)))
+        base = len(order) // groups
+        rem = len(order) % groups
+        packets=[]; pos=0
+        for g in range(groups):
+            size = base + (1 if g < rem else 0)
+            packet = order[pos:pos+size]; pos += size
+            packets.append(packet)
+        self.rain_packets = packets
+        self.rain_card_group = {}
+        self.rain_card_rank = {}
+        for g, packet in enumerate(packets):
+            for rank, cid in enumerate(packet):
+                self.rain_card_group[cid] = g
+                self.rain_card_rank[cid] = rank
+
+    def _rain_group_rect(self, group_index):
+        count=max(1,len(self.rain_packets))
+        cols=min(6,count)
+        cw=min(62.0,max(42.0,self.width()*.052))
+        ch=cw*1.58
+        span=self.width()*.74
+        left=(self.width()-span)/2
+        step=span/max(1,cols-1)
+        x=left + (group_index % cols)*step - cw/2
+        y=max(18.0,self.height()*.10)
+        if group_index>=cols:
+            y += ch*.42
+        return QRectF(x,y,cw,ch)
 
     def _apply_multi_cut(self, order, groups):
         """Cut the physical deck into N contiguous packets, then re-stack them.
@@ -422,6 +575,7 @@ class TarotStage(QWidget):
             if not self.major_only:
                 self.deck_order = self.active_order[:]
             self.state = "shuffled"
+            self.deck_shuffled_since_last_action = True
             self.state_started = time.perf_counter()
             self.animationStatus.emit(self._t("洗牌已终止 · 当前牌序已保留", "Shuffle stopped · current deck order preserved"))
             self.shuffleFinished.emit()
@@ -453,6 +607,7 @@ class TarotStage(QWidget):
         self.shuffle_rounds = max(1, min(50, int(riffle_rounds)))
         self.cut_groups = max(1, min(20, int(cut_groups)))
         self.shuffle_stop_requested = False
+        self.deck_shuffled_since_last_action = False
         self.showcase_enabled = bool(showcase)
         self.showcase_was_used = bool(showcase)
 
@@ -554,11 +709,13 @@ class TarotStage(QWidget):
         self.draw_count = max(1, min(int(count), len(self.cards)))
         self.allow_reversed = allow_reversed
         self.major_only = False
-        # Manual choice always represents a complete physical 78-card deck. If a
-        # previous reading removed cards, return every card to the table first.
+        # Manual choice keeps the current physical deck order.  Missing cards are
+        # only appended as an integrity fallback; normal round transitions return
+        # table cards visibly before this method is entered.
         current = self.deck_order[:]
         seen = set(current)
-        current.extend(cid for cid in range(len(self.cards)) if cid not in seen)
+        if len(current) < len(self.cards):
+            current.extend(cid for cid in range(len(self.cards)) if cid not in seen)
         self.deck_order = current
         self.active_order = current[:]
 
@@ -581,17 +738,17 @@ class TarotStage(QWidget):
         self.hover_current = QPointF(0.0, 0.0)
 
         self.scatter_order = self.active_order[:]
-        random.shuffle(self.scatter_order)
         if self.manual_layout == "fan":
             self._prepare_fan_layout()
             self.state = "fan_insert"
             self.state_started = time.perf_counter()
             self.animationStatus.emit(self._t("自己选择 · 卡牌正在逐张插入扇形", "Manual choice · cards are rapidly inserting into the fan"))
         else:
+            self._prepare_rain_packets(6)
             self._prepare_scatter_layout()
-            self.state = "self_drop"
+            self.state = "rain_split"
             self.state_started = time.perf_counter()
-            self.animationStatus.emit(self._t("自己选择 · 78 张牌正在落下", "Manual choice · 78 cards are falling"))
+            self.animationStatus.emit(self._t("牌雨 · 卡堆正在分成多组", "Card rain · splitting the deck into packets"))
         self._ensure_timer()
         self.update()
 
@@ -648,15 +805,18 @@ class TarotStage(QWidget):
             y = max(top, min(bottom, y))
             final_rot = random.uniform(-27.0, 27.0)
 
-            # Drop in visibly separated waves. Cards originate well above the table
-            # and fan across the width, so the user can follow where the deck lands.
-            wave = i // max(1, cols)
-            delay = wave * .105 + (i % cols) * .016 + random.uniform(0.0, .035)
-            duration = random.uniform(.88, 1.28)
-            start_x = x + random.uniform(-110.0, 110.0)
-            start_y = -ch - random.uniform(70.0, 360.0)
-            start_rot = final_rot + random.uniform(-150.0, 150.0)
-            drift = random.uniform(-36.0, 36.0)
+            # Every card starts from one of the visible packet stacks prepared by
+            # _prepare_rain_packets().  All groups release together; only tiny
+            # within-packet delays remain so the player can track real bound cards.
+            g = self.rain_card_group.get(cid, i % max(1, len(self.rain_packets)))
+            rank = self.rain_card_rank.get(cid, 0)
+            group_rect = self._rain_group_rect(g)
+            delay = rank * .014 + random.uniform(0.0, .028)
+            duration = random.uniform(.92, 1.24)
+            start_x = group_rect.left() + random.uniform(-5.0, 5.0)
+            start_y = group_rect.top() + min(rank, 8) * .45
+            start_rot = random.uniform(-7.0, 7.0)
+            drift = random.uniform(-46.0, 46.0)
             bounce = random.uniform(10.0, 22.0)
 
             self.scatter_pose[cid] = {
@@ -997,6 +1157,7 @@ class TarotStage(QWidget):
                 if self.shuffle_stop_requested:
                     self.shuffle_stop_requested = False
                     self.state = "shuffled"
+                    self.deck_shuffled_since_last_action = True
                     self.state_started = now
                     self.animationStatus.emit(self._t(f"洗牌已终止 · Cut {self.cut_groups} 组已完成并保留", f"Shuffle stopped · {self.cut_groups}-group cut completed and preserved"))
                     self.shuffleFinished.emit()
@@ -1031,6 +1192,7 @@ class TarotStage(QWidget):
                 if self.shuffle_stop_requested:
                     self.shuffle_stop_requested = False
                     self.state = "shuffled"
+                    self.deck_shuffled_since_last_action = True
                     self.state_started = now
                     self.animationStatus.emit(self._t(f"洗牌已终止 · 已完成 {self.shuffle_round} 次 Riffle", f"Shuffle stopped · {self.shuffle_round} riffles completed"))
                     self.shuffleFinished.emit()
@@ -1043,6 +1205,7 @@ class TarotStage(QWidget):
                     # Shuffling is now a complete, standalone action. Keep the
                     # squared physical deck on the table until the user presses Draw.
                     self.state = "shuffled"
+                    self.deck_shuffled_since_last_action = True
                     self.state_started = now
                     self.animationStatus.emit(self._t("洗牌完成 · 可以抽取", "Shuffle complete · ready to draw"))
                     self.shuffleFinished.emit()
@@ -1058,6 +1221,36 @@ class TarotStage(QWidget):
                 self.animationStatus.emit(self._t("抽取完成 · 点击任意牌翻开", "Draw complete · click any card to reveal it"))
             else:
                 self.animationStatus.emit(self._t(f"正在从牌顶抽取 {idx + 1} / {self.draw_count}", f"Drawing from the top · {idx + 1} / {self.draw_count}"))
+
+        elif self.state == "recollect_idle":
+            animation_active = True
+            total = max(self.recollect_duration, (max(0, len(self.deck_order)-1))*self.recollect_idle_gap + self.recollect_duration)
+            if elapsed >= total:
+                self.state = "idle"
+                self.state_started = now
+                self._execute_pending_action()
+
+        elif self.state == "recollect_results":
+            animation_active = True
+            total = max(self.recollect_duration, (max(0, len(self.recollect_order_slots)-1))*self.recollect_gap + self.recollect_duration)
+            if elapsed >= total:
+                for slot in self.recollect_order_slots:
+                    if slot < len(self.selected_indices):
+                        cid = self.selected_indices[slot]
+                        if cid not in self.deck_order:
+                            self.deck_order.append(cid)
+                self.active_order = self.deck_order[:]
+                self._clear_result_state()
+                self.state = "idle"
+                self.state_started = now
+                self._execute_pending_action()
+
+        elif self.state == "rain_split":
+            animation_active = True
+            if elapsed >= self.rain_split_duration:
+                self.state = "self_drop"
+                self.state_started = now
+                self.animationStatus.emit(self._t("牌雨 · 多组卡牌同时开始散落", "Card rain · all packets are scattering together"))
 
         elif self.state == "self_drop":
             animation_active = True
@@ -1101,6 +1294,11 @@ class TarotStage(QWidget):
                 # Remaining cards are already visually at the parked target.
                 self.deck_park_started = now - self.deck_park_duration
                 self.animationStatus.emit(self._t("选择完成 · 点击任意已选卡牌翻开", "Selection complete · click any selected card to reveal it"))
+                # Free-move readings must release the UI immediately after the cards
+                # are placed; waiting for every card to be face-up previously left
+                # the operation controls permanently disabled.
+                if self.free_move_enabled:
+                    self._emit_finished_once()
 
         elif self.state in ("await_reveal", "done"):
             # Keep repainting while the remaining deck is gliding into its parked
@@ -1137,8 +1335,8 @@ class TarotStage(QWidget):
         hy = self.hover_current.y()
         tx = self.hover_target.x() if self.hovered_slot >= 0 else 0.0
         ty = self.hover_target.y() if self.hovered_slot >= 0 else 0.0
-        nx = hx + (tx - hx) * 0.18
-        ny = hy + (ty - hy) * 0.18
+        nx = hx + (tx - hx) * 0.24
+        ny = hy + (ty - hy) * 0.24
         if abs(nx - tx) < 0.002:
             nx = tx
         if abs(ny - ty) < 0.002:
@@ -1147,7 +1345,8 @@ class TarotStage(QWidget):
         self.hover_current = QPointF(nx, ny)
 
         self.update()
-        if not animation_active and not hover_active and not self.flip_started_by_slot:
+        warning_active = bool(self.warning_text and now < self.warning_until)
+        if not animation_active and not hover_active and not self.flip_started_by_slot and not warning_active:
             self._timer.stop()
 
     def _emit_finished_once(self):
@@ -1225,17 +1424,55 @@ class TarotStage(QWidget):
         ry = dx * math.sin(a) + dy * math.cos(a) + c.y()
         return rect.adjusted(-pad, -pad, pad, pad).contains(QPointF(rx, ry))
 
-    def _spread_label_rect(self, index, rect):
-        """Place labels outside the visible rotated card bounds to prevent overlap."""
-        rot = abs(self._slot_rotation(index)) % 180.0
-        if 70.0 <= rot <= 110.0:
-            # A horizontal crossing card is much wider than its unrotated QRectF.
-            visual_w = rect.height()
-            visual_h = rect.width()
-            return QRectF(rect.center().x() - visual_w * .50,
-                          rect.center().y() + visual_h * .50 + 7,
-                          visual_w, 24)
-        return QRectF(rect.left() - 22, rect.bottom() + 5, rect.width() + 44, 28)
+    def _visual_card_bounds(self, rect, index):
+        rot = math.radians(abs(self._slot_rotation(index)) % 180.0)
+        c = abs(math.cos(rot)); s = abs(math.sin(rot))
+        w = rect.width()*c + rect.height()*s
+        h = rect.width()*s + rect.height()*c
+        return QRectF(rect.center().x()-w/2, rect.center().y()-h/2, w, h)
+
+    def _spread_label_rects(self, slots):
+        """Find readable label positions without covering cards or other labels."""
+        card_boxes = [self._visual_card_bounds(r, i).adjusted(-5,-5,5,5) for i,r in enumerate(slots)]
+        used=[]; result=[]
+        bounds = QRectF(8, 8, max(10, self.width()-16), max(10, self.height()-42))
+        for i, r in enumerate(slots):
+            vb = self._visual_card_bounds(r, i)
+            label_w = max(76.0, min(150.0, vb.width()*1.35))
+            label_h = 27.0
+            gap = 8.0
+            # Crossing / crowded cards prefer side labels; ordinary cards prefer below.
+            rot = abs(self._slot_rotation(i)) % 180.0
+            directions = ("right","left","below","above") if 55 <= rot <= 125 else ("below","above","right","left")
+            chosen=None
+            for step in (1.0, 1.7, 2.5, 3.4):
+                for d in directions:
+                    if d == "below":
+                        cand=QRectF(vb.center().x()-label_w/2, vb.bottom()+gap*step, label_w, label_h)
+                    elif d == "above":
+                        cand=QRectF(vb.center().x()-label_w/2, vb.top()-gap*step-label_h, label_w, label_h)
+                    elif d == "right":
+                        cand=QRectF(vb.right()+gap*step, vb.center().y()-label_h/2, label_w, label_h)
+                    else:
+                        cand=QRectF(vb.left()-gap*step-label_w, vb.center().y()-label_h/2, label_w, label_h)
+                    cand.moveLeft(max(bounds.left(), min(cand.left(), bounds.right()-cand.width())))
+                    cand.moveTop(max(bounds.top(), min(cand.top(), bounds.bottom()-cand.height())))
+                    if any(cand.intersects(b) for b in card_boxes):
+                        continue
+                    if any(cand.intersects(u.adjusted(-4,-2,4,2)) for u in used):
+                        continue
+                    chosen=cand; break
+                if chosen is not None: break
+            if chosen is None:
+                # Last resort: place in the nearest open stage edge strip instead
+                # of drawing directly over a card.
+                y=max(bounds.top(), min(vb.center().y()-label_h/2, bounds.bottom()-label_h))
+                if vb.center().x() < self.width()/2:
+                    chosen=QRectF(bounds.left(), y, label_w, label_h)
+                else:
+                    chosen=QRectF(bounds.right()-label_w, y, label_w, label_h)
+            used.append(chosen); result.append(chosen)
+        return result
 
     def _idle_geometry(self, i, count=None):
         n = max(1, count if count is not None else len(self.active_order))
@@ -1384,10 +1621,24 @@ class TarotStage(QWidget):
         dx = self.hover_current.x()
         dy = self.hover_current.y()
         c = rect.center()
+
+        # Free-move cards can become quite small after the user places many cards.
+        # Only enlarge those genuinely small cards while hovered; normal-size cards
+        # keep their original size so the table layout does not jump unnecessarily.
+        hover_scale = 1.06
+        if self.free_move_enabled and rect.width() < 88.0:
+            target_width = 104.0
+            hover_scale = min(1.72, max(1.18, target_width / max(1.0, rect.width())))
+
         p.translate(c)
-        p.scale(1.035, 1.035)
-        p.rotate(dx * 2.8)
-        p.shear(dx * 0.055, -dy * 0.045)
+        # Stronger pseudo-3D response in all four directions. Horizontal mouse
+        # movement drives yaw/roll, while vertical movement adds the opposite-axis
+        # shear and a small perspective compression/expansion.
+        p.translate(dx * 7.0, dy * 7.0)
+        p.scale(hover_scale * (1.0 + abs(dy) * 0.025),
+                hover_scale * (1.0 - dy * 0.055))
+        p.rotate(dx * 7.2)
+        p.shear(dx * 0.115, -dy * 0.125)
         p.translate(-c)
 
     def _paint_slot_card(self, p, slot, slot_index, face_up):
@@ -1397,7 +1648,7 @@ class TarotStage(QWidget):
             c = slot.center(); p.translate(c); p.rotate(rot); p.translate(-c)
         self._apply_hover_transform(p, slot, slot_index)
         if slot_index == self.hovered_slot and slot_index not in self.flip_started_by_slot:
-            shadow = slot.translated(self.hover_current.x()*4 + 4, self.hover_current.y()*4 + 7)
+            shadow = slot.translated(self.hover_current.x()*9 + 5, self.hover_current.y()*9 + 9)
             p.setPen(Qt.NoPen)
             p.setBrush(QColor(0, 0, 0, 105))
             p.drawRoundedRect(shadow, 6, 6)
@@ -1678,6 +1929,15 @@ class TarotStage(QWidget):
         p.setRenderHint(QPainter.Antialiasing)
         p.setRenderHint(QPainter.SmoothPixmapTransform)
         p.fillRect(self.rect(), QColor("#070707"))
+        now = time.perf_counter()
+        if self.warning_text and now < self.warning_until:
+            box = QRectF(max(12.0, self.width()-278.0), 14.0, 260.0, 36.0)
+            p.setPen(QPen(QColor("#553232"), 1))
+            p.setBrush(QColor(32, 15, 15, 235))
+            p.drawRoundedRect(box, 8, 8)
+            p.setPen(QColor("#d69494"))
+            p.setFont(QFont("Segoe UI", 9, QFont.DemiBold))
+            p.drawText(box.adjusted(10,0,-10,0), Qt.AlignVCenter|Qt.AlignRight, self.warning_text)
         p.setPen(QPen(QColor(38, 38, 38, 150), 1))
         floor = QRectF(self.width()*.12, self.height()*.67, self.width()*.76, self.height()*.20)
         p.drawEllipse(floor)
@@ -1713,6 +1973,64 @@ class TarotStage(QWidget):
                             "SHOW ALL CARD FACES" if self.state == "showcase_front" else "FLIP TO CARD BACKS")
             p.setPen(QColor("#8a8a8a")); p.setFont(QFont("Segoe UI", 10))
             p.drawText(QRectF(0, self.height()-32, self.width(), 22), Qt.AlignCenter, label)
+            return
+
+        if self.state == "recollect_idle":
+            order = self.deck_order[:] if self.deck_order else list(range(len(self.cards)))
+            deck = self._deck_rect()
+            for i, cid in enumerate(order):
+                x,y,cw,ch,rot0 = self._idle_geometry(i, len(order))
+                src=QRectF(x-cw/2,y-ch/2,cw,ch)
+                dst,_=self._stack_pose(deck,i,len(order),0.0,.035)
+                local=(elapsed-i*self.recollect_idle_gap)/max(.001,self.recollect_duration)
+                if local <= 0:
+                    self._paint_physical_back(p,cid,src,rot0,245,False)
+                elif local >= 1:
+                    self._paint_physical_back(p,cid,dst,0.0,255,False)
+                else:
+                    e=self._ease_in_out(local)
+                    r=QRectF(self._lerp(src.left(),dst.left(),e),self._lerp(src.top(),dst.top(),e)-math.sin(e*math.pi)*18.0,self._lerp(src.width(),dst.width(),e),self._lerp(src.height(),dst.height(),e))
+                    self._paint_physical_back(p,cid,r,self._lerp(rot0,0.0,e),255,False)
+            return
+
+        if self.state == "recollect_results":
+            deck=self._deck_rect()
+            # Remaining deck moves from the parked tabletop pile back to center.
+            remain=self.deck_order[:]
+            q0=self._ease_in_out(min(1.0,elapsed/max(.001,self.recollect_duration)))
+            parked=self._parked_deck_rect()
+            for rank,cid in enumerate(remain):
+                depth=rank/max(1,len(remain)-1)
+                src=parked.translated((depth-.5)*5.5,(depth-.5)*14.0)
+                dst,_=self._stack_pose(deck,rank,len(remain)+len(self.recollect_order_slots),0.0,.035)
+                r=QRectF(self._lerp(src.left(),dst.left(),q0),self._lerp(src.top(),dst.top(),q0),self._lerp(src.width(),dst.width(),q0),self._lerp(src.height(),dst.height(),q0))
+                self._paint_physical_back(p,cid,r,self._lerp(-13.0,0.0,q0),255,False)
+            # Table cards return left-to-right, one after another, to the top.
+            for seq,slot in enumerate(self.recollect_order_slots):
+                if slot>=len(self.selected_indices): continue
+                cid=self.selected_indices[slot]; src=self.recollect_slot_rects.get(slot,self._result_slots()[slot])
+                dst,_=self._stack_pose(deck,len(remain)+seq,len(remain)+len(self.recollect_order_slots),0.0,.035)
+                local=(elapsed-seq*self.recollect_gap)/max(.001,self.recollect_duration)
+                if local<=0:
+                    if slot < len(self.revealed) and self.revealed[slot]: self._paint_front(p,src,cid,self.cards[cid].reversed)
+                    else: self._paint_physical_back(p,cid,src,self._slot_rotation(slot),255,True)
+                else:
+                    e=self._ease_in_out(min(1.0,local))
+                    r=QRectF(self._lerp(src.left(),dst.left(),e),self._lerp(src.top(),dst.top(),e)-math.sin(e*math.pi)*24.0,self._lerp(src.width(),dst.width(),e),self._lerp(src.height(),dst.height(),e))
+                    self._paint_physical_back(p,cid,r,self._lerp(self._slot_rotation(slot),0.0,e),255,False)
+            return
+
+        if self.state == "rain_split":
+            deck=self._deck_rect(); q=self._ease_in_out(min(1.0,elapsed/max(.001,self.rain_split_duration)))
+            for g,packet in enumerate(self.rain_packets):
+                target_base=self._rain_group_rect(g)
+                for rank,cid in enumerate(packet):
+                    source_rank=self.scatter_order.index(cid)
+                    src,_=self._stack_pose(deck,source_rank,len(self.scatter_order),0.0,.035)
+                    dst,rot_t=self._stack_pose(target_base,rank,len(packet),((g%3)-1)*2.0,.08)
+                    r=QRectF(self._lerp(src.left(),dst.left(),q),self._lerp(src.top(),dst.top(),q)-math.sin(q*math.pi)*(10+g%3*3),self._lerp(src.width(),dst.width(),q),self._lerp(src.height(),dst.height(),q))
+                    self._paint_physical_back(p,cid,r,self._lerp(0.0,rot_t,q),255,False)
+            self._paint_progress(p,q,f"CARD RAIN · SPLIT {len(self.rain_packets)} GROUPS")
             return
 
         if self.state == "idle":
@@ -1935,7 +2253,7 @@ class TarotStage(QWidget):
             p.drawText(QRectF(0,self.height()-30,self.width(),22),Qt.AlignCenter,self._t(f"从扇形牌中选择 · {len(self.selected_indices)} / {self.draw_count}",f"Choose from the fan · {len(self.selected_indices)} / {self.draw_count}"))
             return
 
-        if self.state in ("self_drop", "self_select", "manual_gather_rest"):
+        if self.state in ("self_drop", "self_select", "manual_gather_rest","recollect_idle","recollect_results","rain_split"):
             slots = self._result_slots()
             selected = set(self.selected_indices)
 
@@ -2049,17 +2367,15 @@ class TarotStage(QWidget):
         if self.spread_slots and self.spread_labels:
             p.save()
             p.setFont(QFont("Segoe UI", 8))
-            for i, r in enumerate(slots):
+            label_rects = self._spread_label_rects(slots)
+            for i, rr in enumerate(label_rects):
                 if i < len(self.spread_labels):
                     txt = self.spread_labels[i]
-                    rr = self._spread_label_rect(i, r)
-                    # A small dark backing keeps labels readable over nearby cards
-                    # and prevents Celtic Cross Present/Challenge labels colliding.
                     p.setPen(Qt.NoPen)
-                    p.setBrush(QColor(5, 5, 5, 215))
+                    p.setBrush(QColor(5, 5, 5, 230))
                     p.drawRoundedRect(rr.adjusted(-3, -1, 3, 1), 4, 4)
-                    p.setPen(QColor("#8a8a8a"))
-                    p.drawText(rr, Qt.AlignHCenter | Qt.AlignTop | Qt.TextWordWrap, txt)
+                    p.setPen(QColor("#949494"))
+                    p.drawText(rr, Qt.AlignCenter | Qt.TextWordWrap, txt)
             p.restore()
 
         p.setPen(QColor("#777777"))
@@ -2373,16 +2689,16 @@ class CustomTarotPage(QWidget):
         self.stop_shuffle_button.setEnabled(running)
 
     def _shuffle_clicked(self):
-        if self.stage.state not in ("idle","done","shuffled"): return
+        if self.stage.state not in ("idle","done","shuffled","await_reveal"): return
         try: riffles=int(self.riffle_input.text() or "3")
         except ValueError: riffles=3
         try: cuts=int(self.cut_input.text() or "2")
         except ValueError: cuts=2
         riffles=max(1,min(50,riffles)); cuts=max(1,min(20,cuts)); self.riffle_input.setText(str(riffles)); self.cut_input.setText(str(cuts))
         self._set_controls_enabled(False)
-        self.stage.configure_free_move(False)
         self.stage.configure_spread(None)
-        self.stage.start_shuffle(self.reverse_chip.isChecked(), self.major_chip.isChecked(), riffles, cuts, self.showcase_check.isChecked())
+        if not self.stage.request_shuffle(self.reverse_chip.isChecked(), self.major_chip.isChecked(), riffles, cuts, self.showcase_check.isChecked()):
+            self._set_controls_enabled(True)
         self.stop_shuffle_button.setEnabled(self.stage.state in ("showcase_front","showcase_flip","gather","cut_spread","cut_restack","split","riffle","square"))
 
     def _stop_shuffle_clicked(self):
@@ -2393,16 +2709,16 @@ class CustomTarotPage(QWidget):
         self.status.setText(TXT("洗牌完成 · 可以调整抽牌数量后按“抽取”", "Shuffle complete · adjust the draw count, then press Draw"))
 
     def _draw_clicked(self):
-        if self.stage.state not in ("idle","done","shuffled"): return
-        self._set_controls_enabled(False); self.stage.configure_free_move(False); self.stage.configure_spread(None); self.stage.draw_from_deck(self.selected_count, self.major_chip.isChecked())
+        if self.stage.state not in ("idle","done","shuffled","await_reveal"): return
+        self._set_controls_enabled(False); self.stage.configure_spread(None)
+        if not self.stage.request_draw(self.selected_count, self.major_chip.isChecked()):
+            self._set_controls_enabled(True)
 
     def _manual_clicked(self):
-        if self.stage.state not in ("idle","done","shuffled"): return
-        old=self.stage.state; self._set_controls_enabled(False)
+        if self.stage.state not in ("idle","done","shuffled","await_reveal"): return
+        self._set_controls_enabled(False)
         self.stage.configure_spread(None)
-        self.stage.configure_free_move(self.free_move_check.isChecked())
-        self.stage.start_manual(self.selected_count,self.reverse_chip.isChecked(),"fan" if self.fan_mode_button.isChecked() else "rain")
-        if self.stage.state==old:
+        if not self.stage.request_manual(self.selected_count,self.reverse_chip.isChecked(),"fan" if self.fan_mode_button.isChecked() else "rain", self.free_move_check.isChecked()):
             self._set_controls_enabled(True); self.status.setText(TXT("自己选择未能启动，请重试。", "Manual choice could not start. Please try again."))
 
     def _finished(self,names):
@@ -2619,7 +2935,7 @@ class ClassicTarotPage(QWidget):
         self.view_stack.setCurrentIndex(1)
 
     def _back_to_selection(self):
-        if self.stage.state in ("showcase_front","showcase_flip","gather","cut_spread","cut_restack","split","riffle","square","deal","self_drop","fan_insert","manual_gather_rest"):
+        if self.stage.state in ("showcase_front","showcase_flip","gather","cut_spread","cut_restack","split","riffle","square","deal","self_drop","fan_insert","manual_gather_rest","recollect_idle","recollect_results","rain_split"):
             return
         self.view_stack.setCurrentIndex(0)
 
@@ -2630,14 +2946,15 @@ class ClassicTarotPage(QWidget):
         self.stop_button.setEnabled(running)
 
     def _shuffle(self):
-        if self.stage.state not in ("idle","done","shuffled"): return
-        d=self._definition(self.current_spread_key); self.stage.configure_spread(d["slots"],d["labels"]); self.stage.configure_free_move(False)
+        if self.stage.state not in ("idle","done","shuffled","await_reveal"): return
+        d=self._definition(self.current_spread_key); self.stage.configure_spread(d["slots"],d["labels"])
         try:r=int(self.riffle_input.text() or "3")
         except:r=3
         try:c=int(self.cut_input.text() or "2")
         except:c=2
         r=max(1,min(50,r)); c=max(1,min(20,c)); self.riffle_input.setText(str(r)); self.cut_input.setText(str(c)); self._set_controls(False)
-        self.stage.start_shuffle(self.reverse.isChecked(),self.major.isChecked(),r,c,self.showcase.isChecked()); self.stop_button.setEnabled(True)
+        if not self.stage.request_shuffle(self.reverse.isChecked(),self.major.isChecked(),r,c,self.showcase.isChecked()): self._set_controls(True)
+        self.stop_button.setEnabled(self.stage.state in ("showcase_front","showcase_flip","gather","cut_spread","cut_restack","split","riffle","square"))
 
     def _stop(self):
         if self.stage.request_stop_shuffle(): self.stop_button.setEnabled(False)
@@ -2646,15 +2963,14 @@ class ClassicTarotPage(QWidget):
         self._set_controls(True); self.status.setText(TXT("洗牌完成 · 可按“抽取”或“自己选择”。","Shuffle complete · press Draw or Choose Cards."))
 
     def _draw(self):
-        if self.stage.state not in ("idle","done","shuffled"): return
+        if self.stage.state not in ("idle","done","shuffled","await_reveal"): return
         d=self._definition(self.current_spread_key); self.stage.configure_spread(d["slots"],d["labels"]); self.stage.configure_free_move(False); self._set_controls(False)
-        self.stage.draw_from_deck(d["count"],self.major.isChecked())
+        if not self.stage.request_draw(d["count"],self.major.isChecked()): self._set_controls(True)
 
     def _manual(self):
-        if self.stage.state not in ("idle","done","shuffled"): return
-        d=self._definition(self.current_spread_key); self.stage.configure_spread(d["slots"],d["labels"]); self.stage.configure_free_move(False); old=self.stage.state; self._set_controls(False)
-        self.stage.start_manual(d["count"],self.reverse.isChecked(),"fan" if self.fan.isChecked() else "rain")
-        if self.stage.state==old: self._set_controls(True)
+        if self.stage.state not in ("idle","done","shuffled","await_reveal"): return
+        d=self._definition(self.current_spread_key); self.stage.configure_spread(d["slots"],d["labels"]); self.stage.configure_free_move(False); self._set_controls(False)
+        if not self.stage.request_manual(d["count"],self.reverse.isChecked(),"fan" if self.fan.isChecked() else "rain", False): self._set_controls(True)
 
     def _finished(self,names):
         self._set_controls(True); self.status.setText(TXT("牌阵抽取完成 · 可逐张翻牌。","Spread complete · reveal cards one by one."))
@@ -2898,13 +3214,17 @@ class MainWindow(QMainWindow):
         self.ui_scale = scale
         self.setStyleSheet(_scaled_stylesheet(STYLE, scale))
         for w in self.findChildren(QWidget):
+            # Interface zoom must never resize the physical cards/table renderer.
+            # TarotStage keeps its original geometry; only surrounding UI scales.
+            if isinstance(w, TarotStage):
+                continue
             bmin = getattr(w, "_zoom_base_min", None)
             bmax = getattr(w, "_zoom_base_max", None)
             if bmin is not None:
                 w.setMinimumSize(self._scaled_size(bmin, scale, False))
             if bmax is not None:
                 w.setMaximumSize(self._scaled_size(bmax, scale, True))
-        self.setMinimumSize(self._scaled_size(self._base_window_min, scale, False))
+        self.setMinimumSize(self._base_window_min)
         self.updateGeometry()
         self.update()
 
