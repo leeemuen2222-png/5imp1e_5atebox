@@ -9,11 +9,15 @@ from PySide6.QtGui import QColor, QPainter, QPen, QBrush, QFont, QPainterPath, Q
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel,
     QPushButton, QFrame, QButtonGroup, QStackedWidget, QSizePolicy,
-    QGraphicsDropShadowEffect, QLineEdit
+    QGraphicsDropShadowEffect, QLineEdit, QCheckBox, QComboBox
 )
 
 APP_NAME = "5imp1e 5atebox"
-APP_VERSION = "0.6.3"
+APP_VERSION = "0.7.0"
+APP_SETTINGS = {"language": "zh", "mark_back": False}
+
+def TXT(zh, en):
+    return en if APP_SETTINGS.get("language") == "en" else zh
 BASE_DIR = Path(__file__).resolve().parent
 RESOURCE_DIR = BASE_DIR / "resource"
 
@@ -64,7 +68,7 @@ class PhysicalCard:
     program.  Shuffling therefore moves card objects instead of shuffling a list
     of filenames and choosing a result separately afterwards.
     """
-    __slots__ = ("card_id", "path", "face", "back", "reversed")
+    __slots__ = ("card_id", "path", "face", "back", "reversed", "marked")
 
     def __init__(self, card_id, path, face, back=None):
         self.card_id = card_id
@@ -72,6 +76,7 @@ class PhysicalCard:
         self.face = face
         self.back = back.copy() if back is not None and not back.isNull() else QPixmap()
         self.reversed = False
+        self.marked = False
 
 
 class TarotStage(QWidget):
@@ -190,6 +195,28 @@ class TarotStage(QWidget):
         self._last_mouse_pos = None
         self._last_mouse_time = 0.0
         self._last_tick_time = time.perf_counter()
+
+        # Presentation / manual-choice modes.
+        self.language = APP_SETTINGS.get("language", "zh")
+        self.mark_back_enabled = APP_SETTINGS.get("mark_back", False)
+        self.manual_layout = "rain"
+        self.showcase_enabled = False
+        self.showcase_was_used = False
+        self.showcase_front_duration = 1.15
+        self.showcase_flip_card_duration = 0.34
+        self.showcase_flip_gap = 0.010
+        self.fan_insert_gap = 0.016
+        self.fan_insert_duration = 0.28
+        self.fan_total_duration = 0.0
+
+    def _t(self, zh, en):
+        return en if self.language == "en" else zh
+
+    def configure_runtime(self, language=None, mark_back=None):
+        if language is not None:
+            self.language = language
+        if mark_back is not None:
+            self.mark_back_enabled = bool(mark_back)
 
     @staticmethod
     def _is_major(stem):
@@ -355,19 +382,19 @@ class TarotStage(QWidget):
 
     def request_stop_shuffle(self):
         """Ask the physical shuffle to stop at the nearest safe point."""
-        shuffle_states = {"gather", "cut_spread", "cut_restack", "split", "riffle", "square"}
+        shuffle_states = {"showcase_front", "showcase_flip", "gather", "cut_spread", "cut_restack", "split", "riffle", "square"}
         if self.state not in shuffle_states:
             return False
 
         # Before cards start interleaving there is no partial physical order to
         # preserve, so stopping can be immediate.
-        if self.state in {"gather"}:
+        if self.state in {"showcase_front", "showcase_flip", "gather"}:
             self.shuffle_stop_requested = False
             if not self.major_only:
                 self.deck_order = self.active_order[:]
             self.state = "shuffled"
             self.state_started = time.perf_counter()
-            self.animationStatus.emit("洗牌已终止 · 当前牌序已保留")
+            self.animationStatus.emit(self._t("洗牌已终止 · 当前牌序已保留", "Shuffle stopped · current deck order preserved"))
             self.shuffleFinished.emit()
             self.update()
             return True
@@ -376,16 +403,16 @@ class TarotStage(QWidget):
         # This prevents bound cards from snapping or disappearing mid-movement.
         self.shuffle_stop_requested = True
         if self.state in {"cut_spread", "cut_restack"}:
-            self.animationStatus.emit("终止已请求 · 将在当前 Cut 重新叠放完成后停止")
+            self.animationStatus.emit(self._t("终止已请求 · 将在当前 Cut 重新叠放完成后停止", "Stop requested · will stop after the current cut is restacked"))
         else:
-            self.animationStatus.emit("终止已请求 · 将在本次交错整理完成后停止")
+            self.animationStatus.emit(self._t("终止已请求 · 将在本次交错整理完成后停止", "Stop requested · will stop after the current riffle is squared"))
         return True
 
-    def start_shuffle(self, allow_reversed=True, major_only=False, riffle_rounds=3, cut_groups=2):
+    def start_shuffle(self, allow_reversed=True, major_only=False, riffle_rounds=3, cut_groups=2, showcase=False):
         if self.state not in ("idle", "done", "shuffled"):
             return
         if len(self.cards) < 22:
-            self.animationStatus.emit("resource/cards/front 中没有完整牌组。")
+            self.animationStatus.emit(self._t("resource/cards/front 中没有完整牌组。", "No complete deck found in resource/cards/front."))
             return
 
         pool = self.major_indices[:] if major_only else list(range(len(self.cards)))
@@ -397,6 +424,8 @@ class TarotStage(QWidget):
         self.shuffle_rounds = max(1, min(50, int(riffle_rounds)))
         self.cut_groups = max(1, min(20, int(cut_groups)))
         self.shuffle_stop_requested = False
+        self.showcase_enabled = bool(showcase)
+        self.showcase_was_used = bool(showcase)
 
         # Start from the current physical order for a full deck. For a major-only
         # reading, retain the relative physical order of major cards.
@@ -433,15 +462,18 @@ class TarotStage(QWidget):
 
         self.shuffle_round = 0
         self.round_input = self.active_order[:]
-        self.state = "gather"
+        self.state = "showcase_front" if self.showcase_enabled else "gather"
         self.state_started = time.perf_counter()
-        self.animationStatus.emit(f"正在切牌 · {self.cut_groups} 组 / Riffle {self.shuffle_rounds} 次")
+        if self.showcase_enabled:
+            self.animationStatus.emit(self._t("卡牌展示 · 正面总览", "Card showcase · face overview"))
+        else:
+            self.animationStatus.emit(self._t(f"正在切牌 · {self.cut_groups} 组 / Riffle {self.shuffle_rounds} 次", f"Cutting · {self.cut_groups} groups / {self.shuffle_rounds} riffles"))
         self._ensure_timer()
         self.update()
 
     def start(self, count=3, allow_reversed=True, major_only=False):
         # Backward-compatible alias: start now performs shuffling only.
-        self.start_shuffle(allow_reversed=allow_reversed, major_only=major_only, riffle_rounds=self.shuffle_rounds, cut_groups=self.cut_groups)
+        self.start_shuffle(allow_reversed=allow_reversed, major_only=major_only, riffle_rounds=self.shuffle_rounds, cut_groups=self.cut_groups, showcase=False)
 
     def draw_from_deck(self, count=3, major_only=False):
         if self.state not in ("idle", "shuffled", "done"):
@@ -452,7 +484,7 @@ class TarotStage(QWidget):
         pool_set = set(self.major_indices) if major_only else set(range(len(self.cards)))
         order = [cid for cid in self.deck_order if cid in pool_set]
         if not order:
-            self.animationStatus.emit("当前牌组中没有可抽取的牌。")
+            self.animationStatus.emit(self._t("当前牌组中没有可抽取的牌。", "There are no drawable cards in the current deck."))
             return
 
         self.manual_mode = False
@@ -477,18 +509,19 @@ class TarotStage(QWidget):
 
         self.state = "deal"
         self.state_started = time.perf_counter()
-        self.animationStatus.emit(f"正在从牌顶抽取 1 / {self.draw_count}")
+        self.animationStatus.emit(self._t(f"正在从牌顶抽取 1 / {self.draw_count}", f"Drawing from the top · 1 / {self.draw_count}"))
         self._ensure_timer()
         self.update()
 
-    def start_manual(self, count=3, allow_reversed=True):
+    def start_manual(self, count=3, allow_reversed=True, layout_mode="rain"):
         if self.state not in ("idle", "done", "shuffled", "await_reveal"):
             return
         if len(self.cards) < 78:
-            self.animationStatus.emit("自己选择模式需要完整的 78 张牌。")
+            self.animationStatus.emit(self._t("自己选择模式需要完整的 78 张牌。", "Manual choice requires a complete 78-card deck."))
             return
 
         self.manual_mode = True
+        self.manual_layout = layout_mode if layout_mode in ("rain", "fan") else "rain"
         self.draw_count = max(1, min(int(count), 8))
         self.allow_reversed = allow_reversed
         self.major_only = False
@@ -516,10 +549,16 @@ class TarotStage(QWidget):
 
         self.scatter_order = self.active_order[:]
         random.shuffle(self.scatter_order)
-        self._prepare_scatter_layout()
-        self.state = "self_drop"
-        self.state_started = time.perf_counter()
-        self.animationStatus.emit("自己选择 · 78 张牌正在落下")
+        if self.manual_layout == "fan":
+            self._prepare_fan_layout()
+            self.state = "fan_insert"
+            self.state_started = time.perf_counter()
+            self.animationStatus.emit(self._t("自己选择 · 卡牌正在逐张插入扇形", "Manual choice · cards are rapidly inserting into the fan"))
+        else:
+            self._prepare_scatter_layout()
+            self.state = "self_drop"
+            self.state_started = time.perf_counter()
+            self.animationStatus.emit(self._t("自己选择 · 78 张牌正在落下", "Manual choice · 78 cards are falling"))
         self._ensure_timer()
         self.update()
 
@@ -607,6 +646,63 @@ class TarotStage(QWidget):
         self.scatter_drop_total = max_end + .12
         self._last_mouse_pos = None
         self._last_mouse_time = 0.0
+
+    def _prepare_fan_layout(self):
+        """Prepare a wide physical fan. Cards are inserted one-by-one in shuffled order."""
+        self.scatter_pose = {}
+        self.scatter_velocity = {}
+        self.scatter_offset = {}
+        self.scatter_rest_offset = {}
+        self.scatter_peak_offset = {}
+        self.scatter_retention = {}
+        n = max(1, len(self.scatter_order))
+        cw = max(56.0, min(72.0, self.width() * .055))
+        ch = cw * 1.58
+        left = max(34.0, self.width() * .045)
+        right = min(self.width() - cw - 34.0, self.width() * .955 - cw)
+        span = max(1.0, right - left)
+        center_x = (left + right) * .5
+        base_y = self.height() * .47
+        for i, cid in enumerate(self.scatter_order):
+            u = i / max(1, n - 1)
+            x = left + span * u
+            norm = (x - center_x) / max(1.0, span * .5)
+            y = base_y + (norm * norm) * 88.0 - 20.0
+            rot = norm * 22.0
+            self.scatter_pose[cid] = {
+                "rect": QRectF(x, y, cw, ch),
+                "rot": rot,
+                "delay": i * self.fan_insert_gap,
+                "duration": self.fan_insert_duration,
+                "start_x": self.width() * .50 - cw * .50 + random.uniform(-8.0, 8.0),
+                "start_y": self.height() * .73,
+                "start_rot": random.uniform(-5.0, 5.0),
+                "drift": 0.0,
+                "bounce": 0.0,
+            }
+            self.scatter_velocity[cid] = QPointF()
+            self.scatter_offset[cid] = QPointF()
+            self.scatter_rest_offset[cid] = QPointF()
+            self.scatter_peak_offset[cid] = QPointF()
+            self.scatter_retention[cid] = 0.0
+        self.fan_total_duration = (n - 1) * self.fan_insert_gap + self.fan_insert_duration + .12
+
+    def _fan_card_pose(self, cid, elapsed):
+        d = self.scatter_pose[cid]
+        target = d["rect"]
+        q = (elapsed - d["delay"]) / max(.001, d["duration"])
+        if q <= 0:
+            return QRectF(d["start_x"], d["start_y"], target.width(), target.height()), d["start_rot"], 0.0
+        if q >= 1:
+            return QRectF(target), d["rot"], 1.0
+        e = self._ease_in_out(q)
+        x = self._lerp(d["start_x"], target.left(), e)
+        y = self._lerp(d["start_y"], target.top(), e) - math.sin(e * math.pi) * 34.0
+        rot = self._lerp(d["start_rot"], d["rot"], e)
+        return QRectF(x, y, target.width(), target.height()), rot, q
+
+    def _manual_hit(self, pos):
+        return self._manual_card_hit(pos)
 
     def _scatter_card_pose(self, cid, elapsed):
         d = self.scatter_pose[cid]
@@ -821,13 +917,28 @@ class TarotStage(QWidget):
             if self._update_scatter_physics(dt):
                 animation_active = True
 
-        if self.state == "gather":
+        if self.state == "showcase_front":
+            animation_active = True
+            if elapsed >= self.showcase_front_duration:
+                self.state = "showcase_flip"
+                self.state_started = now
+                self.animationStatus.emit(self._t("卡牌展示 · 正面正在翻转为背面", "Card showcase · flipping all cards face-down"))
+
+        elif self.state == "showcase_flip":
+            animation_active = True
+            total = (max(0, len(self.active_order)-1) * self.showcase_flip_gap + self.showcase_flip_card_duration + .10)
+            if elapsed >= total:
+                self.state = "gather"
+                self.state_started = now
+                self.animationStatus.emit(self._t(f"展示完成 · 开始 Cut {self.cut_groups} 组", f"Showcase complete · starting {self.cut_groups}-group cut"))
+
+        elif self.state == "gather":
             animation_active = True
             if elapsed >= self.gather_duration:
                 if self.cut_groups > 1 and self.cut_packets:
                     self.state = "cut_spread"
                     self.state_started = now
-                    self.animationStatus.emit(f"Cut · 正在展开 {len(self.cut_packets)} 组实体牌堆")
+                    self.animationStatus.emit(self._t(f"Cut · 正在展开 {len(self.cut_packets)} 组实体牌堆", f"Cut · spreading {len(self.cut_packets)} physical packets"))
                 else:
                     self.active_order = self.cut_output[:] if self.cut_output else self.active_order
                     if not self.major_only:
@@ -835,14 +946,14 @@ class TarotStage(QWidget):
                     self._prepare_riffle_round()
                     self.state = "split"
                     self.state_started = now
-                    self.animationStatus.emit(f"真实洗牌 {self.shuffle_round + 1}/{self.shuffle_rounds} · Riffle 切半")
+                    self.animationStatus.emit(self._t(f"真实洗牌 {self.shuffle_round + 1}/{self.shuffle_rounds} · Riffle 切半", f"Physical shuffle {self.shuffle_round + 1}/{self.shuffle_rounds} · riffle split"))
 
         elif self.state == "cut_spread":
             animation_active = True
             if elapsed >= self.cut_spread_duration:
                 self.state = "cut_restack"
                 self.state_started = now
-                self.animationStatus.emit(f"Cut · {len(self.cut_packets)} 组按新顺序逐组叠回")
+                self.animationStatus.emit(self._t(f"Cut · {len(self.cut_packets)} 组按新顺序逐组叠回", f"Cut · restacking {len(self.cut_packets)} packets in the new order"))
 
         elif self.state == "cut_restack":
             animation_active = True
@@ -854,27 +965,27 @@ class TarotStage(QWidget):
                     self.shuffle_stop_requested = False
                     self.state = "shuffled"
                     self.state_started = now
-                    self.animationStatus.emit(f"洗牌已终止 · Cut {self.cut_groups} 组已完成并保留")
+                    self.animationStatus.emit(self._t(f"洗牌已终止 · Cut {self.cut_groups} 组已完成并保留", f"Shuffle stopped · {self.cut_groups}-group cut completed and preserved"))
                     self.shuffleFinished.emit()
                 else:
                     self._prepare_riffle_round()
                     self.state = "split"
                     self.state_started = now
-                    self.animationStatus.emit(f"真实洗牌 {self.shuffle_round + 1}/{self.shuffle_rounds} · Riffle 切半")
+                    self.animationStatus.emit(self._t(f"真实洗牌 {self.shuffle_round + 1}/{self.shuffle_rounds} · Riffle 切半", f"Physical shuffle {self.shuffle_round + 1}/{self.shuffle_rounds} · riffle split"))
 
         elif self.state == "split":
             animation_active = True
             if elapsed >= self.split_duration:
                 self.state = "riffle"
                 self.state_started = now
-                self.animationStatus.emit(f"真实洗牌 {self.shuffle_round + 1}/{self.shuffle_rounds} · 交错落牌")
+                self.animationStatus.emit(self._t(f"真实洗牌 {self.shuffle_round + 1}/{self.shuffle_rounds} · 交错落牌", f"Physical shuffle {self.shuffle_round + 1}/{self.shuffle_rounds} · interleaving"))
 
         elif self.state == "riffle":
             animation_active = True
             if elapsed >= self._riffle_total_duration():
                 self.state = "square"
                 self.state_started = now
-                self.animationStatus.emit(f"真实洗牌 {self.shuffle_round + 1}/{self.shuffle_rounds} · 整理牌组")
+                self.animationStatus.emit(self._t(f"真实洗牌 {self.shuffle_round + 1}/{self.shuffle_rounds} · 整理牌组", f"Physical shuffle {self.shuffle_round + 1}/{self.shuffle_rounds} · squaring the deck"))
 
         elif self.state == "square":
             animation_active = True
@@ -888,19 +999,19 @@ class TarotStage(QWidget):
                     self.shuffle_stop_requested = False
                     self.state = "shuffled"
                     self.state_started = now
-                    self.animationStatus.emit(f"洗牌已终止 · 已完成 {self.shuffle_round} 次 Riffle")
+                    self.animationStatus.emit(self._t(f"洗牌已终止 · 已完成 {self.shuffle_round} 次 Riffle", f"Shuffle stopped · {self.shuffle_round} riffles completed"))
                     self.shuffleFinished.emit()
                 elif self.shuffle_round < self.shuffle_rounds:
                     self._prepare_riffle_round()
                     self.state = "split"
                     self.state_started = now
-                    self.animationStatus.emit(f"真实洗牌 {self.shuffle_round + 1}/{self.shuffle_rounds} · 切牌")
+                    self.animationStatus.emit(self._t(f"真实洗牌 {self.shuffle_round + 1}/{self.shuffle_rounds} · 切牌", f"Physical shuffle {self.shuffle_round + 1}/{self.shuffle_rounds} · split"))
                 else:
                     # Shuffling is now a complete, standalone action. Keep the
                     # squared physical deck on the table until the user presses Draw.
                     self.state = "shuffled"
                     self.state_started = now
-                    self.animationStatus.emit("洗牌完成 · 可以抽取")
+                    self.animationStatus.emit(self._t("洗牌完成 · 可以抽取", "Shuffle complete · ready to draw"))
                     self.shuffleFinished.emit()
 
         elif self.state == "deal":
@@ -911,18 +1022,25 @@ class TarotStage(QWidget):
                 self.state = "await_reveal"
                 self.state_started = now
                 self.deck_park_started = now
-                self.animationStatus.emit("抽取完成 · 点击任意牌翻开")
+                self.animationStatus.emit(self._t("抽取完成 · 点击任意牌翻开", "Draw complete · click any card to reveal it"))
             else:
-                self.animationStatus.emit(f"正在从牌顶抽取 {idx + 1} / {self.draw_count}")
+                self.animationStatus.emit(self._t(f"正在从牌顶抽取 {idx + 1} / {self.draw_count}", f"Drawing from the top · {idx + 1} / {self.draw_count}"))
 
         elif self.state == "self_drop":
             animation_active = True
             if elapsed >= self.scatter_drop_total:
                 self.state = "self_select"
                 self.state_started = now
-                self.animationStatus.emit(f"自己选择 · 请挑选 {self.draw_count} 张牌")
+                self.animationStatus.emit(self._t(f"自己选择 · 请挑选 {self.draw_count} 张牌", f"Manual choice · choose {self.draw_count} cards"))
 
-        elif self.state == "self_select":
+        elif self.state == "fan_insert":
+            animation_active = True
+            if elapsed >= self.fan_total_duration:
+                self.state = "fan_select"
+                self.state_started = now
+                self.animationStatus.emit(self._t(f"扇形展开 · 请挑选 {self.draw_count} 张牌", f"Fan spread · choose {self.draw_count} cards"))
+
+        elif self.state in ("self_select", "fan_select"):
             if self.manual_take_started:
                 animation_active = True
             finished_slots = []
@@ -939,7 +1057,7 @@ class TarotStage(QWidget):
                 self.active_order = self.deck_order[:]
                 self.state = "manual_gather_rest"
                 self.state_started = now
-                self.animationStatus.emit("选择完成 · 正在整理剩余牌组")
+                self.animationStatus.emit(self._t("选择完成 · 正在整理剩余牌组", "Selection complete · gathering the remaining deck"))
                 animation_active = True
 
         elif self.state == "manual_gather_rest":
@@ -949,7 +1067,7 @@ class TarotStage(QWidget):
                 self.state_started = now
                 # Remaining cards are already visually at the parked target.
                 self.deck_park_started = now - self.deck_park_duration
-                self.animationStatus.emit("选择完成 · 点击任意已选卡牌翻开")
+                self.animationStatus.emit(self._t("选择完成 · 点击任意已选卡牌翻开", "Selection complete · click any selected card to reveal it"))
 
         elif self.state in ("await_reveal", "done"):
             # Keep repainting while the remaining deck is gliding into its parked
@@ -969,13 +1087,13 @@ class TarotStage(QWidget):
             if finished:
                 if all(self.revealed):
                     self.state = "done"
-                    self.animationStatus.emit("全部卡牌已翻开")
+                    self.animationStatus.emit(self._t("全部卡牌已翻开", "All cards revealed"))
                     self._emit_finished_once()
                 else:
                     left = sum(1 for v in self.revealed if not v)
                     active = len(self.flip_started_by_slot)
-                    suffix = f" · {active} 张正在翻转" if active else ""
-                    self.animationStatus.emit(f"已翻开 · 还有 {left} 张{suffix}")
+                    suffix = self._t(f" · {active} 张正在翻转", f" · {active} flipping") if active else ""
+                    self.animationStatus.emit(self._t(f"已翻开 · 还有 {left} 张{suffix}", f"Revealed · {left} remaining{suffix}"))
 
         hx = self.hover_current.x()
         hy = self.hover_current.y()
@@ -1141,6 +1259,13 @@ class TarotStage(QWidget):
                 f.setWeight(QFont.DemiBold)
                 p.setFont(f)
                 p.drawText(r, Qt.AlignCenter, "515")
+        if card_id is not None and 0 <= card_id < len(self.cards) and self.cards[card_id].marked:
+            p.setBrush(QColor(150, 12, 12, 42))
+            p.setPen(QPen(QColor("#c63232"), max(2.0, rect.width()*.028)))
+            p.drawRoundedRect(r.adjusted(2, 2, -2, -2), 5, 5)
+            if rect.width() > 38:
+                p.setBrush(QColor("#c63232")); p.setPen(Qt.NoPen)
+                p.drawEllipse(QPointF(r.right()-8, r.top()+8), 3.2, 3.2)
         p.restore()
 
     def _paint_front(self, p, rect, card_idx, reversed_card=False, alpha=255):
@@ -1244,13 +1369,27 @@ class TarotStage(QWidget):
         rot = self._lerp(src_rot, target_rot, e)
         return QRectF(x, y, w, h), rot, 1
 
+    def _idle_card_hit(self, pos):
+        order = self.deck_order if self.deck_order else list(range(len(self.cards)))
+        for i in range(len(order)-1, -1, -1):
+            cid = order[i]
+            x, y, cw, ch, rot = self._idle_geometry(i, len(order))
+            rect = QRectF(x-cw/2, y-ch/2, cw, ch)
+            c = rect.center(); a = math.radians(-rot)
+            dx, dy = pos.x()-c.x(), pos.y()-c.y()
+            rx = dx*math.cos(a)-dy*math.sin(a)+c.x()
+            ry = dx*math.sin(a)+dy*math.cos(a)+c.y()
+            if rect.adjusted(-3,-3,3,3).contains(QPointF(rx,ry)):
+                return cid
+        return -1
+
     def mouseMoveEvent(self, event):
         pos = event.position()
         slots = self._result_slots() if self.state in ("await_reveal", "done") else []
         hit = -1
-        if self.state == "self_select":
+        if self.state in ("self_select", "fan_select"):
             now = time.perf_counter()
-            if self._last_mouse_pos is not None and self._last_mouse_time > 0:
+            if self.state == "self_select" and self._last_mouse_pos is not None and self._last_mouse_time > 0:
                 dt = max(.001, now - self._last_mouse_time)
                 dxm = pos.x() - self._last_mouse_pos.x()
                 dym = pos.y() - self._last_mouse_pos.y()
@@ -1295,7 +1434,30 @@ class TarotStage(QWidget):
         super().leaveEvent(event)
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton and self.state == "self_select":
+        if event.button() == Qt.RightButton and self.mark_back_enabled:
+            cid = -1
+            if self.state in ("self_select", "fan_select"):
+                cid = self._manual_card_hit(event.position())
+            elif self.state == "idle":
+                cid = self._idle_card_hit(event.position())
+            elif self.state == "shuffled":
+                order = self.active_order if self.active_order else self.deck_order
+                if order and self._deck_rect().adjusted(-8,-8,8,8).contains(event.position()):
+                    cid = order[-1]
+            elif self.state in ("await_reveal", "done"):
+                for i, r in enumerate(self._result_slots()):
+                    if r.adjusted(-5, -5, 5, 5).contains(event.position()) and i < len(self.selected_indices):
+                        cid = self.selected_indices[i]
+                        break
+            if cid >= 0:
+                self.cards[cid].marked = not self.cards[cid].marked
+                state_text = self._t("红色标记", "red mark") if self.cards[cid].marked else self._t("取消标记", "mark removed")
+                self.animationStatus.emit(self._t(f"卡背标记 · {state_text}", f"Card-back marking · {state_text}"))
+                self.update()
+                event.accept()
+                return
+
+        if event.button() == Qt.LeftButton and self.state in ("self_select", "fan_select"):
             if len(self.selected_indices) < self.draw_count:
                 cid = self._manual_card_hit(event.position())
                 if cid >= 0 and cid not in self.selected_indices:
@@ -1304,7 +1466,7 @@ class TarotStage(QWidget):
                     self.selected_reversed.append(self.cards[cid].reversed)
                     self.revealed.append(False)
                     self.manual_take_started[slot] = time.perf_counter()
-                    self.animationStatus.emit(f"已选择 {slot + 1} / {self.draw_count} 张")
+                    self.animationStatus.emit(self._t(f"已选择 {slot + 1} / {self.draw_count} 张", f"Selected {slot + 1} / {self.draw_count}"))
                     self._ensure_timer()
                     self.update()
             super().mousePressEvent(event)
@@ -1321,11 +1483,33 @@ class TarotStage(QWidget):
                         if self.state == "done":
                             self.state = "await_reveal"
                         active = len(self.flip_started_by_slot)
-                        self.animationStatus.emit(f"翻开第 {i + 1} 张牌 · {active} 张正在翻转")
+                        self.animationStatus.emit(self._t(f"翻开第 {i + 1} 张牌 · {active} 张正在翻转", f"Revealing card {i + 1} · {active} flipping"))
                         self._ensure_timer()
                         self.update()
                     break
         super().mousePressEvent(event)
+
+    def _showcase_rects(self):
+        n = max(1, len(self.active_order))
+        cols = 13 if n >= 70 else max(6, int(math.ceil(math.sqrt(n * 2.0))))
+        rows = int(math.ceil(n / cols))
+        gap = 7.0
+        max_w = self.width() - 70.0
+        max_h = self.height() * .70
+        cw = min(62.0, (max_w - gap*(cols-1)) / cols)
+        ch = cw * 1.58
+        if rows * ch + gap*(rows-1) > max_h:
+            ch = (max_h - gap*(rows-1)) / rows
+            cw = ch / 1.58
+        total_w = cols*cw + (cols-1)*gap
+        total_h = rows*ch + (rows-1)*gap
+        ox = (self.width() - total_w) * .5
+        oy = max(28.0, (self.height()* .72 - total_h)*.5)
+        rects=[]
+        for i in range(n):
+            r=i//cols; c=i%cols
+            rects.append(QRectF(ox+c*(cw+gap), oy+r*(ch+gap), cw, ch))
+        return rects
 
     def paintEvent(self, event):
         p = QPainter(self)
@@ -1339,6 +1523,36 @@ class TarotStage(QWidget):
         now = time.perf_counter()
         elapsed = now - self.state_started
 
+        if self.state in ("showcase_front", "showcase_flip"):
+            rects = self._showcase_rects()
+            for i, cid in enumerate(self.active_order):
+                if i >= len(rects):
+                    break
+                r = rects[i]
+                if self.state == "showcase_front":
+                    self._paint_front(p, r, cid, self.cards[cid].reversed)
+                else:
+                    local = (elapsed - i*self.showcase_flip_gap) / max(.001, self.showcase_flip_card_duration)
+                    if local <= 0:
+                        self._paint_front(p, r, cid, self.cards[cid].reversed)
+                    elif local >= 1:
+                        self._paint_physical_back(p, cid, r, 0.0, 255, False)
+                    else:
+                        e = self._ease_in_out(local)
+                        if e < .5:
+                            w = max(1.0, r.width()*(1.0-e/.5))
+                            rr = QRectF(r.center().x()-w/2, r.top(), w, r.height())
+                            self._paint_front(p, rr, cid, self.cards[cid].reversed)
+                        else:
+                            w = max(1.0, r.width()*((e-.5)/.5))
+                            rr = QRectF(r.center().x()-w/2, r.top(), w, r.height())
+                            self._paint_physical_back(p, cid, rr, 0.0, 255, False)
+            label = self._t("展示所有卡牌正面" if self.state == "showcase_front" else "翻转为卡背",
+                            "SHOW ALL CARD FACES" if self.state == "showcase_front" else "FLIP TO CARD BACKS")
+            p.setPen(QColor("#8a8a8a")); p.setFont(QFont("Segoe UI", 10))
+            p.drawText(QRectF(0, self.height()-32, self.width(), 22), Qt.AlignCenter, label)
+            return
+
         if self.state == "idle":
             order = self.deck_order if self.deck_order else list(range(len(self.cards)))
             for i, cid in enumerate(order):
@@ -1347,7 +1561,7 @@ class TarotStage(QWidget):
             p.setPen(QColor("#757575"))
             p.setFont(QFont("Segoe UI", 10))
             p.drawText(QRectF(0, self.height()-36, self.width(), 24), Qt.AlignCenter,
-                       "先洗牌，再按“抽取”；也可以直接从当前牌序抽取")
+                       self._t("先洗牌，再按“抽取”；也可以直接从当前牌序抽取", "Shuffle first, then press Draw; or draw directly from the current order"))
             return
 
         if self.state == "shuffled":
@@ -1359,7 +1573,7 @@ class TarotStage(QWidget):
             p.setPen(QColor("#777777"))
             p.setFont(QFont("Segoe UI", 10))
             p.drawText(QRectF(0, self.height()-36, self.width(), 24), Qt.AlignCenter,
-                       "洗牌完成 · 可再次洗牌、自己选择，或按“抽取”")
+                       self._t("洗牌完成 · 可再次洗牌、自己选择，或按“抽取”", "Shuffle complete · shuffle again, choose manually, or press Draw"))
             return
 
         if self.state == "gather":
@@ -1367,8 +1581,13 @@ class TarotStage(QWidget):
             order = self.active_order
             deck = self._deck_rect()
             for i, cid in enumerate(order):
-                x, y, cw, ch, rot = self._idle_geometry(i, len(order))
-                start = QRectF(x-cw/2, y-ch/2, cw, ch)
+                if self.showcase_was_used:
+                    grid = self._showcase_rects()
+                    start = grid[i] if i < len(grid) else self._deck_rect()
+                    rot = 0.0
+                else:
+                    x, y, cw, ch, rot = self._idle_geometry(i, len(order))
+                    start = QRectF(x-cw/2, y-ch/2, cw, ch)
                 target, _ = self._stack_pose(deck, i, len(order), 0.0, .06)
                 r = QRectF(
                     self._lerp(start.left(), target.left(), q),
@@ -1522,6 +1741,36 @@ class TarotStage(QWidget):
             self._paint_progress(p, q, f"SQUARE · {self.shuffle_round + 1}/{self.shuffle_rounds}")
             return
 
+        if self.state in ("fan_insert", "fan_select"):
+            slots = self._result_slots()
+            selected = set(self.selected_indices)
+            if self.state == "fan_insert":
+                for cid in self.scatter_order:
+                    r, rot, q = self._fan_card_pose(cid, elapsed)
+                    if q > 0:
+                        self._paint_physical_back(p, cid, r, rot, 255, False)
+                prog = min(1.0, elapsed / max(.001, self.fan_total_duration))
+                self._paint_progress(p, prog, "FAN INSERT · 78 CARDS")
+                return
+            for cid in self.scatter_order:
+                if cid not in selected:
+                    d = self.scatter_pose[cid]
+                    self._paint_physical_back(p, cid, d["rect"], d["rot"], 255, False)
+            now2 = time.perf_counter()
+            for slot, cid in enumerate(self.selected_indices):
+                d = self.scatter_pose[cid]
+                if slot in self.manual_take_started:
+                    q = min(1.0, max(0.0, (now2-self.manual_take_started[slot])/self.manual_take_duration))
+                    e = self._ease_in_out(q)
+                    src=d["rect"]; dst=slots[slot]
+                    r=QRectF(self._lerp(src.left(),dst.left(),e), self._lerp(src.top(),dst.top(),e)-math.sin(e*math.pi)*46.0, self._lerp(src.width(),dst.width(),e), self._lerp(src.height(),dst.height(),e))
+                    self._paint_physical_back(p,cid,r,self._lerp(d["rot"],0.0,e),255,True)
+                else:
+                    self._paint_physical_back(p,cid,slots[slot],0.0,255,True)
+            p.setPen(QColor("#808080")); p.setFont(QFont("Segoe UI",10))
+            p.drawText(QRectF(0,self.height()-30,self.width(),22),Qt.AlignCenter,self._t(f"从扇形牌中选择 · {len(self.selected_indices)} / {self.draw_count}",f"Choose from the fan · {len(self.selected_indices)} / {self.draw_count}"))
+            return
+
         if self.state in ("self_drop", "self_select", "manual_gather_rest"):
             slots = self._result_slots()
             selected = set(self.selected_indices)
@@ -1564,7 +1813,7 @@ class TarotStage(QWidget):
                 p.setPen(QColor("#808080"))
                 p.setFont(QFont("Segoe UI", 10))
                 p.drawText(QRectF(0, self.height()-30, self.width(), 22), Qt.AlignCenter,
-                           f"从散落的牌中选择 · {len(self.selected_indices)} / {self.draw_count}")
+                           self._t(f"从散落的牌中选择 · {len(self.selected_indices)} / {self.draw_count}", f"Choose from the scattered cards · {len(self.selected_indices)} / {self.draw_count}"))
                 return
 
             # After the final choice, remaining cards physically gather from their
@@ -1631,7 +1880,7 @@ class TarotStage(QWidget):
 
         p.setPen(QColor("#777777"))
         p.setFont(QFont("Segoe UI", 10))
-        message = "全部卡牌已翻开" if self.state == "done" else "点击卡牌翻开 · 移动鼠标查看 3D 视差"
+        message = self._t("全部卡牌已翻开", "All cards revealed") if self.state == "done" else self._t("点击卡牌翻开 · 移动鼠标查看 3D 视差", "Click a card to reveal · move the mouse for 3D parallax")
         p.drawText(QRectF(0, self.height()-30, self.width(), 22), Qt.AlignCenter, message)
 
     def _paint_progress(self, p, progress, label):
@@ -1705,12 +1954,12 @@ class HomePage(QWidget):
         kicker.setObjectName("kicker")
         outer.addWidget(kicker)
 
-        title = QLabel("选择一种方式，看看随机性会给你什么。")
+        title = QLabel(TXT("选择一种方式，看看随机性会给你什么。", "Choose a method and see what chance gives you."))
         title.setObjectName("heroTitle")
         title.setWordWrap(True)
         outer.addWidget(title)
 
-        subtitle = QLabel("一个简洁的离线占卜工具。当前版本先完成塔罗牌界面，其他方式将逐步加入。")
+        subtitle = QLabel(TXT("一个简洁的离线占卜工具。当前版本先完成塔罗牌界面，其他方式将逐步加入。", "A minimalist offline divination tool. Tarot is the current focus; more methods will be added over time."))
         subtitle.setObjectName("heroSubtitle")
         subtitle.setWordWrap(True)
         outer.addWidget(subtitle)
@@ -1718,10 +1967,10 @@ class HomePage(QWidget):
 
         grid = QHBoxLayout()
         grid.setSpacing(12)
-        tarot = MethodCard("塔罗牌", "78 张牌 · 正位 / 逆位", "◇", True)
-        dice = MethodCard("骰子", "开发中", "□", False)
-        rune = MethodCard("符文", "开发中", "△", False)
-        coin = MethodCard("硬币", "开发中", "○", False)
+        tarot = MethodCard(TXT("塔罗牌", "Tarot"), TXT("78 张牌 · 正位 / 逆位", "78 cards · upright / reversed"), "◇", True)
+        dice = MethodCard(TXT("骰子", "Dice"), TXT("开发中", "In development"), "□", False)
+        rune = MethodCard(TXT("符文", "Runes"), TXT("开发中", "In development"), "△", False)
+        coin = MethodCard(TXT("硬币", "Coin"), TXT("开发中", "In development"), "○", False)
         tarot.clicked.connect(lambda _: self.startTarot.emit())
         for card in (tarot, dice, rune, coin):
             grid.addWidget(card, 1)
@@ -1733,124 +1982,71 @@ class HomePage(QWidget):
         outer.addWidget(quote)
 
 
-class TarotPage(QWidget):
+class CustomTarotPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.selected_count = 3
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(46, 30, 46, 24)
-        outer.setSpacing(12)
+        outer.setContentsMargins(34, 20, 34, 20)
+        outer.setSpacing(10)
 
         head = QHBoxLayout()
-        head_text = QVBoxLayout()
-        head_text.setSpacing(4)
-        eyebrow = QLabel("TAROT / PHYSICAL DECK")
-        eyebrow.setObjectName("kicker")
-        title = QLabel("塔罗牌抽取")
-        title.setObjectName("pageTitle")
-        desc = QLabel("洗牌与抽取现在彼此独立：先真实交错洗牌，再决定何时从牌顶抽取；也可以让 78 张牌散落后自行挑选。")
-        desc.setObjectName("pageDesc")
-        desc.setWordWrap(True)
-        head_text.addWidget(eyebrow)
-        head_text.addWidget(title)
-        head_text.addWidget(desc)
+        head_text = QVBoxLayout(); head_text.setSpacing(3)
+        eyebrow = QLabel("TAROT / PHYSICAL DECK"); eyebrow.setObjectName("kicker")
+        title = QLabel(TXT("自定义塔罗牌抽取", "Custom Tarot Draw")); title.setObjectName("pageTitle")
+        desc = QLabel(TXT("自由设置抽牌数量、洗牌方式与自己选择模式。每一张卡面与卡背都保持物理绑定。",
+                          "Freely set draw count, shuffle behavior, and manual selection mode. Every face remains physically bound to its card back."))
+        desc.setObjectName("pageDesc"); desc.setWordWrap(True)
+        head_text.addWidget(eyebrow); head_text.addWidget(title); head_text.addWidget(desc)
         head.addLayout(head_text, 1)
 
-        action_col = QHBoxLayout()
-        action_col.setSpacing(8)
-        self.manual_button = QPushButton("自己选择")
-        self.manual_button.setObjectName("chipButton")
-        self.manual_button.setCursor(Qt.PointingHandCursor)
-        self.manual_button.setFixedSize(112, 44)
-        action_col.addWidget(self.manual_button)
+        actions = QHBoxLayout(); actions.setSpacing(8)
+        self.manual_button = QPushButton(TXT("自己选择", "Choose Cards")); self.manual_button.setObjectName("chipButton"); self.manual_button.setFixedSize(112, 42)
+        self.shuffle_button = QPushButton(TXT("洗牌", "Shuffle")); self.shuffle_button.setObjectName("chipButton"); self.shuffle_button.setFixedSize(88, 42)
+        self.stop_shuffle_button = QPushButton(TXT("终止洗牌", "Stop Shuffle")); self.stop_shuffle_button.setObjectName("dangerChipButton"); self.stop_shuffle_button.setFixedSize(104, 42); self.stop_shuffle_button.setEnabled(False)
+        self.draw_button = QPushButton(TXT("抽取", "Draw")); self.draw_button.setObjectName("primaryButton"); self.draw_button.setFixedSize(92, 42)
+        for b in (self.manual_button, self.shuffle_button, self.stop_shuffle_button, self.draw_button): b.setCursor(Qt.PointingHandCursor)
+        actions.addWidget(self.manual_button); actions.addWidget(self.shuffle_button); actions.addWidget(self.stop_shuffle_button); actions.addWidget(self.draw_button)
+        head.addLayout(actions); outer.addLayout(head)
 
-        self.shuffle_button = QPushButton("洗牌")
-        self.shuffle_button.setObjectName("chipButton")
-        self.shuffle_button.setCursor(Qt.PointingHandCursor)
-        self.shuffle_button.setFixedSize(92, 44)
-        action_col.addWidget(self.shuffle_button)
+        config = QFrame(); config.setObjectName("configPanel")
+        panel = QVBoxLayout(config); panel.setContentsMargins(16, 10, 16, 10); panel.setSpacing(8)
+        top = QHBoxLayout(); top.setSpacing(8)
+        label_col = QVBoxLayout(); label_col.setSpacing(0)
+        label = QLabel(TXT("抽牌数量", "Draw Count")); label.setObjectName("settingTitle")
+        note = QLabel(TXT("1–8 张", "1–8 cards")); note.setObjectName("settingNote")
+        label_col.addWidget(label); label_col.addWidget(note); top.addLayout(label_col); top.addSpacing(4)
 
-        self.stop_shuffle_button = QPushButton("终止洗牌")
-        self.stop_shuffle_button.setObjectName("dangerChipButton")
-        self.stop_shuffle_button.setCursor(Qt.PointingHandCursor)
-        self.stop_shuffle_button.setFixedSize(104, 44)
-        self.stop_shuffle_button.setEnabled(False)
-        action_col.addWidget(self.stop_shuffle_button)
-
-        self.draw_button = QPushButton("抽取")
-        self.draw_button.setObjectName("primaryButton")
-        self.draw_button.setCursor(Qt.PointingHandCursor)
-        self.draw_button.setFixedSize(96, 44)
-        action_col.addWidget(self.draw_button)
-        head.addLayout(action_col)
-        outer.addLayout(head)
-
-        config = QFrame()
-        config.setObjectName("configPanel")
-        cfg = QHBoxLayout(config)
-        cfg.setContentsMargins(18, 12, 18, 12)
-        cfg.setSpacing(12)
-
-        label_col = QVBoxLayout()
-        label_col.setSpacing(1)
-        label = QLabel("抽牌数量")
-        label.setObjectName("settingTitle")
-        note = QLabel("1–8 张")
-        note.setObjectName("settingNote")
-        label_col.addWidget(label)
-        label_col.addWidget(note)
-        cfg.addLayout(label_col)
-        cfg.addSpacing(8)
-
-        self.count_group = QButtonGroup(self)
-        self.count_group.setExclusive(True)
+        self.count_group = QButtonGroup(self); self.count_group.setExclusive(True)
         for n in range(1, 9):
-            b = CountButton(n)
-            b.setChecked(n == self.selected_count)
-            self.count_group.addButton(b, n)
-            cfg.addWidget(b)
+            b = CountButton(n); b.setChecked(n == self.selected_count); self.count_group.addButton(b, n); top.addWidget(b)
         self.count_group.idClicked.connect(self._set_count)
+        top.addSpacing(6)
+        riffle_label = QLabel(TXT("Riffle 次数", "Riffle Count")); riffle_label.setObjectName("settingNote"); top.addWidget(riffle_label)
+        self.riffle_input = QLineEdit("3"); self.riffle_input.setObjectName("numberInput"); self.riffle_input.setAlignment(Qt.AlignCenter); self.riffle_input.setValidator(QIntValidator(1,50,self)); self.riffle_input.setFixedSize(50,34); top.addWidget(self.riffle_input)
+        cut_label = QLabel(TXT("Cut 组数", "Cut Groups")); cut_label.setObjectName("settingNote"); top.addWidget(cut_label)
+        self.cut_input = QLineEdit("2"); self.cut_input.setObjectName("numberInput"); self.cut_input.setAlignment(Qt.AlignCenter); self.cut_input.setValidator(QIntValidator(1,20,self)); self.cut_input.setFixedSize(50,34); top.addWidget(self.cut_input)
+        top.addStretch(1); panel.addLayout(top)
 
-        cfg.addSpacing(10)
-        riffle_label = QLabel("Riffle 次数")
-        riffle_label.setObjectName("settingNote")
-        cfg.addWidget(riffle_label)
-        self.riffle_input = QLineEdit("3")
-        self.riffle_input.setObjectName("numberInput")
-        self.riffle_input.setAlignment(Qt.AlignCenter)
-        self.riffle_input.setValidator(QIntValidator(1, 50, self))
-        self.riffle_input.setFixedSize(54, 36)
-        cfg.addWidget(self.riffle_input)
-
-        cut_label = QLabel("Cut 组数")
-        cut_label.setObjectName("settingNote")
-        cfg.addWidget(cut_label)
-        self.cut_input = QLineEdit("2")
-        self.cut_input.setObjectName("numberInput")
-        self.cut_input.setAlignment(Qt.AlignCenter)
-        self.cut_input.setValidator(QIntValidator(1, 20, self))
-        self.cut_input.setFixedSize(54, 36)
-        cfg.addWidget(self.cut_input)
-
-        cfg.addStretch(1)
-        self.reverse_chip = MiniSwitch("允许逆位", True)
-        self.major_chip = MiniSwitch("仅大阿卡纳", False)
-        cfg.addWidget(self.reverse_chip)
-        cfg.addWidget(self.major_chip)
+        options = QHBoxLayout(); options.setSpacing(9)
+        mode_label = QLabel(TXT("自己选择方式", "Manual Choice Style")); mode_label.setObjectName("settingNote"); options.addWidget(mode_label)
+        self.manual_mode_group = QButtonGroup(self); self.manual_mode_group.setExclusive(True)
+        self.rain_mode_button = QPushButton(TXT("牌雨", "Card Rain")); self.fan_mode_button = QPushButton(TXT("扇形展开", "Fan Spread"))
+        for mid,b in enumerate((self.rain_mode_button,self.fan_mode_button)):
+            b.setObjectName("chipButton"); b.setCheckable(True); b.setCursor(Qt.PointingHandCursor); b.setMinimumHeight(34); self.manual_mode_group.addButton(b,mid); options.addWidget(b)
+        self.rain_mode_button.setChecked(True)
+        self.showcase_check = QCheckBox(TXT("卡牌展示", "Card Showcase")); self.showcase_check.setObjectName("optionCheck"); self.showcase_check.setToolTip(TXT("洗牌前展示所有卡牌正面，再动画翻为背面。", "Show every card face before shuffling, then animate them face-down.")); options.addWidget(self.showcase_check)
+        options.addStretch(1)
+        self.reverse_chip = MiniSwitch(TXT("允许逆位", "Allow Reversed"), True); self.major_chip = MiniSwitch(TXT("仅大阿卡纳", "Major Arcana Only"), False)
+        options.addWidget(self.reverse_chip); options.addWidget(self.major_chip); panel.addLayout(options)
         outer.addWidget(config)
 
-        self.stage = TarotStage()
-        outer.addWidget(self.stage, 1)
-
+        self.stage = TarotStage(); self.stage.configure_runtime(APP_SETTINGS.get("language","zh"), APP_SETTINGS.get("mark_back",False)); outer.addWidget(self.stage, 1)
         status_row = QHBoxLayout()
-        self.status = QLabel("准备就绪 · 78 张牌已载入")
-        self.status.setObjectName("statusText")
-        status_row.addWidget(self.status)
-        status_row.addStretch(1)
-        self.card_count_label = QLabel(f"RESOURCE / {len(self.stage.card_files)} CARDS")
-        self.card_count_label.setObjectName("muted")
-        status_row.addWidget(self.card_count_label)
+        self.status = QLabel(TXT("准备就绪 · 78 张牌已载入", "Ready · 78 cards loaded")); self.status.setObjectName("statusText")
+        status_row.addWidget(self.status); status_row.addStretch(1)
+        self.card_count_label = QLabel(f"RESOURCE / {len(self.stage.card_files)} CARDS"); self.card_count_label.setObjectName("muted"); status_row.addWidget(self.card_count_label)
         outer.addLayout(status_row)
 
         self.shuffle_button.clicked.connect(self._shuffle_clicked)
@@ -1861,87 +2057,145 @@ class TarotPage(QWidget):
         self.stage.shuffleFinished.connect(self._shuffle_finished)
         self.stage.animationFinished.connect(self._finished)
 
-    def _set_count(self, n):
-        self.selected_count = n
+    def _set_count(self, n): self.selected_count = n
 
     def _set_controls_enabled(self, enabled):
-        self.shuffle_button.setEnabled(enabled)
-        self.draw_button.setEnabled(enabled)
-        self.manual_button.setEnabled(enabled)
-        for b in self.count_group.buttons():
-            b.setEnabled(enabled)
-        self.reverse_chip.setEnabled(enabled)
-        self.major_chip.setEnabled(enabled)
-        self.riffle_input.setEnabled(enabled)
-        self.cut_input.setEnabled(enabled)
-        # Stop is intentionally the inverse during a running shuffle.
-        shuffle_running = self.stage.state in ("gather", "cut_spread", "cut_restack", "split", "riffle", "square")
-        self.stop_shuffle_button.setEnabled(shuffle_running)
+        for b in (self.shuffle_button,self.draw_button,self.manual_button): b.setEnabled(enabled)
+        for b in self.count_group.buttons(): b.setEnabled(enabled)
+        for w in (self.reverse_chip,self.major_chip,self.riffle_input,self.cut_input,self.rain_mode_button,self.fan_mode_button,self.showcase_check): w.setEnabled(enabled)
+        running = self.stage.state in ("showcase_front","showcase_flip","gather","cut_spread","cut_restack","split","riffle","square")
+        self.stop_shuffle_button.setEnabled(running)
 
     def _shuffle_clicked(self):
-        if self.stage.state not in ("idle", "done", "shuffled"):
-            return
-        try:
-            riffles = int(self.riffle_input.text() or "3")
-        except ValueError:
-            riffles = 3
-        try:
-            cut_groups = int(self.cut_input.text() or "2")
-        except ValueError:
-            cut_groups = 2
-        riffles = max(1, min(50, riffles))
-        cut_groups = max(1, min(20, cut_groups))
-        self.riffle_input.setText(str(riffles))
-        self.cut_input.setText(str(cut_groups))
-
+        if self.stage.state not in ("idle","done","shuffled"): return
+        try: riffles=int(self.riffle_input.text() or "3")
+        except ValueError: riffles=3
+        try: cuts=int(self.cut_input.text() or "2")
+        except ValueError: cuts=2
+        riffles=max(1,min(50,riffles)); cuts=max(1,min(20,cuts)); self.riffle_input.setText(str(riffles)); self.cut_input.setText(str(cuts))
         self._set_controls_enabled(False)
-        self.stage.start_shuffle(
-            allow_reversed=self.reverse_chip.isChecked(),
-            major_only=self.major_chip.isChecked(),
-            riffle_rounds=riffles,
-            cut_groups=cut_groups,
-        )
-        self.stop_shuffle_button.setEnabled(self.stage.state in ("gather", "split", "riffle", "square"))
+        self.stage.start_shuffle(self.reverse_chip.isChecked(), self.major_chip.isChecked(), riffles, cuts, self.showcase_check.isChecked())
+        self.stop_shuffle_button.setEnabled(self.stage.state in ("showcase_front","showcase_flip","gather","cut_spread","cut_restack","split","riffle","square"))
 
     def _stop_shuffle_clicked(self):
-        if self.stage.request_stop_shuffle():
-            # Keep regular controls locked until the stage emits shuffleFinished.
-            self.stop_shuffle_button.setEnabled(False)
+        if self.stage.request_stop_shuffle(): self.stop_shuffle_button.setEnabled(False)
 
     def _shuffle_finished(self):
         self._set_controls_enabled(True)
-        self.status.setText("洗牌完成 · 可以调整抽牌数量后按“抽取”")
+        self.status.setText(TXT("洗牌完成 · 可以调整抽牌数量后按“抽取”", "Shuffle complete · adjust the draw count, then press Draw"))
 
     def _draw_clicked(self):
-        if self.stage.state not in ("idle", "done", "shuffled"):
-            return
-        self._set_controls_enabled(False)
-        self.stage.draw_from_deck(
-            count=self.selected_count,
-            major_only=self.major_chip.isChecked(),
-        )
+        if self.stage.state not in ("idle","done","shuffled"): return
+        self._set_controls_enabled(False); self.stage.draw_from_deck(self.selected_count, self.major_chip.isChecked())
 
     def _manual_clicked(self):
-        if self.stage.state not in ("idle", "done", "shuffled"):
-            return
-        previous_state = self.stage.state
-        self._set_controls_enabled(False)
-        self.stage.start_manual(
-            count=self.selected_count,
-            allow_reversed=self.reverse_chip.isChecked(),
-        )
-        # Defensive recovery: if manual mode could not start for any reason,
-        # never leave the whole control strip disabled.
-        if self.stage.state == previous_state:
-            self._set_controls_enabled(True)
-            self.status.setText("自己选择未能启动，请重试。")
+        if self.stage.state not in ("idle","done","shuffled"): return
+        old=self.stage.state; self._set_controls_enabled(False)
+        self.stage.start_manual(self.selected_count,self.reverse_chip.isChecked(),"fan" if self.fan_mode_button.isChecked() else "rain")
+        if self.stage.state==old:
+            self._set_controls_enabled(True); self.status.setText(TXT("自己选择未能启动，请重试。", "Manual choice could not start. Please try again."))
 
-    def _finished(self, names):
-        self._set_controls_enabled(True)
-        short = " · ".join(names[:4])
-        if len(names) > 4:
-            short += f" · +{len(names)-4}"
-        self.status.setText(f"抽取完成 · {short}")
+    def _finished(self,names):
+        self._set_controls_enabled(True); short=" · ".join(names[:4]); short += f" · +{len(names)-4}" if len(names)>4 else ""
+        self.status.setText(TXT(f"抽取完成 · {short}",f"Draw complete · {short}"))
+
+
+class ClassicTarotPage(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(46, 34, 46, 34)
+        layout.setSpacing(12)
+        kicker = QLabel("TAROT / CLASSIC SPREADS")
+        kicker.setObjectName("kicker")
+        title = QLabel(TXT("经典牌阵", "Classic Spreads"))
+        title.setObjectName("pageTitle")
+        desc = QLabel(TXT("经典牌阵页面正在制作。后续将在这里加入三张牌阵、凯尔特十字等固定牌阵。",
+                          "Classic spread layouts are under construction. Three-card spreads, the Celtic Cross, and other fixed layouts will appear here."))
+        desc.setObjectName("pageDesc")
+        desc.setWordWrap(True)
+        placeholder = QFrame()
+        placeholder.setObjectName("configPanel")
+        pl = QVBoxLayout(placeholder)
+        pl.setContentsMargins(28, 28, 28, 28)
+        msg = QLabel(TXT("占位页面 · 经典牌阵将在后续版本开放", "Placeholder · classic spreads will be added in a later version"))
+        msg.setObjectName("heroSubtitle")
+        msg.setAlignment(Qt.AlignCenter)
+        pl.addStretch(1); pl.addWidget(msg); pl.addStretch(1)
+        layout.addWidget(kicker); layout.addWidget(title); layout.addWidget(desc); layout.addSpacing(12); layout.addWidget(placeholder, 1)
+
+
+class TarotPage(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(28, 18, 28, 18)
+        outer.setSpacing(10)
+        tabs = QHBoxLayout(); tabs.setSpacing(8)
+        self.classic_btn = QPushButton(TXT("经典牌阵", "Classic Spreads"))
+        self.custom_btn = QPushButton(TXT("自定义塔罗牌抽取", "Custom Tarot Draw"))
+        self.classic_btn.setCheckable(True); self.custom_btn.setCheckable(True)
+        self.classic_btn.setObjectName("tarotTab"); self.custom_btn.setObjectName("tarotTab")
+        self.tab_group = QButtonGroup(self); self.tab_group.setExclusive(True)
+        self.tab_group.addButton(self.classic_btn, 0); self.tab_group.addButton(self.custom_btn, 1)
+        self.classic_btn.setChecked(True)
+        tabs.addWidget(self.classic_btn); tabs.addWidget(self.custom_btn); tabs.addStretch(1)
+        outer.addLayout(tabs)
+        self.pages = QStackedWidget()
+        self.classic = ClassicTarotPage()
+        self.custom = CustomTarotPage()
+        self.pages.addWidget(self.classic); self.pages.addWidget(self.custom)
+        outer.addWidget(self.pages, 1)
+        self.tab_group.idClicked.connect(self.pages.setCurrentIndex)
+
+
+class SettingsPage(QWidget):
+    settingsChanged = Signal()
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(48, 38, 48, 38)
+        layout.setSpacing(18)
+        kicker = QLabel("5IMP1E 5ATEBOX / SETTINGS")
+        kicker.setObjectName("kicker")
+        title = QLabel(TXT("设置", "Settings")); title.setObjectName("pageTitle")
+        desc = QLabel(TXT("界面与实体卡牌交互设置。", "Interface and physical-card interaction settings.")); desc.setObjectName("pageDesc")
+        layout.addWidget(kicker); layout.addWidget(title); layout.addWidget(desc)
+
+        panel = QFrame(); panel.setObjectName("configPanel")
+        form = QVBoxLayout(panel); form.setContentsMargins(22, 18, 22, 18); form.setSpacing(16)
+
+        lang_row = QHBoxLayout()
+        lang_text = QVBoxLayout()
+        lang_title = QLabel(TXT("语言", "Language")); lang_title.setObjectName("settingTitle")
+        lang_note = QLabel(TXT("切换整个程序的界面语言", "Change the interface language for the entire app")); lang_note.setObjectName("settingNote")
+        lang_text.addWidget(lang_title); lang_text.addWidget(lang_note)
+        self.language_combo = QComboBox(); self.language_combo.setObjectName("settingCombo")
+        self.language_combo.addItem(TXT("简体中文", "Chinese (Simplified)"), "zh"); self.language_combo.addItem("English", "en")
+        idx = self.language_combo.findData(APP_SETTINGS.get("language", "zh")); self.language_combo.setCurrentIndex(max(0, idx))
+        lang_row.addLayout(lang_text, 1); lang_row.addWidget(self.language_combo)
+        form.addLayout(lang_row)
+
+        form.addWidget(AccentLine())
+        mark_row = QHBoxLayout()
+        mark_text = QVBoxLayout()
+        mark_title = QLabel(TXT("卡背标记", "Card-back Marking")); mark_title.setObjectName("settingTitle")
+        mark_note = QLabel(TXT("开启后，右键一张可见的卡牌可把它的卡背标为红色；再次右键取消。标记会跟随实体卡牌通过 Cut、Riffle、抽取与翻牌。",
+                               "When enabled, right-click a visible card to mark its back red; right-click again to remove it. The mark stays bound to that physical card through cuts, riffles, draws, and reveals."))
+        mark_note.setObjectName("settingNote"); mark_note.setWordWrap(True)
+        mark_text.addWidget(mark_title); mark_text.addWidget(mark_note)
+        self.mark_check = QCheckBox(TXT("启用卡背红色标记", "Enable red card-back marks")); self.mark_check.setChecked(APP_SETTINGS.get("mark_back", False))
+        mark_row.addLayout(mark_text, 1); mark_row.addWidget(self.mark_check)
+        form.addLayout(mark_row)
+        layout.addWidget(panel); layout.addStretch(1)
+
+        self.language_combo.currentIndexChanged.connect(self._changed)
+        self.mark_check.toggled.connect(self._changed)
+
+    def _changed(self, *args):
+        APP_SETTINGS["language"] = self.language_combo.currentData()
+        APP_SETTINGS["mark_back"] = self.mark_check.isChecked()
+        self.settingsChanged.emit()
 
 
 class PlaceholderPage(QWidget):
@@ -1953,7 +2207,7 @@ class PlaceholderPage(QWidget):
         kicker.setObjectName("kicker")
         title_lbl = QLabel(title)
         title_lbl.setObjectName("pageTitle")
-        desc = QLabel("此模块尚未启用。当前开发重点为塔罗牌界面与伪 3D 交互。")
+        desc = QLabel(TXT("此模块尚未启用。当前开发重点为塔罗牌界面与伪 3D 交互。", "This module is not enabled yet. Current development focuses on Tarot and pseudo-3D interaction."))
         desc.setObjectName("pageDesc")
         layout.addWidget(kicker)
         layout.addWidget(title_lbl)
@@ -1967,6 +2221,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"{APP_NAME}  ·  {APP_VERSION}")
         self.resize(1440, 900)
         self.setMinimumSize(1180, 760)
+        self._language = APP_SETTINGS.get("language", "zh")
         self._build_ui()
 
     def _build_ui(self):
@@ -1996,12 +2251,12 @@ class MainWindow(QMainWindow):
         self.nav_group = QButtonGroup(self)
         self.nav_group.setExclusive(True)
         nav_specs = [
-            ("首页", "⌂"),
-            ("塔罗牌", "◇"),
-            ("骰子", "□"),
-            ("符文", "△"),
-            ("硬币", "○"),
-            ("抽签", "│"),
+            (TXT("首页", "Home"), "⌂"),
+            (TXT("塔罗牌", "Tarot"), "◇"),
+            (TXT("骰子", "Dice"), "□"),
+            (TXT("符文", "Runes"), "△"),
+            (TXT("硬币", "Coin"), "○"),
+            (TXT("抽签", "Lots"), "│"),
         ]
         self.nav_buttons = []
         for idx, (text, glyph) in enumerate(nav_specs):
@@ -2015,8 +2270,8 @@ class MainWindow(QMainWindow):
         sl.addWidget(AccentLine())
         sl.addSpacing(10)
 
-        settings = NavButton("设置", "⚙")
-        about = NavButton("关于", "·")
+        settings = NavButton(TXT("设置", "Settings"), "⚙")
+        about = NavButton(TXT("关于", "About"), "·")
         self.nav_group.addButton(settings, 6)
         self.nav_group.addButton(about, 7)
         self.nav_buttons.extend([settings, about])
@@ -2040,7 +2295,7 @@ class MainWindow(QMainWindow):
         tl = QHBoxLayout(topbar)
         tl.setContentsMargins(24, 0, 24, 0)
         tl.setSpacing(10)
-        self.section_title = QLabel("首页")
+        self.section_title = QLabel(TXT("首页", "Home"))
         self.section_title.setObjectName("sectionTitle")
         tl.addWidget(self.section_title)
         tl.addStretch(1)
@@ -2063,8 +2318,14 @@ class MainWindow(QMainWindow):
         self.home.startTarot.connect(lambda: self._navigate(1))
         self.stack.addWidget(self.home)
         self.stack.addWidget(self.tarot)
-        for title in ["骰子", "符文", "硬币", "抽签", "设置", "关于"]:
-            self.stack.addWidget(PlaceholderPage(title))
+        self.stack.addWidget(PlaceholderPage(TXT("骰子", "Dice")))
+        self.stack.addWidget(PlaceholderPage(TXT("符文", "Runes")))
+        self.stack.addWidget(PlaceholderPage(TXT("硬币", "Coin")))
+        self.stack.addWidget(PlaceholderPage(TXT("抽签", "Lots")))
+        self.settings_page = SettingsPage()
+        self.settings_page.settingsChanged.connect(self._settings_changed)
+        self.stack.addWidget(self.settings_page)
+        self.stack.addWidget(PlaceholderPage(TXT("关于", "About")))
         content_layout.addWidget(self.stack, 1)
 
         main.addWidget(side)
@@ -2075,11 +2336,27 @@ class MainWindow(QMainWindow):
 
     def _navigate(self, idx):
         self.stack.setCurrentIndex(idx)
-        names = ["首页", "塔罗牌", "骰子", "符文", "硬币", "抽签", "设置", "关于"]
+        names = [TXT("首页", "Home"), TXT("塔罗牌", "Tarot"), TXT("骰子", "Dice"), TXT("符文", "Runes"), TXT("硬币", "Coin"), TXT("抽签", "Lots"), TXT("设置", "Settings"), TXT("关于", "About")]
         self.section_title.setText(names[idx])
         btn = self.nav_group.button(idx)
         if btn:
             btn.setChecked(True)
+
+    def _settings_changed(self):
+        idx = self.stack.currentIndex() if hasattr(self, "stack") else 6
+        new_lang = APP_SETTINGS.get("language", "zh")
+        if new_lang == self._language:
+            try:
+                self.tarot.custom.stage.configure_runtime(mark_back=APP_SETTINGS.get("mark_back", False))
+            except Exception:
+                pass
+            return
+        self._language = new_lang
+        old_group = getattr(self, "nav_group", None)
+        if old_group is not None:
+            old_group.deleteLater()
+        self._build_ui()
+        self._navigate(min(idx, self.stack.count()-1))
 
 
 STYLE = r"""
@@ -2277,6 +2554,16 @@ QPushButton#primaryButton {
 }
 QPushButton#primaryButton:hover { background: #ffffff; }
 QPushButton#primaryButton:pressed { background: #cfcfcf; }
+
+QPushButton#tarotTab {
+    color: #777; background: #0d0d0d; border: 1px solid #222; border-radius: 9px;
+    padding: 8px 16px; min-height: 24px;
+}
+QPushButton#tarotTab:hover { color: #ddd; background: #121212; }
+QPushButton#tarotTab:checked { color: #f0f0f0; background: #171717; border-color: #3a3a3a; }
+QCheckBox#optionCheck { color: #aaa; spacing: 7px; }
+QCheckBox#optionCheck::indicator, QCheckBox::indicator { width: 16px; height: 16px; }
+QComboBox#settingCombo { background: #111; color: #ddd; border: 1px solid #303030; border-radius: 8px; padding: 7px 12px; min-width: 150px; }
 """
 
 
