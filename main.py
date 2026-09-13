@@ -14,8 +14,18 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "5imp1e 5atebox"
-APP_VERSION = "0.8.5"
-APP_SETTINGS = {"language": "zh", "mark_back": False}
+APP_VERSION = "0.8.6"
+APP_SETTINGS = {
+    "language": "zh",
+    "mark_back": False,
+    "allow_reversed": True,
+    "riffle_rounds": 3,
+    "cut_groups": 2,
+    # Custom draw keeps its own default behavior; all classic/other manual draws
+    # default to a fan spread unless changed in Settings.
+    "custom_manual_mode": "rain",
+    "default_manual_mode": "fan",
+}
 
 def TXT(zh, en):
     return en if APP_SETTINGS.get("language") == "en" else zh
@@ -2641,25 +2651,16 @@ class CustomTarotPage(QWidget):
         for n in range(1, 9):
             b = CountButton(n); b.setChecked(n == self.selected_count); self.count_group.addButton(b, n); top.addWidget(b)
         self.count_group.idClicked.connect(self._set_count)
-        top.addSpacing(6)
-        riffle_label = QLabel(TXT("Riffle 次数", "Riffle Count")); riffle_label.setObjectName("settingNote"); top.addWidget(riffle_label)
-        self.riffle_input = QLineEdit("3"); self.riffle_input.setObjectName("numberInput"); self.riffle_input.setAlignment(Qt.AlignCenter); self.riffle_input.setValidator(QIntValidator(1,50,self)); self.riffle_input.setFixedSize(50,34); top.addWidget(self.riffle_input)
-        cut_label = QLabel(TXT("Cut 组数", "Cut Groups")); cut_label.setObjectName("settingNote"); top.addWidget(cut_label)
-        self.cut_input = QLineEdit("2"); self.cut_input.setObjectName("numberInput"); self.cut_input.setAlignment(Qt.AlignCenter); self.cut_input.setValidator(QIntValidator(1,20,self)); self.cut_input.setFixedSize(50,34); top.addWidget(self.cut_input)
         top.addStretch(1); panel.addLayout(top)
 
         options = QHBoxLayout(); options.setSpacing(9)
-        mode_label = QLabel(TXT("自己选择方式", "Manual Choice Style")); mode_label.setObjectName("settingNote"); options.addWidget(mode_label)
-        self.manual_mode_group = QButtonGroup(self); self.manual_mode_group.setExclusive(True)
-        self.rain_mode_button = QPushButton(TXT("牌雨", "Card Rain")); self.fan_mode_button = QPushButton(TXT("扇形展开", "Fan Spread"))
-        for mid,b in enumerate((self.rain_mode_button,self.fan_mode_button)):
-            b.setObjectName("chipButton"); b.setCheckable(True); b.setCursor(Qt.PointingHandCursor); b.setMinimumHeight(34); self.manual_mode_group.addButton(b,mid); options.addWidget(b)
-        self.rain_mode_button.setChecked(True)
+        settings_note = QLabel(TXT("洗牌 / 逆位 / 自己选择方式可在“设置”中调整", "Shuffle / reversed / manual-choice behavior is configured in Settings"))
+        settings_note.setObjectName("settingNote"); options.addWidget(settings_note)
         self.showcase_check = QCheckBox(TXT("卡牌展示", "Card Showcase")); self.showcase_check.setObjectName("optionCheck"); self.showcase_check.setToolTip(TXT("洗牌前展示所有卡牌正面，再动画翻为背面。", "Show every card face before shuffling, then animate them face-down.")); options.addWidget(self.showcase_check)
         self.free_move_check = QCheckBox(TXT("自由移动", "Free Move")); self.free_move_check.setObjectName("optionCheck"); self.free_move_check.setToolTip(TXT("自己选择后可拖动已抽出的牌到任意位置；单击牌面可反复翻转正反面。", "After manual selection, drag drawn cards anywhere; click a card to flip freely between face and back.")); options.addWidget(self.free_move_check)
         options.addStretch(1)
-        self.reverse_chip = MiniSwitch(TXT("允许逆位", "Allow Reversed"), True); self.major_chip = MiniSwitch(TXT("仅大阿卡纳", "Major Arcana Only"), False)
-        options.addWidget(self.reverse_chip); options.addWidget(self.major_chip); panel.addLayout(options)
+        self.major_chip = MiniSwitch(TXT("仅大阿卡纳", "Major Arcana Only"), False)
+        options.addWidget(self.major_chip); panel.addLayout(options)
         outer.addWidget(config)
 
         self.stage = TarotStage(); self.stage.configure_runtime(APP_SETTINGS.get("language","zh"), APP_SETTINGS.get("mark_back",False)); outer.addWidget(self.stage, 1)
@@ -2682,20 +2683,18 @@ class CustomTarotPage(QWidget):
     def _set_controls_enabled(self, enabled):
         for b in (self.shuffle_button,self.draw_button,self.manual_button): b.setEnabled(enabled)
         for b in self.count_group.buttons(): b.setEnabled(enabled)
-        for w in (self.reverse_chip,self.major_chip,self.riffle_input,self.cut_input,self.rain_mode_button,self.fan_mode_button,self.showcase_check,self.free_move_check): w.setEnabled(enabled)
+        for w in (self.major_chip,self.showcase_check,self.free_move_check): w.setEnabled(enabled)
         running = self.stage.state in ("showcase_front","showcase_flip","gather","cut_spread","cut_restack","split","riffle","square")
         self.stop_shuffle_button.setEnabled(running)
 
     def _shuffle_clicked(self):
         if self.stage.state not in ("idle","done","shuffled","await_reveal"): return
-        try: riffles=int(self.riffle_input.text() or "3")
-        except ValueError: riffles=3
-        try: cuts=int(self.cut_input.text() or "2")
-        except ValueError: cuts=2
-        riffles=max(1,min(50,riffles)); cuts=max(1,min(20,cuts)); self.riffle_input.setText(str(riffles)); self.cut_input.setText(str(cuts))
+        riffles = max(1, min(50, int(APP_SETTINGS.get("riffle_rounds", 3))))
+        cuts = max(1, min(20, int(APP_SETTINGS.get("cut_groups", 2))))
+        allow_reversed = bool(APP_SETTINGS.get("allow_reversed", True))
         self._set_controls_enabled(False)
         self.stage.configure_spread(None)
-        if not self.stage.request_shuffle(self.reverse_chip.isChecked(), self.major_chip.isChecked(), riffles, cuts, self.showcase_check.isChecked()):
+        if not self.stage.request_shuffle(allow_reversed, self.major_chip.isChecked(), riffles, cuts, self.showcase_check.isChecked()):
             self._set_controls_enabled(True)
         self.stop_shuffle_button.setEnabled(self.stage.state in ("showcase_front","showcase_flip","gather","cut_spread","cut_restack","split","riffle","square"))
 
@@ -2716,7 +2715,9 @@ class CustomTarotPage(QWidget):
         if self.stage.state not in ("idle","done","shuffled","await_reveal"): return
         self._set_controls_enabled(False)
         self.stage.configure_spread(None)
-        if not self.stage.request_manual(self.selected_count,self.reverse_chip.isChecked(),"fan" if self.fan_mode_button.isChecked() else "rain", self.free_move_check.isChecked()):
+        mode = APP_SETTINGS.get("custom_manual_mode", "rain")
+        if mode not in ("rain", "fan"): mode = "rain"
+        if not self.stage.request_manual(self.selected_count,bool(APP_SETTINGS.get("allow_reversed", True)),mode, self.free_move_check.isChecked()):
             self._set_controls_enabled(True); self.status.setText(TXT("自己选择未能启动，请重试。", "Manual choice could not start. Please try again."))
 
     def _finished(self,names):
@@ -2834,24 +2835,12 @@ class ClassicTarotPage(QWidget):
         panel = QVBoxLayout(config); panel.setContentsMargins(16,10,16,10); panel.setSpacing(8)
         row1 = QHBoxLayout(); row1.setSpacing(9)
         self.count_text = QLabel(); self.count_text.setObjectName("settingTitle"); row1.addWidget(self.count_text)
+        settings_note = QLabel(TXT("经典牌阵的自己选择默认使用扇形展开；可在“设置”中修改", "Classic manual choice defaults to Fan Spread; change it in Settings"))
+        settings_note.setObjectName("settingNote"); row1.addWidget(settings_note)
         row1.addStretch(1)
-        riffle_label=QLabel(TXT("Riffle 次数","Riffle Count")); riffle_label.setObjectName("settingNote"); row1.addWidget(riffle_label)
-        self.riffle_input=QLineEdit("3"); self.riffle_input.setObjectName("numberInput"); self.riffle_input.setValidator(QIntValidator(1,50,self)); self.riffle_input.setAlignment(Qt.AlignCenter); self.riffle_input.setFixedSize(50,34); row1.addWidget(self.riffle_input)
-        cut_label=QLabel(TXT("Cut 组数","Cut Groups")); cut_label.setObjectName("settingNote"); row1.addWidget(cut_label)
-        self.cut_input=QLineEdit("2"); self.cut_input.setObjectName("numberInput"); self.cut_input.setValidator(QIntValidator(1,20,self)); self.cut_input.setAlignment(Qt.AlignCenter); self.cut_input.setFixedSize(50,34); row1.addWidget(self.cut_input)
+        self.showcase=QCheckBox(TXT("卡牌展示","Card Showcase")); self.showcase.setObjectName("optionCheck"); row1.addWidget(self.showcase)
+        self.major=MiniSwitch(TXT("仅大阿卡纳","Major Arcana Only"),False); row1.addWidget(self.major)
         panel.addLayout(row1)
-
-        row2=QHBoxLayout(); row2.setSpacing(9)
-        method=QLabel(TXT("自己选择方式","Manual Choice Style")); method.setObjectName("settingNote"); row2.addWidget(method)
-        self.mode_group=QButtonGroup(self); self.mode_group.setExclusive(True)
-        self.rain=QPushButton(TXT("牌雨","Card Rain")); self.fan=QPushButton(TXT("扇形展开","Fan Spread"))
-        for i,b in enumerate((self.rain,self.fan)):
-            b.setObjectName("chipButton"); b.setCheckable(True); b.setCursor(Qt.PointingHandCursor); b.setMinimumHeight(34); self.mode_group.addButton(b,i); row2.addWidget(b)
-        self.rain.setChecked(True)
-        self.showcase=QCheckBox(TXT("卡牌展示","Card Showcase")); self.showcase.setObjectName("optionCheck"); row2.addWidget(self.showcase)
-        row2.addStretch(1)
-        self.reverse=MiniSwitch(TXT("允许逆位","Allow Reversed"),True); self.major=MiniSwitch(TXT("仅大阿卡纳","Major Arcana Only"),False)
-        row2.addWidget(self.reverse); row2.addWidget(self.major); panel.addLayout(row2)
         table_outer.addWidget(config)
 
         self.stage=TarotStage()
@@ -2938,7 +2927,7 @@ class ClassicTarotPage(QWidget):
         self.view_stack.setCurrentIndex(0)
 
     def _set_controls(self, enabled):
-        for w in (self.back_button,self.shuffle_button,self.draw_button,self.manual_button,self.riffle_input,self.cut_input,self.rain,self.fan,self.showcase,self.reverse,self.major):
+        for w in (self.back_button,self.shuffle_button,self.draw_button,self.manual_button,self.showcase,self.major):
             w.setEnabled(enabled)
         running=self.stage.state in ("showcase_front","showcase_flip","gather","cut_spread","cut_restack","split","riffle","square")
         self.stop_button.setEnabled(running)
@@ -2946,12 +2935,11 @@ class ClassicTarotPage(QWidget):
     def _shuffle(self):
         if self.stage.state not in ("idle","done","shuffled","await_reveal"): return
         d=self._definition(self.current_spread_key); self.stage.configure_spread(d["slots"],d["labels"])
-        try:r=int(self.riffle_input.text() or "3")
-        except:r=3
-        try:c=int(self.cut_input.text() or "2")
-        except:c=2
-        r=max(1,min(50,r)); c=max(1,min(20,c)); self.riffle_input.setText(str(r)); self.cut_input.setText(str(c)); self._set_controls(False)
-        if not self.stage.request_shuffle(self.reverse.isChecked(),self.major.isChecked(),r,c,self.showcase.isChecked()): self._set_controls(True)
+        r=max(1,min(50,int(APP_SETTINGS.get("riffle_rounds",3))))
+        c=max(1,min(20,int(APP_SETTINGS.get("cut_groups",2))))
+        allow_reversed=bool(APP_SETTINGS.get("allow_reversed",True))
+        self._set_controls(False)
+        if not self.stage.request_shuffle(allow_reversed,self.major.isChecked(),r,c,self.showcase.isChecked()): self._set_controls(True)
         self.stop_button.setEnabled(self.stage.state in ("showcase_front","showcase_flip","gather","cut_spread","cut_restack","split","riffle","square"))
 
     def _stop(self):
@@ -2968,7 +2956,9 @@ class ClassicTarotPage(QWidget):
     def _manual(self):
         if self.stage.state not in ("idle","done","shuffled","await_reveal"): return
         d=self._definition(self.current_spread_key); self.stage.configure_spread(d["slots"],d["labels"]); self.stage.configure_free_move(False); self._set_controls(False)
-        if not self.stage.request_manual(d["count"],self.reverse.isChecked(),"fan" if self.fan.isChecked() else "rain", False): self._set_controls(True)
+        mode=APP_SETTINGS.get("default_manual_mode","fan")
+        if mode not in ("rain","fan"): mode="fan"
+        if not self.stage.request_manual(d["count"],bool(APP_SETTINGS.get("allow_reversed",True)),mode, False): self._set_controls(True)
 
     def _finished(self,names):
         self._set_controls(True); self.status.setText(TXT("牌阵抽取完成 · 可逐张翻牌。","Spread complete · reveal cards one by one."))
@@ -3005,45 +2995,110 @@ class SettingsPage(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(48, 38, 48, 38)
         layout.setSpacing(18)
-        kicker = QLabel("5IMP1E 5ATEBOX / SETTINGS")
-        kicker.setObjectName("kicker")
+        kicker = QLabel("5IMP1E 5ATEBOX / SETTINGS"); kicker.setObjectName("kicker")
         title = QLabel(TXT("设置", "Settings")); title.setObjectName("pageTitle")
-        desc = QLabel(TXT("界面与实体卡牌交互设置。", "Interface and physical-card interaction settings.")); desc.setObjectName("pageDesc")
+        desc = QLabel(TXT("界面、塔罗洗牌、自己选择与实体卡牌设置。", "Interface, tarot shuffle, manual-choice, and physical-card settings.")); desc.setObjectName("pageDesc")
         layout.addWidget(kicker); layout.addWidget(title); layout.addWidget(desc)
 
-        panel = QFrame(); panel.setObjectName("configPanel")
-        form = QVBoxLayout(panel); form.setContentsMargins(22, 18, 22, 18); form.setSpacing(16)
-
-        lang_row = QHBoxLayout()
-        lang_text = QVBoxLayout()
+        # ---- Interface ----
+        interface_title = QLabel(TXT("界面", "INTERFACE")); interface_title.setObjectName("settingCategory")
+        layout.addWidget(interface_title)
+        interface_panel = QFrame(); interface_panel.setObjectName("configPanel")
+        interface_form = QVBoxLayout(interface_panel); interface_form.setContentsMargins(22,18,22,18); interface_form.setSpacing(14)
+        lang_row = QHBoxLayout(); lang_text = QVBoxLayout()
         lang_title = QLabel(TXT("语言", "Language")); lang_title.setObjectName("settingTitle")
         lang_note = QLabel(TXT("切换整个程序的界面语言", "Change the interface language for the entire app")); lang_note.setObjectName("settingNote")
         lang_text.addWidget(lang_title); lang_text.addWidget(lang_note)
         self.language_combo = QComboBox(); self.language_combo.setObjectName("settingCombo")
         self.language_combo.addItem(TXT("简体中文", "Chinese (Simplified)"), "zh"); self.language_combo.addItem("English", "en")
-        idx = self.language_combo.findData(APP_SETTINGS.get("language", "zh")); self.language_combo.setCurrentIndex(max(0, idx))
-        lang_row.addLayout(lang_text, 1); lang_row.addWidget(self.language_combo)
-        form.addLayout(lang_row)
+        idx=self.language_combo.findData(APP_SETTINGS.get("language","zh")); self.language_combo.setCurrentIndex(max(0,idx))
+        lang_row.addLayout(lang_text,1); lang_row.addWidget(self.language_combo); interface_form.addLayout(lang_row)
+        layout.addWidget(interface_panel)
 
-        form.addWidget(AccentLine())
-        mark_row = QHBoxLayout()
-        mark_text = QVBoxLayout()
-        mark_title = QLabel(TXT("卡背标记", "Card-back Marking")); mark_title.setObjectName("settingTitle")
-        mark_note = QLabel(TXT("开启后，右键一张可见的卡牌可把它的卡背标为红色；再次右键取消。标记会跟随实体卡牌通过 Cut、Riffle、抽取与翻牌。",
-                               "When enabled, right-click a visible card to mark its back red; right-click again to remove it. The mark stays bound to that physical card through cuts, riffles, draws, and reveals."))
-        mark_note.setObjectName("settingNote"); mark_note.setWordWrap(True)
+        # ---- Tarot / Shuffle ----
+        tarot_title = QLabel(TXT("塔罗牌与洗牌", "TAROT & SHUFFLE")); tarot_title.setObjectName("settingCategory")
+        layout.addWidget(tarot_title)
+        tarot_panel = QFrame(); tarot_panel.setObjectName("configPanel")
+        tarot_form = QVBoxLayout(tarot_panel); tarot_form.setContentsMargins(22,18,22,18); tarot_form.setSpacing(14)
+
+        rev_row=QHBoxLayout(); rev_text=QVBoxLayout()
+        rev_title=QLabel(TXT("允许逆位", "Allow Reversed Cards")); rev_title.setObjectName("settingTitle")
+        rev_note=QLabel(TXT("默认开启。关闭后所有新一轮洗牌与自己选择都只使用正位。", "Enabled by default. When off, new shuffles and manual selections use upright cards only.")); rev_note.setObjectName("settingNote"); rev_note.setWordWrap(True)
+        rev_text.addWidget(rev_title); rev_text.addWidget(rev_note)
+        self.reverse_check=QCheckBox(TXT("启用逆位", "Enable reversed cards")); self.reverse_check.setChecked(bool(APP_SETTINGS.get("allow_reversed",True)))
+        rev_row.addLayout(rev_text,1); rev_row.addWidget(self.reverse_check); tarot_form.addLayout(rev_row)
+        tarot_form.addWidget(AccentLine())
+
+        shuffle_row=QHBoxLayout(); shuffle_text=QVBoxLayout()
+        shuffle_title=QLabel(TXT("洗牌参数", "Shuffle Parameters")); shuffle_title.setObjectName("settingTitle")
+        shuffle_note=QLabel(TXT("Riffle 1–50 次；Cut 1–20 组。所有塔罗页面共用。", "Riffle: 1–50 rounds; Cut: 1–20 groups. Shared by all Tarot pages.")); shuffle_note.setObjectName("settingNote")
+        shuffle_text.addWidget(shuffle_title); shuffle_text.addWidget(shuffle_note); shuffle_row.addLayout(shuffle_text,1)
+        riffle_label=QLabel(TXT("Riffle 次数", "Riffle Count")); riffle_label.setObjectName("settingNote"); shuffle_row.addWidget(riffle_label)
+        self.riffle_input=QLineEdit(str(APP_SETTINGS.get("riffle_rounds",3))); self.riffle_input.setObjectName("numberInput"); self.riffle_input.setValidator(QIntValidator(1,50,self)); self.riffle_input.setAlignment(Qt.AlignCenter); self.riffle_input.setFixedSize(56,34); shuffle_row.addWidget(self.riffle_input)
+        cut_label=QLabel(TXT("Cut 组数", "Cut Groups")); cut_label.setObjectName("settingNote"); shuffle_row.addWidget(cut_label)
+        self.cut_input=QLineEdit(str(APP_SETTINGS.get("cut_groups",2))); self.cut_input.setObjectName("numberInput"); self.cut_input.setValidator(QIntValidator(1,20,self)); self.cut_input.setAlignment(Qt.AlignCenter); self.cut_input.setFixedSize(56,34); shuffle_row.addWidget(self.cut_input)
+        tarot_form.addLayout(shuffle_row)
+        layout.addWidget(tarot_panel)
+
+        # ---- Manual choice ----
+        manual_title=QLabel(TXT("自己选择", "MANUAL CHOICE")); manual_title.setObjectName("settingCategory")
+        layout.addWidget(manual_title)
+        manual_panel=QFrame(); manual_panel.setObjectName("configPanel")
+        manual_form=QVBoxLayout(manual_panel); manual_form.setContentsMargins(22,18,22,18); manual_form.setSpacing(14)
+
+        custom_row=QHBoxLayout(); custom_text=QVBoxLayout()
+        custom_title=QLabel(TXT("自定义塔罗牌抽取", "Custom Tarot Draw")); custom_title.setObjectName("settingTitle")
+        custom_note=QLabel(TXT("仅控制“自定义塔罗牌抽取”页面的自己选择展示方式。", "Controls manual-choice presentation only on the Custom Tarot Draw page.")); custom_note.setObjectName("settingNote"); custom_note.setWordWrap(True)
+        custom_text.addWidget(custom_title); custom_text.addWidget(custom_note)
+        self.custom_mode_combo=QComboBox(); self.custom_mode_combo.setObjectName("settingCombo"); self.custom_mode_combo.addItem(TXT("牌雨", "Card Rain"),"rain"); self.custom_mode_combo.addItem(TXT("扇形展开", "Fan Spread"),"fan")
+        idx=self.custom_mode_combo.findData(APP_SETTINGS.get("custom_manual_mode","rain")); self.custom_mode_combo.setCurrentIndex(max(0,idx))
+        custom_row.addLayout(custom_text,1); custom_row.addWidget(self.custom_mode_combo); manual_form.addLayout(custom_row)
+        manual_form.addWidget(AccentLine())
+
+        default_row=QHBoxLayout(); default_text=QVBoxLayout()
+        default_title=QLabel(TXT("经典牌阵及其他模式", "Classic Spreads & Other Modes")); default_title.setObjectName("settingTitle")
+        default_note=QLabel(TXT("默认使用扇形展开。以后新增的非自定义自己选择模式也使用此选项。", "Defaults to Fan Spread. Future non-custom manual-choice modes also use this option.")); default_note.setObjectName("settingNote"); default_note.setWordWrap(True)
+        default_text.addWidget(default_title); default_text.addWidget(default_note)
+        self.default_mode_combo=QComboBox(); self.default_mode_combo.setObjectName("settingCombo"); self.default_mode_combo.addItem(TXT("扇形展开", "Fan Spread"),"fan"); self.default_mode_combo.addItem(TXT("牌雨", "Card Rain"),"rain")
+        idx=self.default_mode_combo.findData(APP_SETTINGS.get("default_manual_mode","fan")); self.default_mode_combo.setCurrentIndex(max(0,idx))
+        default_row.addLayout(default_text,1); default_row.addWidget(self.default_mode_combo); manual_form.addLayout(default_row)
+        layout.addWidget(manual_panel)
+
+        # ---- Physical cards ----
+        physical_title=QLabel(TXT("实体卡牌", "PHYSICAL CARDS")); physical_title.setObjectName("settingCategory")
+        layout.addWidget(physical_title)
+        physical_panel=QFrame(); physical_panel.setObjectName("configPanel")
+        physical_form=QVBoxLayout(physical_panel); physical_form.setContentsMargins(22,18,22,18); physical_form.setSpacing(14)
+        mark_row=QHBoxLayout(); mark_text=QVBoxLayout()
+        mark_title=QLabel(TXT("卡背标记", "Card-back Marking")); mark_title.setObjectName("settingTitle")
+        mark_note=QLabel(TXT("开启后右键可见卡牌，将该实体卡背标记为红色；再次右键取消。标记会跟随该实体牌通过 Cut、Riffle、抽取与翻牌。", "Right-click a visible card to mark that physical card's back red; right-click again to remove it. The mark follows the card through cuts, riffles, draws, and reveals.")); mark_note.setObjectName("settingNote"); mark_note.setWordWrap(True)
         mark_text.addWidget(mark_title); mark_text.addWidget(mark_note)
-        self.mark_check = QCheckBox(TXT("启用卡背红色标记", "Enable red card-back marks")); self.mark_check.setChecked(APP_SETTINGS.get("mark_back", False))
-        mark_row.addLayout(mark_text, 1); mark_row.addWidget(self.mark_check)
-        form.addLayout(mark_row)
-        layout.addWidget(panel); layout.addStretch(1)
+        self.mark_check=QCheckBox(TXT("启用卡背红色标记", "Enable red card-back marks")); self.mark_check.setChecked(bool(APP_SETTINGS.get("mark_back",False)))
+        mark_row.addLayout(mark_text,1); mark_row.addWidget(self.mark_check); physical_form.addLayout(mark_row)
+        layout.addWidget(physical_panel)
+        layout.addStretch(1)
 
         self.language_combo.currentIndexChanged.connect(self._changed)
         self.mark_check.toggled.connect(self._changed)
+        self.reverse_check.toggled.connect(self._changed)
+        self.custom_mode_combo.currentIndexChanged.connect(self._changed)
+        self.default_mode_combo.currentIndexChanged.connect(self._changed)
+        self.riffle_input.editingFinished.connect(self._changed)
+        self.cut_input.editingFinished.connect(self._changed)
 
     def _changed(self, *args):
         APP_SETTINGS["language"] = self.language_combo.currentData()
         APP_SETTINGS["mark_back"] = self.mark_check.isChecked()
+        APP_SETTINGS["allow_reversed"] = self.reverse_check.isChecked()
+        APP_SETTINGS["custom_manual_mode"] = self.custom_mode_combo.currentData() or "rain"
+        APP_SETTINGS["default_manual_mode"] = self.default_mode_combo.currentData() or "fan"
+        try: riffles=int(self.riffle_input.text() or APP_SETTINGS.get("riffle_rounds",3))
+        except ValueError: riffles=3
+        try: cuts=int(self.cut_input.text() or APP_SETTINGS.get("cut_groups",2))
+        except ValueError: cuts=2
+        riffles=max(1,min(50,riffles)); cuts=max(1,min(20,cuts))
+        APP_SETTINGS["riffle_rounds"] = riffles; APP_SETTINGS["cut_groups"] = cuts
+        self.riffle_input.setText(str(riffles)); self.cut_input.setText(str(cuts))
         self.settingsChanged.emit()
 
 
@@ -3271,7 +3326,9 @@ class MainWindow(QMainWindow):
         new_lang = APP_SETTINGS.get("language", "zh")
         if new_lang == self._language:
             try:
-                self.tarot.custom.stage.configure_runtime(mark_back=APP_SETTINGS.get("mark_back", False))
+                mark_back = APP_SETTINGS.get("mark_back", False)
+                self.tarot.custom.stage.configure_runtime(mark_back=mark_back)
+                self.tarot.classic.stage.configure_runtime(mark_back=mark_back)
             except Exception:
                 pass
             return
@@ -3445,6 +3502,13 @@ QLabel#settingTitle {
     color: #d6d6d6;
     font-size: 13px;
     font-weight: 600;
+}
+QLabel#settingCategory {
+    color: #7f7f7f;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 2px;
+    padding-top: 4px;
 }
 QLabel#settingNote, QLabel#muted, QLabel#statusText {
     color: #6e6e6e;
