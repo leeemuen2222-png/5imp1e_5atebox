@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "5imp1e 5atebox"
-APP_VERSION = "0.8.6"
+APP_VERSION = "0.8.7"
 APP_SETTINGS = {
     "language": "zh",
     "mark_back": False,
@@ -3179,11 +3179,14 @@ class MainWindow(QMainWindow):
         sl.addWidget(AccentLine())
         sl.addSpacing(10)
 
+        card_games = NavButton(TXT("卡牌游戏", "Card Games"), "▤")
         settings = NavButton(TXT("设置", "Settings"), "⚙")
         about = NavButton(TXT("关于", "About"), "·")
-        self.nav_group.addButton(settings, 6)
-        self.nav_group.addButton(about, 7)
-        self.nav_buttons.extend([settings, about])
+        self.nav_group.addButton(card_games, 6)
+        self.nav_group.addButton(settings, 7)
+        self.nav_group.addButton(about, 8)
+        self.nav_buttons.extend([card_games, settings, about])
+        sl.addWidget(card_games)
         sl.addWidget(settings)
         sl.addWidget(about)
         sl.addStretch(1)
@@ -3231,6 +3234,7 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(PlaceholderPage(TXT("符文", "Runes")))
         self.stack.addWidget(PlaceholderPage(TXT("硬币", "Coin")))
         self.stack.addWidget(PlaceholderPage(TXT("抽签", "Lots")))
+        self.stack.addWidget(PlaceholderPage(TXT("卡牌游戏", "Card Games")))
         self.settings_page = SettingsPage()
         self.settings_page.settingsChanged.connect(self._settings_changed)
         self.stack.addWidget(self.settings_page)
@@ -3315,14 +3319,14 @@ class MainWindow(QMainWindow):
 
     def _navigate(self, idx):
         self.stack.setCurrentIndex(idx)
-        names = [TXT("首页", "Home"), TXT("塔罗牌", "Tarot"), TXT("骰子", "Dice"), TXT("符文", "Runes"), TXT("硬币", "Coin"), TXT("抽签", "Lots"), TXT("设置", "Settings"), TXT("关于", "About")]
+        names = [TXT("首页", "Home"), TXT("塔罗牌", "Tarot"), TXT("骰子", "Dice"), TXT("符文", "Runes"), TXT("硬币", "Coin"), TXT("抽签", "Lots"), TXT("卡牌游戏", "Card Games"), TXT("设置", "Settings"), TXT("关于", "About")]
         self.section_title.setText(names[idx])
         btn = self.nav_group.button(idx)
         if btn:
             btn.setChecked(True)
 
     def _settings_changed(self):
-        idx = self.stack.currentIndex() if hasattr(self, "stack") else 6
+        idx = self.stack.currentIndex() if hasattr(self, "stack") else 7
         new_lang = APP_SETTINGS.get("language", "zh")
         if new_lang == self._language:
             try:
