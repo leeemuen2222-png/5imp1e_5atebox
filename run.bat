@@ -1,74 +1,93 @@
 @echo off
 setlocal EnableExtensions
 cd /d "%~dp0"
-title 5imp1e 5atebox - launcher
+title 5imp1e 5atebox Launcher
 
-set "PY="
+echo ==================================================
+echo   5imp1e 5atebox / 515 launcher
+echo ==================================================
+echo.
 
-echo [1/3] Checking Python...
-py -3 -c "import sys; print(sys.version.split()[0])" >nul 2>nul
-if not errorlevel 1 (
-    set "PY=py -3"
-    goto :python_ok
+echo [1/4] Detecting Python...
+set "PY_CMD="
+where py >nul 2>nul
+if not errorlevel 1 set "PY_CMD=py -3"
+if not defined PY_CMD (
+    where python >nul 2>nul
+    if not errorlevel 1 set "PY_CMD=python"
 )
-
-python -c "import sys; print(sys.version.split()[0])" >nul 2>nul
-if not errorlevel 1 (
-    set "PY=python"
-    goto :python_ok
+if not defined PY_CMD (
+    where python3 >nul 2>nul
+    if not errorlevel 1 set "PY_CMD=python3"
 )
-
-python3 -c "import sys; print(sys.version.split()[0])" >nul 2>nul
-if not errorlevel 1 (
-    set "PY=python3"
-    goto :python_ok
+if not defined PY_CMD (
+    echo.
+    echo [ERROR] Python 3 was not found.
+    echo Install Python 3, enable "Add Python to PATH", then run this file again.
+    echo.
+    pause
+    exit /b 1
 )
-
-echo [ERROR] A working Python 3 interpreter was not found.
-echo The Windows Store alias may be shadowing your real Python installation.
-echo Try running: py -3 --version
-pause
-exit /b 1
-
-:python_ok
-for /f "delims=" %%V in ('%PY% -c "import sys; print(sys.version.split()[0])"') do set "PYVER=%%V"
-echo Python %PYVER% found via: %PY%
+%PY_CMD% --version
+if errorlevel 1 goto :python_error
 
 echo.
-echo [2/3] Checking PySide6...
-%PY% -c "import PySide6; print(PySide6.__version__)" > "%TEMP%\515_pyside_check.txt" 2>&1
-if errorlevel 1 goto :install_pyside
-for /f "usebackq delims=" %%V in ("%TEMP%\515_pyside_check.txt") do set "PYSIDEVER=%%V"
-del "%TEMP%\515_pyside_check.txt" >nul 2>nul
-echo PySide6 %PYSIDEVER% found.
-goto :start_app
+echo [2/4] Checking core UI dependency...
+%PY_CMD% -c "import PySide6" >nul 2>nul
+if errorlevel 1 (
+    echo PySide6 not found. Installing...
+    %PY_CMD% -m pip install --disable-pip-version-check PySide6
+    if errorlevel 1 goto :install_error
+) else (
+    echo PySide6 OK.
+)
 
-:install_pyside
-del "%TEMP%\515_pyside_check.txt" >nul 2>nul
-echo PySide6 not found. Installing requirements...
-%PY% -m pip install -r requirements.txt
-if errorlevel 1 goto :install_failed
-%PY% -c "import PySide6; print('PySide6 ' + PySide6.__version__ + ' installed successfully.')"
-if errorlevel 1 goto :install_failed
+echo.
+echo [3/4] Checking lightweight 3D renderer...
+%PY_CMD% -c "import numpy, pyqtgraph, pyqtgraph.opengl, OpenGL" >nul 2>nul
+if errorlevel 1 (
+    echo 3D packages missing. Installing pyqtgraph, PyOpenGL and numpy...
+    %PY_CMD% -m pip install --disable-pip-version-check numpy pyqtgraph PyOpenGL
+    if errorlevel 1 goto :install_error
+    echo Verifying 3D packages...
+    %PY_CMD% -c "import numpy, pyqtgraph, pyqtgraph.opengl, OpenGL" >nul 2>nul
+    if errorlevel 1 goto :install_error
+) else (
+    echo pyqtgraph / PyOpenGL / numpy OK.
+)
 
-:start_app
 echo.
-echo [3/3] Starting 5imp1e 5atebox...
-echo.
-%PY% main.py
+echo [4/4] Starting 5imp1e 5atebox...
+if not exist "main.py" (
+    echo.
+    echo [ERROR] main.py was not found in:
+    echo %CD%
+    echo Rename the downloaded main^&*.py file to main.py and place it here.
+    echo.
+    pause
+    exit /b 1
+)
+%PY_CMD% "main.py"
 set "APP_EXIT=%ERRORLEVEL%"
 if not "%APP_EXIT%"=="0" (
     echo.
     echo [ERROR] The application exited with code %APP_EXIT%.
-    echo Copy the traceback above and send it to me.
+    echo The console is being kept open so you can read the error above.
+    echo.
     pause
-    exit /b %APP_EXIT%
 )
-exit /b 0
+exit /b %APP_EXIT%
 
-:install_failed
+:python_error
 echo.
-echo [ERROR] Dependency installation failed.
-echo Check pip and your internet connection, then try again.
+echo [ERROR] Python was detected but could not be started correctly.
+pause
+exit /b 1
+
+:install_error
+echo.
+echo [ERROR] A required package could not be installed.
+echo Check your internet connection and pip configuration, then run this launcher again.
+echo.
 pause
 exit /b 1

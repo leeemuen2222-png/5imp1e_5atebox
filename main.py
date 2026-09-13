@@ -6,15 +6,26 @@ import re
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QRectF, QPointF, Signal, QSize, QTimer, QEvent
-from PySide6.QtGui import QColor, QPainter, QPen, QBrush, QFont, QPainterPath, QPixmap, QIntValidator
+from PySide6.QtGui import QColor, QPainter, QPen, QBrush, QFont, QPainterPath, QPixmap, QIntValidator, QMatrix4x4, QVector3D
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel,
     QPushButton, QFrame, QButtonGroup, QStackedWidget, QSizePolicy,
     QGraphicsDropShadowEffect, QLineEdit, QCheckBox, QComboBox, QGridLayout, QScrollArea, QBoxLayout
 )
 
+try:
+    import numpy as np
+    import pyqtgraph.opengl as gl
+    OPENGL_3D_AVAILABLE = True
+    OPENGL_3D_ERROR = ""
+except Exception as exc:
+    np = None
+    gl = None
+    OPENGL_3D_AVAILABLE = False
+    OPENGL_3D_ERROR = str(exc)
+
 APP_NAME = "5imp1e 5atebox"
-APP_VERSION = "0.10.0"
+APP_VERSION = "0.11.0"
 APP_SETTINGS = {
     "language": "zh",
     "mark_back": False,
@@ -208,8 +219,8 @@ class TarotStage(QWidget):
         self.hovered_slot = -1
         self.hover_target = QPointF(0.0, 0.0)
         self.hover_current = QPointF(0.0, 0.0)
-        # Small-card magnification is intentionally deliberate: the configured
-        # preview hotkey must be held while the same card is hovered for 2 seconds.
+        # Small-card magnification is deliberate: it appears only while the
+        # configured preview hotkey is held over the card.
         self.hover_preview_slot = -1
         self.hover_preview_started = 0.0
         self.hover_preview_active = False
@@ -1144,8 +1155,7 @@ class TarotStage(QWidget):
         dt = max(0.0, min(.05, now - self._last_tick_time))
         self._last_tick_time = now
 
-        # Delayed small-card preview. Holding the configured key and remaining
-        # over the same small free-move card for two seconds activates magnification.
+        # Small-card preview activates immediately while the configured hotkey is held.
         preview_waiting = False
         preview_key = str(APP_SETTINGS.get("hover_preview_hotkey", "V")).upper()
         preview_key_down = preview_key in HELD_KEYS
@@ -1156,15 +1166,9 @@ class TarotStage(QWidget):
                 valid_preview = True
 
         if valid_preview and preview_key_down:
-            if self.hover_preview_slot != self.hovered_slot:
-                self.hover_preview_slot = self.hovered_slot
-                self.hover_preview_started = now
-                self.hover_preview_active = False
-            elapsed_preview = now - self.hover_preview_started
-            if elapsed_preview >= 2.0:
-                self.hover_preview_active = True
-            else:
-                preview_waiting = True
+            self.hover_preview_slot = self.hovered_slot
+            self.hover_preview_started = now
+            self.hover_preview_active = True
         else:
             self.hover_preview_slot = -1
             self.hover_preview_started = 0.0
@@ -3175,160 +3179,268 @@ class HotkeyCaptureButton(QPushButton):
 
 
 class DiceStage(QWidget):
-    """A lightweight pseudo-3D die with a damped tabletop bounce animation."""
+    """Real OpenGL low-poly die with a lightweight rigid-body-style fall/bounce."""
     rollFinished = Signal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumHeight(430)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
         self._timer = QTimer(self)
         self._timer.setInterval(16)
         self._timer.timeout.connect(self._tick)
+
         self.animating = False
-        self.started = 0.0
-        self.duration = 2.35
         self.result = 1
-        self.display_value = 1
-        self.spin_x = 0.0
-        self.spin_y = 0.0
-        self.spin_z = 0.0
+        self.sim_time = 0.0
+        self.last_tick = 0.0
+        self.settle_time = 0.0
+        self.bounce_count = 0
 
-    def roll(self):
-        if self.animating:
+        # World-space physical state. The tabletop is z = 0.
+        self.half = 0.72
+        self.pos = [0.0, 0.0, self.half]
+        self.vel = [0.0, 0.0, 0.0]
+        self.rot = [18.0, -24.0, 8.0]
+        self.ang = [0.0, 0.0, 0.0]
+
+        # Tuned for a readable but natural-looking small rigid body.
+        self.gravity = -9.81
+        self.restitution = 0.47
+        self.surface_friction = 0.76
+        self.rolling_drag = 0.90
+        self.air_drag = 0.998
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        if not OPENGL_3D_AVAILABLE:
+            self.view = None
+            self.die_mesh = None
+            msg = QLabel(TXT(
+                "3D 渲染组件尚未加载。请使用新版 run.bat 启动器，它会自动安装 pyqtgraph 与 PyOpenGL。",
+                "The 3D renderer is not available. Start the app with the new run.bat launcher to install pyqtgraph and PyOpenGL automatically."
+            ))
+            msg.setWordWrap(True)
+            msg.setAlignment(Qt.AlignCenter)
+            msg.setObjectName("pageDesc")
+            root.addWidget(msg, 1)
             return
-        self.result = random.randint(1, 6)
-        self.display_value = random.randint(1, 6)
-        self.started = time.perf_counter()
-        self.animating = True
-        self._timer.start()
-        self.update()
 
-    def _tick(self):
-        elapsed = time.perf_counter() - self.started
-        t = max(0.0, min(1.0, elapsed / self.duration))
-        # Fast tumbling at the beginning, naturally damping toward the final face.
-        spin = (1.0 - t) ** 1.35
-        self.spin_x = elapsed * (620.0 * spin + 65.0)
-        self.spin_y = elapsed * (510.0 * spin + 50.0)
-        self.spin_z = math.sin(elapsed * 5.2) * 13.0 * (1.0 - t)
-        if elapsed < self.duration * .80:
-            phase = int(elapsed / .10)
-            random.seed((phase + 1) * 92821 + self.result * 17)
-            self.display_value = random.randint(1, 6)
-        else:
-            self.display_value = self.result
-        self.update()
-        if t >= 1.0:
-            self.animating = False
-            self.display_value = self.result
-            self._timer.stop()
-            self.rollFinished.emit(self.result)
-            self.update()
+        self.view = gl.GLViewWidget()
+        self.view.setBackgroundColor((7, 7, 7, 255))
+        self.view.opts['distance'] = 11.5
+        self.view.opts['elevation'] = 24
+        self.view.opts['azimuth'] = -42
+        self.view.setCameraPosition(pos=QVector3D(0.0, 0.25, 0.45), distance=11.5,
+                                    elevation=24, azimuth=-42)
+        root.addWidget(self.view, 1)
+
+        # Dark tabletop grid gives depth cues while retaining the 515 aesthetic.
+        self.floor = gl.GLGridItem()
+        self.floor.setSize(x=12.0, y=8.0)
+        self.floor.setSpacing(x=1.0, y=1.0)
+        self.floor.setColor((42, 42, 42, 95))
+        self.view.addItem(self.floor)
+
+        # A single generated mesh contains both the die body and low-poly pips.
+        verts, faces, colors = self._build_die_geometry()
+        md = gl.MeshData(vertexes=np.asarray(verts, dtype=float),
+                         faces=np.asarray(faces, dtype=np.int32),
+                         faceColors=np.asarray(colors, dtype=float))
+        self.die_mesh = gl.GLMeshItem(meshdata=md, smooth=False,
+                                      drawFaces=True, drawEdges=True,
+                                      edgeColor=(0.22, 0.22, 0.22, 1.0))
+        self.view.addItem(self.die_mesh)
+        self._apply_transform()
 
     @staticmethod
-    def _pip_positions(value):
-        pts = {
+    def _pip_pattern(value):
+        return {
             1: [(0, 0)],
-            2: [(-.45, -.45), (.45, .45)],
-            3: [(-.45, -.45), (0, 0), (.45, .45)],
-            4: [(-.45, -.45), (.45, -.45), (-.45, .45), (.45, .45)],
-            5: [(-.45, -.45), (.45, -.45), (0, 0), (-.45, .45), (.45, .45)],
-            6: [(-.45, -.52), (.45, -.52), (-.45, 0), (.45, 0), (-.45, .52), (.45, .52)],
-        }
-        return pts[value]
+            2: [(-.42, -.42), (.42, .42)],
+            3: [(-.42, -.42), (0, 0), (.42, .42)],
+            4: [(-.42, -.42), (.42, -.42), (-.42, .42), (.42, .42)],
+            5: [(-.42, -.42), (.42, -.42), (0, 0), (-.42, .42), (.42, .42)],
+            6: [(-.42, -.50), (.42, -.50), (-.42, 0), (.42, 0), (-.42, .50), (.42, .50)],
+        }[value]
 
-    def _draw_face(self, p, poly, value, brightness=1.0):
-        path = QPainterPath()
-        path.moveTo(poly[0])
-        for pt in poly[1:]:
-            path.lineTo(pt)
-        path.closeSubpath()
-        shade = int(224 * brightness)
-        p.setBrush(QColor(shade, shade, shade))
-        p.setPen(QPen(QColor("#505050"), 1.2))
-        p.drawPath(path)
+    @staticmethod
+    def _append_octa_sphere(verts, faces, colors, center, radius=0.075):
+        """Append a tiny octahedral pip: extremely low poly and cheap to render."""
+        cx, cy, cz = center
+        base = len(verts)
+        verts.extend([
+            (cx + radius, cy, cz), (cx - radius, cy, cz),
+            (cx, cy + radius, cz), (cx, cy - radius, cz),
+            (cx, cy, cz + radius), (cx, cy, cz - radius),
+        ])
+        tris = [(0,2,4),(2,1,4),(1,3,4),(3,0,4),
+                (2,0,5),(1,2,5),(3,1,5),(0,3,5)]
+        pip_color = (0.035, 0.035, 0.035, 1.0)
+        for tri in tris:
+            faces.append(tuple(base+i for i in tri))
+            colors.append(pip_color)
 
-        # Bilinear interpolation lets pips follow the perspective face.
-        a, b, c, d = poly
-        for ux, uy in self._pip_positions(value):
-            u = (ux + 1.0) * .5
-            v = (uy + 1.0) * .5
-            top = QPointF(a.x() + (b.x()-a.x())*u, a.y() + (b.y()-a.y())*u)
-            bot = QPointF(d.x() + (c.x()-d.x())*u, d.y() + (c.y()-d.y())*u)
-            pt = QPointF(top.x() + (bot.x()-top.x())*v, top.y() + (bot.y()-top.y())*v)
-            p.setBrush(QColor("#111111"))
-            p.setPen(Qt.NoPen)
-            p.drawEllipse(pt, 5.2, 5.2)
+    def _build_die_geometry(self):
+        h = self.half
+        verts = [
+            (-h,-h,-h), ( h,-h,-h), ( h, h,-h), (-h, h,-h),
+            (-h,-h, h), ( h,-h, h), ( h, h, h), (-h, h, h),
+        ]
+        # Each face has its own subtle grey tone to make the low-poly form readable.
+        quad_faces = [
+            ((4,5,6,7), (0.93,0.93,0.93,1.0)),  # +Z top
+            ((1,0,3,2), (0.68,0.68,0.68,1.0)),  # -Z bottom
+            ((1,2,6,5), (0.82,0.82,0.82,1.0)),  # +X
+            ((0,4,7,3), (0.73,0.73,0.73,1.0)),  # -X
+            ((2,3,7,6), (0.87,0.87,0.87,1.0)),  # +Y
+            ((0,1,5,4), (0.78,0.78,0.78,1.0)),  # -Y
+        ]
+        faces, colors = [], []
+        for q, col in quad_faces:
+            a,b,c,d = q
+            faces.extend([(a,b,c),(a,c,d)])
+            colors.extend([col,col])
 
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        p.fillRect(self.rect(), QColor("#070707"))
+        # Opposite faces sum to seven: top/bottom 1/6, +X/-X 3/4, +Y/-Y 2/5.
+        eps = 0.018
+        scale = h * 1.06
+        face_defs = [
+            (1, lambda u,v: (u*scale, v*scale,  h+eps)),
+            (6, lambda u,v: (u*scale, -v*scale, -h-eps)),
+            (3, lambda u,v: ( h+eps, u*scale, v*scale)),
+            (4, lambda u,v: (-h-eps, -u*scale, v*scale)),
+            (2, lambda u,v: (u*scale,  h+eps, v*scale)),
+            (5, lambda u,v: (-u*scale, -h-eps, v*scale)),
+        ]
+        for value, mapper in face_defs:
+            for u, v in self._pip_pattern(value):
+                self._append_octa_sphere(verts, faces, colors, mapper(u,v))
+        return verts, faces, colors
 
-        floor = QRectF(self.width()*.18, self.height()*.69, self.width()*.64, self.height()*.19)
-        p.setPen(QPen(QColor(35,35,35), 1))
-        p.setBrush(QColor(9,9,9))
-        p.drawEllipse(floor)
+    def roll(self):
+        if self.animating or not OPENGL_3D_AVAILABLE or self.die_mesh is None:
+            return
+        self.result = random.randint(1, 6)
 
-        elapsed = time.perf_counter() - self.started if self.animating else self.duration
-        t = max(0.0, min(1.0, elapsed / self.duration))
-        if self.animating:
-            # Four decreasing bounces with gravity-like arcs.
-            decay = (1.0 - t) ** 1.45
-            bounce = abs(math.sin(t * math.pi * 4.25)) * 155.0 * decay
+        # Start clearly above the table with lateral motion and tumble.
+        self.pos = [random.uniform(-1.45, -0.75),
+                    random.uniform(-0.55, 0.40),
+                    random.uniform(5.6, 6.8)]
+        self.vel = [random.uniform(2.0, 3.2),
+                    random.uniform(-0.55, 0.80),
+                    random.uniform(-0.20, 0.20)]
+        self.rot = [random.uniform(-150, 150), random.uniform(-150, 150), random.uniform(-150,150)]
+        self.ang = [random.uniform(430, 720), random.uniform(-650, -380), random.uniform(220, 480)]
+        self.sim_time = 0.0
+        self.settle_time = 0.0
+        self.bounce_count = 0
+        self.last_tick = time.perf_counter()
+        self.animating = True
+        self._timer.start()
+        self._apply_transform()
+
+    def _tick(self):
+        if not self.animating:
+            return
+        now = time.perf_counter()
+        # Sub-stepping prevents fast falls from tunneling through the tabletop.
+        frame_dt = max(0.001, min(0.034, now - self.last_tick))
+        self.last_tick = now
+        remaining = frame_dt
+        while remaining > 1e-6:
+            dt = min(0.008, remaining)
+            remaining -= dt
+            self._integrate(dt)
+        self._apply_transform()
+
+        # Settle after several damped contacts. A safety timeout avoids rare endless rolls.
+        speed = math.sqrt(sum(v*v for v in self.vel))
+        spin = math.sqrt(sum(a*a for a in self.ang))
+        grounded = self.pos[2] <= self.half + 0.003
+        if grounded and speed < 0.12 and spin < 18.0:
+            self.settle_time += frame_dt
         else:
-            bounce = 0.0
+            self.settle_time = 0.0
 
-        cx = self.width() * .52
-        base_y = self.height() * .64
-        cy = base_y - bounce
-        size = min(148.0, self.width()*.13, self.height()*.28)
+        if self.settle_time > 0.42 or self.sim_time > 7.0:
+            self.animating = False
+            self.pos[2] = self.half
+            self.vel = [0.0, 0.0, 0.0]
+            self.ang = [0.0, 0.0, 0.0]
+            self._orient_to_result(self.result)
+            self._apply_transform()
+            self._timer.stop()
+            self.rollFinished.emit(self.result)
 
-        # Shadow tightens and darkens as the die approaches the table.
-        shadow_w = size * (1.15 + bounce / 260.0)
-        shadow_h = size * .20
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor(0,0,0, 85 if bounce > 10 else 125))
-        p.drawEllipse(QRectF(cx-shadow_w/2, base_y+size*.48, shadow_w, shadow_h))
+    def _integrate(self, dt):
+        self.sim_time += dt
+        # Airborne dynamics.
+        self.vel[2] += self.gravity * dt
+        self.vel[0] *= self.air_drag
+        self.vel[1] *= self.air_drag
+        for i in range(3):
+            self.pos[i] += self.vel[i] * dt
+            self.rot[i] += self.ang[i] * dt
 
-        # Perspective cube. Spin affects skew and visible depth continuously.
-        ax = math.radians(self.spin_x)
-        ay = math.radians(self.spin_y)
-        az = math.radians(self.spin_z)
-        dx = math.sin(ay) * size * .25
-        dy = -abs(math.cos(ax)) * size * .20 - size*.12
-        skew = math.sin(az) * size * .12
+        # Plane collision using the die's conservative half-extent. The energy loss,
+        # tangential friction and angular impulse create visibly different bounces.
+        if self.pos[2] < self.half:
+            penetration = self.half - self.pos[2]
+            self.pos[2] = self.half + min(0.025, penetration * 0.15)
+            impact = -self.vel[2]
+            if impact > 0.18:
+                self.vel[2] = impact * random.uniform(self.restitution*0.91, self.restitution*1.05)
+                self.vel[0] *= random.uniform(self.surface_friction*0.92, self.surface_friction*1.03)
+                self.vel[1] *= random.uniform(self.surface_friction*0.92, self.surface_friction*1.03)
+                # Couple translation to spin at impact, approximating edge/corner contact.
+                self.ang[0] = self.ang[0]*random.uniform(.67,.79) + self.vel[1]*38 + random.uniform(-30,30)
+                self.ang[1] = self.ang[1]*random.uniform(.67,.79) - self.vel[0]*42 + random.uniform(-30,30)
+                self.ang[2] *= random.uniform(.72,.84)
+                self.vel[0] += random.uniform(-.11,.11)
+                self.vel[1] += random.uniform(-.10,.10)
+                self.bounce_count += 1
+            else:
+                self.vel[2] = 0.0
+                self.vel[0] *= self.rolling_drag
+                self.vel[1] *= self.rolling_drag
+                self.ang[0] *= .86
+                self.ang[1] *= .86
+                self.ang[2] *= .82
 
-        front = [
-            QPointF(cx-size/2+skew, cy-size/2),
-            QPointF(cx+size/2+skew, cy-size/2),
-            QPointF(cx+size/2-skew, cy+size/2),
-            QPointF(cx-size/2-skew, cy+size/2),
-        ]
-        top = [
-            front[0], front[1],
-            QPointF(front[1].x()+dx, front[1].y()+dy),
-            QPointF(front[0].x()+dx, front[0].y()+dy),
-        ]
-        right = [
-            front[1], front[2],
-            QPointF(front[2].x()+dx, front[2].y()+dy),
-            QPointF(front[1].x()+dx, front[1].y()+dy),
-        ]
+        # Keep the die in the visible tabletop area using soft side bounces.
+        for axis, limit in ((0, 3.8), (1, 2.55)):
+            if self.pos[axis] > limit:
+                self.pos[axis] = limit
+                self.vel[axis] *= -.34
+            elif self.pos[axis] < -limit:
+                self.pos[axis] = -limit
+                self.vel[axis] *= -.34
 
-        # Adjacent values are only visual during tumbling; final front is the result.
-        front_value = self.display_value
-        top_value = ((front_value + 1) % 6) + 1
-        right_value = ((front_value + 3) % 6) + 1
-        self._draw_face(p, top, top_value, .82)
-        self._draw_face(p, right, right_value, .70)
-        self._draw_face(p, front, front_value, 1.0)
+    def _orient_to_result(self, value):
+        # Final readable orientations corresponding to the generated face numbering.
+        orientations = {
+            1: (0.0, 0.0, 0.0),
+            6: (180.0, 0.0, 0.0),
+            3: (0.0, -90.0, 0.0),
+            4: (0.0, 90.0, 0.0),
+            2: (90.0, 0.0, 0.0),
+            5: (-90.0, 0.0, 0.0),
+        }
+        self.rot = list(orientations[value])
 
-        p.setPen(QColor("#7c7c7c"))
-        p.setFont(QFont("Segoe UI", 10))
-        hint = TXT("点击“投掷”让骰子在桌面上弹跳。", "Press Roll to bounce the die across the table.")
-        p.drawText(QRectF(0, self.height()-42, self.width(), 24), Qt.AlignCenter, hint)
+    def _apply_transform(self):
+        if self.die_mesh is None:
+            return
+        m = QMatrix4x4()
+        m.translate(self.pos[0], self.pos[1], self.pos[2])
+        m.rotate(self.rot[2], 0, 0, 1)
+        m.rotate(self.rot[1], 0, 1, 0)
+        m.rotate(self.rot[0], 1, 0, 0)
+        self.die_mesh.setTransform(m)
 
 
 class DicePage(QWidget):
@@ -3345,8 +3457,8 @@ class DicePage(QWidget):
         kicker.setObjectName("kicker")
         title = QLabel(TXT("骰子", "Dice"))
         title.setObjectName("pageTitle")
-        desc = QLabel(TXT("第一版骰子功能：3D 骰子、旋转和带衰减的弹跳动画。",
-                          "First dice prototype: a 3D die with rotation and damped bounce animation."))
+        desc = QLabel(TXT("实体 OpenGL 骰子：从空中自由落体，碰撞桌面后自然弹跳、滚动并逐渐停止。",
+                          "Physical OpenGL die: free-falls from the air, then bounces, rolls, and settles naturally on the table."))
         desc.setObjectName("pageDesc")
         desc.setWordWrap(True)
         text_col.addWidget(kicker)
@@ -3373,6 +3485,10 @@ class DicePage(QWidget):
 
         self.roll_button.clicked.connect(self._roll)
         self.stage.rollFinished.connect(self._finished)
+        if not OPENGL_3D_AVAILABLE:
+            self.roll_button.setEnabled(False)
+            self.status.setText(TXT("缺少 3D 组件 · 请使用新版 run.bat 启动",
+                                    "3D components missing · launch with the new run.bat"))
 
     def _roll(self):
         if self.stage.animating:
@@ -3574,8 +3690,8 @@ class SettingsPage(QWidget):
         hotkey_form.addWidget(ResponsiveSettingRow(
             TXT("小卡牌悬停放大", "Small-card Hover Preview"),
             TXT(
-                "按住绑定按键并在同一张较小的自由移动卡牌上悬停 2 秒后，才会放大该卡牌。",
-                "Hold the bound key while hovering the same small free-move card for 2 seconds before magnification activates."
+                "按住绑定按键并悬停在较小的自由移动卡牌上时，会立即放大该卡牌。",
+                "Hold the bound key while hovering a small free-move card to magnify it immediately."
             ),
             self.hover_hotkey_button
         ))
