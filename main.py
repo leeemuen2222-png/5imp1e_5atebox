@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "5imp1e 5atebox"
-APP_VERSION = "0.9.2"
+APP_VERSION = "0.10.0"
 APP_SETTINGS = {
     "language": "zh",
     "mark_back": False,
@@ -25,10 +25,33 @@ APP_SETTINGS = {
     # default to a fan spread unless changed in Settings.
     "custom_manual_mode": "rain",
     "default_manual_mode": "fan",
+    "hover_preview_hotkey": "V",
 }
 
 def TXT(zh, en):
     return en if APP_SETTINGS.get("language") == "en" else zh
+
+HELD_KEYS = set()
+
+def qt_key_name(key):
+    if Qt.Key_A <= key <= Qt.Key_Z:
+        return chr(ord("A") + int(key - Qt.Key_A))
+    if Qt.Key_0 <= key <= Qt.Key_9:
+        return chr(ord("0") + int(key - Qt.Key_0))
+    special = {
+        Qt.Key_Space: "SPACE",
+        Qt.Key_Tab: "TAB",
+        Qt.Key_Backspace: "BACKSPACE",
+        Qt.Key_Return: "ENTER",
+        Qt.Key_Enter: "ENTER",
+        Qt.Key_Escape: "ESC",
+        Qt.Key_Left: "LEFT",
+        Qt.Key_Right: "RIGHT",
+        Qt.Key_Up: "UP",
+        Qt.Key_Down: "DOWN",
+    }
+    return special.get(key, "")
+
 BASE_DIR = Path(__file__).resolve().parent
 RESOURCE_DIR = BASE_DIR / "resource"
 
@@ -185,6 +208,11 @@ class TarotStage(QWidget):
         self.hovered_slot = -1
         self.hover_target = QPointF(0.0, 0.0)
         self.hover_current = QPointF(0.0, 0.0)
+        # Small-card magnification is intentionally deliberate: the configured
+        # preview hotkey must be held while the same card is hovered for 2 seconds.
+        self.hover_preview_slot = -1
+        self.hover_preview_started = 0.0
+        self.hover_preview_active = False
 
         # Manual-choice mode: the full 78-card deck falls from above and scatters
         # across the table. Users then pick physical cards directly from the spread.
@@ -1115,6 +1143,33 @@ class TarotStage(QWidget):
         elapsed = now - self.state_started
         dt = max(0.0, min(.05, now - self._last_tick_time))
         self._last_tick_time = now
+
+        # Delayed small-card preview. Holding the configured key and remaining
+        # over the same small free-move card for two seconds activates magnification.
+        preview_waiting = False
+        preview_key = str(APP_SETTINGS.get("hover_preview_hotkey", "V")).upper()
+        preview_key_down = preview_key in HELD_KEYS
+        valid_preview = False
+        if self.free_move_enabled and self.hovered_slot >= 0 and self.state in ("await_reveal", "done"):
+            slots = self._result_slots()
+            if self.hovered_slot < len(slots) and slots[self.hovered_slot].width() < 88.0:
+                valid_preview = True
+
+        if valid_preview and preview_key_down:
+            if self.hover_preview_slot != self.hovered_slot:
+                self.hover_preview_slot = self.hovered_slot
+                self.hover_preview_started = now
+                self.hover_preview_active = False
+            elapsed_preview = now - self.hover_preview_started
+            if elapsed_preview >= 2.0:
+                self.hover_preview_active = True
+            else:
+                preview_waiting = True
+        else:
+            self.hover_preview_slot = -1
+            self.hover_preview_started = 0.0
+            self.hover_preview_active = False
+
         animation_active = False
         if self.state == "self_select":
             if self._update_scatter_physics(dt):
@@ -1655,7 +1710,8 @@ class TarotStage(QWidget):
         # Keep the original, restrained card-tilt feel. Only genuinely small
         # free-move cards are enlarged on hover so they remain readable.
         hover_scale = 1.035
-        if self.free_move_enabled and rect.width() < 88.0:
+        if (self.free_move_enabled and rect.width() < 88.0
+                and self.hover_preview_active and slot_index == self.hover_preview_slot):
             target_width = 104.0
             hover_scale = min(1.72, max(1.18, target_width / max(1.0, rect.width())))
 
@@ -2592,6 +2648,7 @@ class SpreadChoiceCard(QFrame):
 
 class HomePage(QWidget):
     startTarot = Signal()
+    startDice = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2617,10 +2674,11 @@ class HomePage(QWidget):
         grid = QHBoxLayout()
         grid.setSpacing(12)
         tarot = MethodCard(TXT("塔罗牌", "Tarot"), TXT("78 张牌 · 正位 / 逆位", "78 cards · upright / reversed"), "◇", True)
-        dice = MethodCard(TXT("骰子", "Dice"), TXT("开发中", "In development"), "□", False)
+        dice = MethodCard(TXT("骰子", "Dice"), TXT("3D 骰子 · 弹跳动画", "3D die · bounce animation"), "□", True)
         rune = MethodCard(TXT("符文", "Runes"), TXT("开发中", "In development"), "△", False)
         coin = MethodCard(TXT("硬币", "Coin"), TXT("开发中", "In development"), "○", False)
         tarot.clicked.connect(lambda _: self.startTarot.emit())
+        dice.clicked.connect(lambda _: self.startDice.emit())
         for card in (tarot, dice, rune, coin):
             grid.addWidget(card, 1)
         outer.addLayout(grid)
@@ -3070,6 +3128,264 @@ class ResponsiveSettingRow(QWidget):
         self.updateGeometry()
 
 
+
+class HotkeyCaptureButton(QPushButton):
+    hotkeyChanged = Signal(str)
+
+    def __init__(self, key_name="V", parent=None):
+        super().__init__(parent)
+        self.key_name = (key_name or "V").upper()
+        self.recording = False
+        self.setObjectName("chipButton")
+        self.setCursor(Qt.PointingHandCursor)
+        self.setMinimumWidth(190)
+        self.setMinimumHeight(38)
+        self._refresh_text()
+        self.clicked.connect(self._begin_capture)
+
+    def _refresh_text(self):
+        if self.recording:
+            self.setText(TXT("请按下新的按键…", "Press a new key…"))
+        else:
+            self.setText(TXT(f"当前：{self.key_name} · 点击重新绑定",
+                             f"Current: {self.key_name} · Click to rebind"))
+
+    def _begin_capture(self):
+        self.recording = True
+        self._refresh_text()
+        self.setFocus(Qt.OtherFocusReason)
+
+    def keyPressEvent(self, event):
+        if not self.recording:
+            return super().keyPressEvent(event)
+        if event.isAutoRepeat():
+            event.accept()
+            return
+        name = qt_key_name(event.key())
+        if not name:
+            self.recording = False
+            self._refresh_text()
+            event.accept()
+            return
+        self.key_name = name
+        self.recording = False
+        self._refresh_text()
+        self.hotkeyChanged.emit(name)
+        event.accept()
+
+
+class DiceStage(QWidget):
+    """A lightweight pseudo-3D die with a damped tabletop bounce animation."""
+    rollFinished = Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(430)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)
+        self._timer.timeout.connect(self._tick)
+        self.animating = False
+        self.started = 0.0
+        self.duration = 2.35
+        self.result = 1
+        self.display_value = 1
+        self.spin_x = 0.0
+        self.spin_y = 0.0
+        self.spin_z = 0.0
+
+    def roll(self):
+        if self.animating:
+            return
+        self.result = random.randint(1, 6)
+        self.display_value = random.randint(1, 6)
+        self.started = time.perf_counter()
+        self.animating = True
+        self._timer.start()
+        self.update()
+
+    def _tick(self):
+        elapsed = time.perf_counter() - self.started
+        t = max(0.0, min(1.0, elapsed / self.duration))
+        # Fast tumbling at the beginning, naturally damping toward the final face.
+        spin = (1.0 - t) ** 1.35
+        self.spin_x = elapsed * (620.0 * spin + 65.0)
+        self.spin_y = elapsed * (510.0 * spin + 50.0)
+        self.spin_z = math.sin(elapsed * 5.2) * 13.0 * (1.0 - t)
+        if elapsed < self.duration * .80:
+            phase = int(elapsed / .10)
+            random.seed((phase + 1) * 92821 + self.result * 17)
+            self.display_value = random.randint(1, 6)
+        else:
+            self.display_value = self.result
+        self.update()
+        if t >= 1.0:
+            self.animating = False
+            self.display_value = self.result
+            self._timer.stop()
+            self.rollFinished.emit(self.result)
+            self.update()
+
+    @staticmethod
+    def _pip_positions(value):
+        pts = {
+            1: [(0, 0)],
+            2: [(-.45, -.45), (.45, .45)],
+            3: [(-.45, -.45), (0, 0), (.45, .45)],
+            4: [(-.45, -.45), (.45, -.45), (-.45, .45), (.45, .45)],
+            5: [(-.45, -.45), (.45, -.45), (0, 0), (-.45, .45), (.45, .45)],
+            6: [(-.45, -.52), (.45, -.52), (-.45, 0), (.45, 0), (-.45, .52), (.45, .52)],
+        }
+        return pts[value]
+
+    def _draw_face(self, p, poly, value, brightness=1.0):
+        path = QPainterPath()
+        path.moveTo(poly[0])
+        for pt in poly[1:]:
+            path.lineTo(pt)
+        path.closeSubpath()
+        shade = int(224 * brightness)
+        p.setBrush(QColor(shade, shade, shade))
+        p.setPen(QPen(QColor("#505050"), 1.2))
+        p.drawPath(path)
+
+        # Bilinear interpolation lets pips follow the perspective face.
+        a, b, c, d = poly
+        for ux, uy in self._pip_positions(value):
+            u = (ux + 1.0) * .5
+            v = (uy + 1.0) * .5
+            top = QPointF(a.x() + (b.x()-a.x())*u, a.y() + (b.y()-a.y())*u)
+            bot = QPointF(d.x() + (c.x()-d.x())*u, d.y() + (c.y()-d.y())*u)
+            pt = QPointF(top.x() + (bot.x()-top.x())*v, top.y() + (bot.y()-top.y())*v)
+            p.setBrush(QColor("#111111"))
+            p.setPen(Qt.NoPen)
+            p.drawEllipse(pt, 5.2, 5.2)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.fillRect(self.rect(), QColor("#070707"))
+
+        floor = QRectF(self.width()*.18, self.height()*.69, self.width()*.64, self.height()*.19)
+        p.setPen(QPen(QColor(35,35,35), 1))
+        p.setBrush(QColor(9,9,9))
+        p.drawEllipse(floor)
+
+        elapsed = time.perf_counter() - self.started if self.animating else self.duration
+        t = max(0.0, min(1.0, elapsed / self.duration))
+        if self.animating:
+            # Four decreasing bounces with gravity-like arcs.
+            decay = (1.0 - t) ** 1.45
+            bounce = abs(math.sin(t * math.pi * 4.25)) * 155.0 * decay
+        else:
+            bounce = 0.0
+
+        cx = self.width() * .52
+        base_y = self.height() * .64
+        cy = base_y - bounce
+        size = min(148.0, self.width()*.13, self.height()*.28)
+
+        # Shadow tightens and darkens as the die approaches the table.
+        shadow_w = size * (1.15 + bounce / 260.0)
+        shadow_h = size * .20
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(0,0,0, 85 if bounce > 10 else 125))
+        p.drawEllipse(QRectF(cx-shadow_w/2, base_y+size*.48, shadow_w, shadow_h))
+
+        # Perspective cube. Spin affects skew and visible depth continuously.
+        ax = math.radians(self.spin_x)
+        ay = math.radians(self.spin_y)
+        az = math.radians(self.spin_z)
+        dx = math.sin(ay) * size * .25
+        dy = -abs(math.cos(ax)) * size * .20 - size*.12
+        skew = math.sin(az) * size * .12
+
+        front = [
+            QPointF(cx-size/2+skew, cy-size/2),
+            QPointF(cx+size/2+skew, cy-size/2),
+            QPointF(cx+size/2-skew, cy+size/2),
+            QPointF(cx-size/2-skew, cy+size/2),
+        ]
+        top = [
+            front[0], front[1],
+            QPointF(front[1].x()+dx, front[1].y()+dy),
+            QPointF(front[0].x()+dx, front[0].y()+dy),
+        ]
+        right = [
+            front[1], front[2],
+            QPointF(front[2].x()+dx, front[2].y()+dy),
+            QPointF(front[1].x()+dx, front[1].y()+dy),
+        ]
+
+        # Adjacent values are only visual during tumbling; final front is the result.
+        front_value = self.display_value
+        top_value = ((front_value + 1) % 6) + 1
+        right_value = ((front_value + 3) % 6) + 1
+        self._draw_face(p, top, top_value, .82)
+        self._draw_face(p, right, right_value, .70)
+        self._draw_face(p, front, front_value, 1.0)
+
+        p.setPen(QColor("#7c7c7c"))
+        p.setFont(QFont("Segoe UI", 10))
+        hint = TXT("点击“投掷”让骰子在桌面上弹跳。", "Press Roll to bounce the die across the table.")
+        p.drawText(QRectF(0, self.height()-42, self.width(), 24), Qt.AlignCenter, hint)
+
+
+class DicePage(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(38, 28, 38, 24)
+        outer.setSpacing(12)
+
+        head = QHBoxLayout()
+        text_col = QVBoxLayout()
+        text_col.setSpacing(3)
+        kicker = QLabel("DICE / 3D PHYSICAL ROLL")
+        kicker.setObjectName("kicker")
+        title = QLabel(TXT("骰子", "Dice"))
+        title.setObjectName("pageTitle")
+        desc = QLabel(TXT("第一版骰子功能：3D 骰子、旋转和带衰减的弹跳动画。",
+                          "First dice prototype: a 3D die with rotation and damped bounce animation."))
+        desc.setObjectName("pageDesc")
+        desc.setWordWrap(True)
+        text_col.addWidget(kicker)
+        text_col.addWidget(title)
+        text_col.addWidget(desc)
+        head.addLayout(text_col, 1)
+
+        self.roll_button = QPushButton(TXT("投掷", "Roll"))
+        self.roll_button.setObjectName("primaryButton")
+        self.roll_button.setFixedSize(104, 42)
+        self.roll_button.setCursor(Qt.PointingHandCursor)
+        head.addWidget(self.roll_button, 0, Qt.AlignTop)
+        outer.addLayout(head)
+
+        self.stage = DiceStage()
+        outer.addWidget(self.stage, 1)
+
+        bottom = QHBoxLayout()
+        self.status = QLabel(TXT("准备就绪 · 点击投掷", "Ready · press Roll"))
+        self.status.setObjectName("statusText")
+        bottom.addWidget(self.status)
+        bottom.addStretch(1)
+        outer.addLayout(bottom)
+
+        self.roll_button.clicked.connect(self._roll)
+        self.stage.rollFinished.connect(self._finished)
+
+    def _roll(self):
+        if self.stage.animating:
+            return
+        self.roll_button.setEnabled(False)
+        self.status.setText(TXT("骰子正在弹跳…", "The die is bouncing…"))
+        self.stage.roll()
+
+    def _finished(self, value):
+        self.roll_button.setEnabled(True)
+        self.status.setText(TXT(f"结果：{value}", f"Result: {value}"))
+
+
 class SettingsPage(QWidget):
     settingsChanged = Signal()
 
@@ -3250,6 +3566,21 @@ class SettingsPage(QWidget):
         ))
         layout.addWidget(manual_panel)
 
+        # ---- Hotkeys ----
+        layout.addSpacing(4)
+        layout.addWidget(category("热键", "HOTKEYS"))
+        hotkey_panel, hotkey_form = make_panel()
+        self.hover_hotkey_button = HotkeyCaptureButton(APP_SETTINGS.get("hover_preview_hotkey", "V"))
+        hotkey_form.addWidget(ResponsiveSettingRow(
+            TXT("小卡牌悬停放大", "Small-card Hover Preview"),
+            TXT(
+                "按住绑定按键并在同一张较小的自由移动卡牌上悬停 2 秒后，才会放大该卡牌。",
+                "Hold the bound key while hovering the same small free-move card for 2 seconds before magnification activates."
+            ),
+            self.hover_hotkey_button
+        ))
+        layout.addWidget(hotkey_panel)
+
         # ---- Physical Cards ----
         layout.addSpacing(4)
         layout.addWidget(category("实体卡牌", "PHYSICAL CARDS"))
@@ -3277,8 +3608,13 @@ class SettingsPage(QWidget):
         self.reverse_check.toggled.connect(self._changed)
         self.custom_mode_combo.currentIndexChanged.connect(self._changed)
         self.default_mode_combo.currentIndexChanged.connect(self._changed)
+        self.hover_hotkey_button.hotkeyChanged.connect(self._hotkey_changed)
         self.riffle_input.editingFinished.connect(self._changed)
         self.cut_input.editingFinished.connect(self._changed)
+
+    def _hotkey_changed(self, name):
+        APP_SETTINGS["hover_preview_hotkey"] = (name or "V").upper()
+        self.settingsChanged.emit()
 
     def _changed(self, *args):
         APP_SETTINGS["language"] = self.language_combo.currentData()
@@ -3431,9 +3767,11 @@ class MainWindow(QMainWindow):
         self.home = HomePage()
         self.tarot = TarotPage()
         self.home.startTarot.connect(lambda: self._navigate(1))
+        self.home.startDice.connect(lambda: self._navigate(2))
         self.stack.addWidget(self.home)
         self.stack.addWidget(self.tarot)
-        self.stack.addWidget(PlaceholderPage(TXT("骰子", "Dice")))
+        self.dice = DicePage()
+        self.stack.addWidget(self.dice)
         self.stack.addWidget(PlaceholderPage(TXT("符文", "Runes")))
         self.stack.addWidget(PlaceholderPage(TXT("硬币", "Coin")))
         self.stack.addWidget(PlaceholderPage(TXT("抽签", "Lots")))
@@ -3504,6 +3842,11 @@ class MainWindow(QMainWindow):
                 return True
         if event.type() == QEvent.KeyPress:
             key = event.key()
+            name = qt_key_name(key)
+            if name and not event.isAutoRepeat():
+                HELD_KEYS.add(name)
+                for stage in self.findChildren(TarotStage):
+                    stage._ensure_timer()
             ctrl = bool(event.modifiers() & Qt.ControlModifier)
             focus = QApplication.focusWidget()
             # Plus/minus also work directly when the user is not typing in an input;
@@ -3518,6 +3861,12 @@ class MainWindow(QMainWindow):
             if ctrl and key == Qt.Key_0:
                 self._set_zoom(1.0)
                 return True
+        if event.type() == QEvent.KeyRelease:
+            name = qt_key_name(event.key())
+            if name and not event.isAutoRepeat():
+                HELD_KEYS.discard(name)
+                for stage in self.findChildren(TarotStage):
+                    stage._ensure_timer()
         return super().eventFilter(obj, event)
 
     def _navigate(self, idx):
