@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "5imp1e 5atebox"
-APP_VERSION = "0.8.4"
+APP_VERSION = "0.8.5"
 APP_SETTINGS = {"language": "zh", "mark_back": False}
 
 def TXT(zh, en):
@@ -1622,23 +1622,21 @@ class TarotStage(QWidget):
         dy = self.hover_current.y()
         c = rect.center()
 
-        # Free-move cards can become quite small after the user places many cards.
-        # Only enlarge those genuinely small cards while hovered; normal-size cards
-        # keep their original size so the table layout does not jump unnecessarily.
-        hover_scale = 1.06
+        # Keep the original, restrained card-tilt feel. Only genuinely small
+        # free-move cards are enlarged on hover so they remain readable.
+        hover_scale = 1.035
         if self.free_move_enabled and rect.width() < 88.0:
             target_width = 104.0
             hover_scale = min(1.72, max(1.18, target_width / max(1.0, rect.width())))
 
         p.translate(c)
-        # Stronger pseudo-3D response in all four directions. Horizontal mouse
-        # movement drives yaw/roll, while vertical movement adds the opposite-axis
-        # shear and a small perspective compression/expansion.
-        p.translate(dx * 7.0, dy * 7.0)
-        p.scale(hover_scale * (1.0 + abs(dy) * 0.025),
-                hover_scale * (1.0 - dy * 0.055))
-        p.rotate(dx * 7.2)
-        p.shear(dx * 0.115, -dy * 0.125)
+        # Horizontal motion is restored to the original amplitude. Vertical
+        # response is only slightly stronger than before so up/down hovering is
+        # easier to perceive without making the card wobble excessively.
+        p.translate(0.0, dy * 2.2)
+        p.scale(hover_scale, hover_scale)
+        p.rotate(dx * 2.8)
+        p.shear(dx * 0.055, -dy * 0.068)
         p.translate(-c)
 
     def _paint_slot_card(self, p, slot, slot_index, face_up):
