@@ -10,7 +10,7 @@ from PySide6.QtGui import QColor, QPainter, QPen, QBrush, QFont, QPainterPath, Q
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel,
     QPushButton, QFrame, QButtonGroup, QStackedWidget, QSizePolicy,
-    QGraphicsDropShadowEffect, QLineEdit, QCheckBox, QComboBox, QGridLayout, QScrollArea, QBoxLayout
+    QGraphicsDropShadowEffect, QLineEdit, QCheckBox, QComboBox, QGridLayout, QScrollArea, QBoxLayout, QProgressBar
 )
 
 try:
@@ -38,7 +38,7 @@ except Exception as exc:
     JOLT_ERROR = str(exc)
 
 APP_NAME = "5imp1e 5atebox"
-APP_VERSION = "0.14.0"
+APP_VERSION = "0.14.2"
 APP_SETTINGS = {
     "language": "zh",
     "mark_back": False,
@@ -3263,8 +3263,10 @@ class DiceStage(QWidget):
     only D6. D6 can now roll up to 50 fully independent rigid bodies at once.
     """
 
-    rollFinished = Signal(list)
-    countsChanged = Signal(dict)
+    rollFinished = Signal(object)
+    countsChanged = Signal(int, int, int, int, int, int)
+    loadingProgress = Signal(int, int)
+    loadingStateChanged = Signal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -3289,6 +3291,16 @@ class DiceStage(QWidget):
         self.dice = []
         self.roll_count = 1
         self.current_counts = {i: 0 for i in range(1, 7)}
+
+        # Batch-spawn state. Creating 50 OpenGL items in one UI event is the main
+        # source of the perceived "freeze"; Jolt body creation is comparatively cheap.
+        # We therefore cache D6 geometry and instantiate dice in small UI-friendly
+        # batches while reporting real progress.
+        self.loading_dice = False
+        self.pending_spawn_count = 0
+        self.spawned_count = 0
+        self.spawn_batch_size = 5
+        self._cached_d6_visual_data = None
 
         self.vertices = []
         self.render_faces = []
@@ -3347,7 +3359,9 @@ class DiceStage(QWidget):
         })
         self.floor_body = self.world.create_body(
             pos=(0.0, 0.0, -0.06),
-            size=(6.0, 4.0, 0.06),
+            # Large transparent physical tabletop. The visible grid is resized
+            # dynamically according to dice count, but all rolls stay on this body.
+            size=(11.0, 8.0, 0.06),
             shape=culverin.SHAPE_BOX,
             motion=culverin.MOTION_STATIC,
             mass=0.0,
@@ -3972,9 +3986,175 @@ class DiceStage(QWidget):
                         pass
         self.dice = []
 
+    def _prepare_cached_d6_visual_data(self):
+        """Build immutable D6 mesh data once instead of regenerating it 50 times."""
+        if self._cached_d6_visual_data is not None:
+            return self._cached_d6_visual_data
+
+        h = 0.335
+        r = 0.058
+        s = h - r
+        verts, faces, colors = [], [], []
+        vertex_lookup = {}
+        face_base = {
+            ('x', 1): 0.900, ('x', -1): 0.835,
+            ('y', 1): 0.925, ('y', -1): 0.860,
+            ('z', 1): 0.955, ('z', -1): 0.805,
+        }
+        light = np.asarray((-0.30, -0.40, 0.86), dtype=float)
+        light /= np.linalg.norm(light)
+
+        def rounded_point(p):
+            p = np.asarray(p, dtype=float)
+            q = np.clip(p, -s, s)
+            d = p - q
+            n = float(np.linalg.norm(d))
+            return p if n < 1e-12 else q + d * (r / n)
+
+        def vertex_id(p):
+            key = tuple(round(float(v), 9) for v in p)
+            idx = vertex_lookup.get(key)
+            if idx is None:
+                idx = len(verts)
+                vertex_lookup[key] = idx
+                verts.append(tuple(float(v) for v in p))
+            return idx
+
+        def tri_color(a, b, c, base):
+            pa, pb, pc = np.asarray(verts[a]), np.asarray(verts[b]), np.asarray(verts[c])
+            normal = np.cross(pb-pa, pc-pa)
+            ln = float(np.linalg.norm(normal))
+            if ln > 1e-9:
+                normal /= ln
+            illum = 0.93 + 0.07 * max(0.0, float(np.dot(normal, light)))
+            shade = max(0.68, min(0.985, base * illum))
+            return (shade, shade, max(0.0, shade-0.008), 1.0)
+
+        steps = 12
+        vals = np.linspace(-h, h, steps + 1)
+
+        def build_face(axis, sign):
+            base = face_base[(axis, sign)]
+            grid = [[None]*(steps+1) for _ in range(steps+1)]
+            for iu, u0 in enumerate(vals):
+                for iv, v0 in enumerate(vals):
+                    if axis == 'x':
+                        raw = (sign*h, u0, v0)
+                    elif axis == 'y':
+                        raw = (u0, sign*h, v0)
+                    else:
+                        raw = (u0, v0, sign*h)
+                    grid[iu][iv] = vertex_id(rounded_point(raw))
+            for iu in range(steps):
+                for iv in range(steps):
+                    a = grid[iu][iv]; b = grid[iu+1][iv]
+                    c = grid[iu+1][iv+1]; d = grid[iu][iv+1]
+                    tris = ((a,b,c),(a,c,d)) if sign > 0 else ((a,c,b),(a,d,c))
+                    if axis == 'y':
+                        tris = tuple((t[0], t[2], t[1]) for t in tris)
+                    for tri in tris:
+                        faces.append(tri)
+                        colors.append(tri_color(*tri, base))
+
+        for axis in ('x', 'y', 'z'):
+            build_face(axis, 1)
+            build_face(axis, -1)
+
+        black_v, black_f, red_v, red_f = [], [], [], []
+        eps = 0.0035
+        pip_scale = s * 0.90
+        pip_r = h * 0.070
+
+        def add_disc(target_v, target_f, center, axis, radius, segments=18):
+            cx, cy, cz = center
+            base = len(target_v)
+            target_v.append((cx,cy,cz))
+            for i in range(segments):
+                a = 2.0*math.pi*i/segments
+                ca, sa = math.cos(a)*radius, math.sin(a)*radius
+                if axis == 'z':
+                    target_v.append((cx+ca, cy+sa, cz))
+                elif axis == 'x':
+                    target_v.append((cx, cy+ca, cz+sa))
+                else:
+                    target_v.append((cx+ca, cy, cz+sa))
+            for i in range(segments):
+                target_f.append((base, base+1+i, base+1+((i+1)%segments)))
+
+        face_defs = [
+            (1,'z',lambda u,v:(u*pip_scale,v*pip_scale,h+eps)),
+            (6,'z',lambda u,v:(u*pip_scale,-v*pip_scale,-h-eps)),
+            (3,'x',lambda u,v:(h+eps,u*pip_scale,v*pip_scale)),
+            (4,'x',lambda u,v:(-h-eps,-u*pip_scale,v*pip_scale)),
+            (2,'y',lambda u,v:(u*pip_scale,h+eps,v*pip_scale)),
+            (5,'y',lambda u,v:(-u*pip_scale,-h-eps,v*pip_scale)),
+        ]
+        for value, axis, mapper in face_defs:
+            target_v, target_f = (red_v, red_f) if value == 1 else (black_v, black_f)
+            for u, v in self._pip_positions(value):
+                add_disc(target_v, target_f, mapper(u,v), axis, pip_r)
+
+        self._cached_d6_visual_data = {
+            "body_v": np.asarray(verts, dtype=float),
+            "body_f": np.asarray(faces, dtype=np.int32),
+            "body_c": np.asarray(colors, dtype=float),
+            "black_v": np.asarray(black_v, dtype=float),
+            "black_f": np.asarray(black_f, dtype=np.int32),
+            "red_v": np.asarray(red_v, dtype=float),
+            "red_f": np.asarray(red_f, dtype=np.int32),
+        }
+        return self._cached_d6_visual_data
+
+    def _configure_table_for_count(self, count):
+        """Scale visible table, camera and release volume with the roll size."""
+        t = max(0.0, min(1.0, (count - 1) / 49.0))
+        table_x = 11.5 + 8.5 * t
+        table_y = 7.5 + 6.5 * t
+        self.floor.setSize(x=table_x, y=table_y)
+
+        # Pull the camera back for larger groups so the whole release remains visible.
+        distance = 10.4 + 5.5 * t
+        elevation = 22 + 5 * t
+        self.view.setCameraPosition(
+            pos=QVector3D(0.10, 0.08, 0.45),
+            distance=distance,
+            elevation=elevation,
+            azimuth=-42
+        )
+
     def _new_d6_visual_instance(self):
-        body_mesh, face_plate, shadow_mesh, black_mesh, red_mesh = self._build_legacy_d6_visual()
-        meshes = [body_mesh, face_plate, shadow_mesh, black_mesh, red_mesh]
+        data = self._prepare_cached_d6_visual_data()
+
+        body_md = gl.MeshData(
+            vertexes=data["body_v"],
+            faces=data["body_f"],
+            faceColors=data["body_c"],
+        )
+        body_mesh = gl.GLMeshItem(
+            meshdata=body_md, smooth=True, drawFaces=True, drawEdges=False
+        )
+        body_mesh.setGLOptions("opaque")
+
+        def make_pips(vkey, fkey, color):
+            vs = data[vkey]
+            fs = data[fkey]
+            if len(vs) == 0:
+                return None
+            item = gl.GLMeshItem(
+                vertexes=vs,
+                faces=fs,
+                color=color,
+                smooth=False,
+                drawFaces=True,
+                drawEdges=False,
+                shader=None,
+            )
+            item.setGLOptions("opaque")
+            return item
+
+        black_mesh = make_pips("black_v", "black_f", (0.02,0.02,0.02,1.0))
+        red_mesh = make_pips("red_v", "red_f", (0.82,0.04,0.035,1.0))
+        meshes = [body_mesh, None, None, black_mesh, red_mesh]
         for item in meshes:
             if item is not None:
                 self.view.addItem(item)
@@ -4071,15 +4251,17 @@ class DiceStage(QWidget):
         return max(float((R@n)[2]) for n in self.face_normals_local)
 
     def roll(self, count=1):
-        if self.animating or self.world is None:
+        if self.animating or self.loading_dice or self.world is None:
             return
 
         count = max(1, min(50, int(count)))
         self.roll_count = count
         self.current_counts = {i: 0 for i in range(1, 7)}
-        self.countsChanged.emit(dict(self.current_counts))
+        self.countsChanged.emit(0, 0, 0, 0, 0, 0)
 
-        # Remove the idle single die and all bodies/visuals left from a previous roll.
+        self._configure_table_for_count(count)
+
+        # Clear previous scene before reporting load progress.
         self._remove_single_visual()
         if self.die_body is not None:
             try:
@@ -4089,23 +4271,45 @@ class DiceStage(QWidget):
             self.die_body = None
         self._clear_multi_dice()
 
+        self.pending_spawn_count = count
+        self.spawned_count = 0
+        self.loading_dice = True
+        self.loadingStateChanged.emit(True)
+        self.loadingProgress.emit(0, count)
+
+        # For small throws we can load in a larger batch; for 30-50 dice smaller
+        # batches keep Qt responsive and make progress genuinely visible.
+        self.spawn_batch_size = 8 if count <= 12 else (6 if count <= 30 else 4)
+
+        # Start the batched preparation on the next event-loop turn.
+        QTimer.singleShot(0, self._spawn_next_batch)
+
+    def _spawn_next_batch(self):
+        if not self.loading_dice:
+            return
+
+        count = self.pending_spawn_count
+        remaining = count - self.spawned_count
+        batch = min(self.spawn_batch_size, remaining)
+
+        # Larger throws use a taller and wider release volume for visual impact.
+        t = max(0.0, min(1.0, (count - 1) / 49.0))
+        spread_x = 2.2 + 3.2 * t
+        spread_y = 1.6 + 2.6 * t
+        base_height = 3.6 + 2.6 * t
+        height_jitter = 0.7 + 1.7 * t
+
         d6_half = 0.335
 
-        # Spawn all dice in a compact 3D grid so even 50 bodies enter the simulation
-        # simultaneously without beginning in an overlapping state.
-        cols = min(10, max(1, math.ceil(math.sqrt(count * 2.0))))
-        rows = max(1, math.ceil(count / cols))
-        spacing_x = 0.76
-        spacing_y = 0.76
-
-        for i in range(count):
-            col = i % cols
-            row = (i // cols) % rows
-            layer = i // (cols * rows)
-
-            x = (col - (cols - 1) * 0.5) * spacing_x + random.uniform(-0.055, 0.055)
-            y = (row - (rows - 1) * 0.5) * spacing_y + random.uniform(-0.055, 0.055)
-            z = 3.45 + layer * 0.82 + random.uniform(0.0, 0.55)
+        for _ in range(batch):
+            i = self.spawned_count
+            # Stratified-but-random distribution: avoids exact overlaps while looking
+            # much more explosive than a rigid rectangular spawn grid.
+            angle = (i * 2.399963229728653) + random.uniform(-0.25, 0.25)
+            radial = math.sqrt((i + 0.5) / max(1, count))
+            x = math.cos(angle) * spread_x * radial + random.uniform(-0.16, 0.16)
+            y = math.sin(angle) * spread_y * radial + random.uniform(-0.14, 0.14)
+            z = base_height + random.uniform(0.0, height_jitter)
 
             quat = self._quat_from_euler(
                 random.uniform(-math.pi, math.pi),
@@ -4125,20 +4329,19 @@ class DiceStage(QWidget):
                 ccd=True,
             )
 
-            # Mostly downward throws with small horizontal variation; every body gets
-            # its own angular impulse, so the 50-die roll moves as one event but not
-            # as cloned motion.
+            # Stronger outward/downward release for large batches.
+            horizontal_push = 0.18 + 0.34 * t
             self.world.apply_impulse(
                 body,
-                random.uniform(-0.30, 0.30),
-                random.uniform(-0.30, 0.30),
-                random.uniform(-0.28, -0.06),
+                math.cos(angle) * random.uniform(0.05, horizontal_push),
+                math.sin(angle) * random.uniform(0.05, horizontal_push),
+                random.uniform(-0.42 - 0.18*t, -0.10),
             )
             self.world.apply_angular_impulse(
                 body,
+                random.uniform(-0.10, 0.10),
+                random.uniform(-0.10, 0.10),
                 random.uniform(-0.085, 0.085),
-                random.uniform(-0.085, 0.085),
-                random.uniform(-0.070, 0.070),
             )
 
             meshes = self._new_d6_visual_instance()
@@ -4153,10 +4356,23 @@ class DiceStage(QWidget):
                 "result": None,
             })
 
+            self.spawned_count += 1
+
+        self.loadingProgress.emit(self.spawned_count, count)
+
+        if self.spawned_count < count:
+            QTimer.singleShot(0, self._spawn_next_batch)
+            return
+
+        # Only after all bodies and render items exist do we start Jolt. Therefore
+        # every die begins moving together, even though preparation was incremental.
+        self.loading_dice = False
+        self.loadingStateChanged.emit(False)
         self.physics_accumulator = 0.0
         self.last_tick = time.perf_counter()
         self.animating = True
         self._timer.start()
+
 
     def _tick(self):
         if not self.animating:
@@ -4191,23 +4407,42 @@ class DiceStage(QWidget):
 
             linear = math.sqrt(sum(float(v) * float(v) for v in lv))
             angular = math.sqrt(sum(float(v) * float(v) for v in av))
-            flat = self._d6_flatness_from_quat(quat)
-            grounded = float(pos[2]) < 0.69
+            grounded = float(pos[2]) < 0.72
 
-            if grounded and linear < 0.070 and angular < 0.20 and flat > 0.985:
+            # With many dice colliding together, tiny residual rocking can remain
+            # for a long time even though a die is visibly at rest. Count a D6 once
+            # it has stayed on the table with low linear/angular motion for a short
+            # dwell period. The face value is still read from its actual orientation.
+            if grounded and linear < 0.115 and angular < 0.42:
                 die["sleep_time"] += frame_dt
             else:
-                die["sleep_time"] = max(0.0, die["sleep_time"] - frame_dt * 2.0)
+                die["sleep_time"] = max(0.0, die["sleep_time"] - frame_dt * 1.5)
 
-            if die["sleep_time"] > 0.42:
+            if die["sleep_time"] > 0.34:
                 value = self._d6_result_from_quat(quat)
                 die["result"] = value
                 die["settled"] = True
                 self.current_counts[value] += 1
                 newly_settled = True
+                # Freeze only a die that has already satisfied the low-motion dwell.
+                # Orientation is not changed, so the recorded face stays physical.
+                try:
+                    self.world.set_velocity(body, 0.0, 0.0, 0.0)
+                    self.world.set_angular_velocity(body, 0.0, 0.0, 0.0)
+                except Exception:
+                    # Culverin builds may not expose explicit setters; counting still
+                    # works because the body has already been marked settled.
+                    pass
 
         if newly_settled:
-            self.countsChanged.emit(dict(self.current_counts))
+            self.countsChanged.emit(
+                self.current_counts[1],
+                self.current_counts[2],
+                self.current_counts[3],
+                self.current_counts[4],
+                self.current_counts[5],
+                self.current_counts[6],
+            )
 
         if self.dice and all(die["settled"] for die in self.dice):
             results = [int(die["result"]) for die in self.dice]
@@ -4370,6 +4605,15 @@ class DicePage(QWidget):
         controls.addStretch(1)
         outer.addLayout(controls)
 
+        self.loading_bar = QProgressBar()
+        self.loading_bar.setRange(0, 100)
+        self.loading_bar.setValue(0)
+        self.loading_bar.setTextVisible(True)
+        self.loading_bar.setFormat(TXT("准备骰子 %p%", "Preparing dice %p%"))
+        self.loading_bar.setFixedHeight(18)
+        self.loading_bar.hide()
+        outer.addWidget(self.loading_bar)
+
         self.stage = DiceStage()
         outer.addWidget(self.stage, 1)
 
@@ -4383,6 +4627,8 @@ class DicePage(QWidget):
         self.roll_button.clicked.connect(self._roll)
         self.stage.rollFinished.connect(self._finished)
         self.stage.countsChanged.connect(self._update_counts)
+        self.stage.loadingProgress.connect(self._loading_progress)
+        self.stage.loadingStateChanged.connect(self._loading_state)
         self.quantity_input.textChanged.connect(self._quantity_changed)
 
         if not OPENGL_3D_AVAILABLE or not JOLT_AVAILABLE:
@@ -4408,9 +4654,35 @@ class DicePage(QWidget):
             f"D6 · {count} {'die' if count == 1 else 'dice'} · press Roll"
         ))
 
-    def _update_counts(self, counts):
-        for value in range(1, 7):
-            self.count_labels[value].setText(str(int(counts.get(value, 0))))
+    def _update_counts(self, c1, c2, c3, c4, c5, c6):
+        counts = (c1, c2, c3, c4, c5, c6)
+        for value, count in enumerate(counts, start=1):
+            self.count_labels[value].setText(str(int(count)))
+
+    def _loading_state(self, loading):
+        self.loading_bar.setVisible(bool(loading))
+        if loading:
+            self.loading_bar.setValue(0)
+        else:
+            count = self._quantity()
+            self.status.setText(TXT(
+                f"{count} 个 D6 已全部生成 · 正在同时弹跳…",
+                f"All {count} D6 {'die is' if count == 1 else 'dice are'} ready · rolling together…"
+            ))
+
+    def _loading_progress(self, current, total):
+        total = max(1, int(total))
+        current = max(0, min(total, int(current)))
+        percent = int(round(current * 100 / total))
+        self.loading_bar.setValue(percent)
+        self.loading_bar.setFormat(TXT(
+            f"准备骰子 {current}/{total} · {percent}%",
+            f"Preparing dice {current}/{total} · {percent}%"
+        ))
+        self.status.setText(TXT(
+            f"正在创建实体骰子 {current}/{total}…",
+            f"Creating physical dice {current}/{total}…"
+        ))
 
     def _roll(self):
         if self.stage.animating:
@@ -4420,8 +4692,8 @@ class DicePage(QWidget):
         self.roll_button.setEnabled(False)
         self.quantity_input.setEnabled(False)
         self.status.setText(TXT(
-            f"{count} 个 D6 正在同时弹跳…",
-            f"{count} D6 {'die is' if count == 1 else 'dice are'} rolling together…"
+            f"正在准备 {count} 个 D6…",
+            f"Preparing {count} D6 {'die' if count == 1 else 'dice'}…"
         ))
         self.stage.roll(count)
 
