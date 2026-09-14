@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QRectF, QPointF, Signal, QSize, QTimer, QEvent
-from PySide6.QtGui import QColor, QPainter, QPen, QBrush, QFont, QPainterPath, QPixmap, QIntValidator, QMatrix4x4, QVector3D
+from PySide6.QtGui import QColor, QPainter, QPen, QBrush, QFont, QPainterPath, QPixmap, QIntValidator, QMatrix4x4, QVector3D, QQuaternion
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel,
     QPushButton, QFrame, QButtonGroup, QStackedWidget, QSizePolicy,
@@ -24,8 +24,17 @@ except Exception as exc:
     OPENGL_3D_AVAILABLE = False
     OPENGL_3D_ERROR = str(exc)
 
+try:
+    import culverin
+    JOLT_AVAILABLE = True
+    JOLT_ERROR = ""
+except Exception as exc:
+    culverin = None
+    JOLT_AVAILABLE = False
+    JOLT_ERROR = str(exc)
+
 APP_NAME = "5imp1e 5atebox"
-APP_VERSION = "0.11.0"
+APP_VERSION = "0.12.1"
 APP_SETTINGS = {
     "language": "zh",
     "mark_back": False,
@@ -3179,7 +3188,12 @@ class HotkeyCaptureButton(QPushButton):
 
 
 class DiceStage(QWidget):
-    """Real OpenGL low-poly die with a lightweight rigid-body-style fall/bounce."""
+    """OpenGL renderer driven by Culverin's Jolt Physics rigid-body engine.
+
+    The visible rounded die and the physical collider are completely separate:
+    the renderer shows a rounded cube, while Jolt sees a sharp transparent box
+    of exactly the same overall size. Pips are pure decals and never affect physics.
+    """
     rollFinished = Signal(int)
 
     def __init__(self, parent=None):
@@ -3193,254 +3207,486 @@ class DiceStage(QWidget):
 
         self.animating = False
         self.result = 1
-        self.sim_time = 0.0
-        self.last_tick = 0.0
-        self.settle_time = 0.0
-        self.bounce_count = 0
+        self.last_tick = time.perf_counter()
+        self.physics_accumulator = 0.0
+        self.sleep_time = 0.0
+        self.unstable_time = 0.0
 
-        # World-space physical state. The tabletop is z = 0.
-        self.half = 0.72
-        self.pos = [0.0, 0.0, self.half]
-        self.vel = [0.0, 0.0, 0.0]
-        self.rot = [18.0, -24.0, 8.0]
-        self.ang = [0.0, 0.0, 0.0]
+        # Compact die.
+        self.half = 0.300
+        self.bevel = 0.052
+        self.collider_half = self.half
 
-        # Tuned for a readable but natural-looking small rigid body.
-        self.gravity = -9.81
-        self.restitution = 0.47
-        self.surface_friction = 0.76
-        self.rolling_drag = 0.90
-        self.air_drag = 0.998
+        # Fixed Jolt step. 240 Hz is deliberately independent from Qt frame rate.
+        self.physics_dt = 1.0 / 240.0
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        if not OPENGL_3D_AVAILABLE:
+        if not OPENGL_3D_AVAILABLE or not JOLT_AVAILABLE:
             self.view = None
             self.die_mesh = None
+            self.pip_mesh = None
+            missing = []
+            if not OPENGL_3D_AVAILABLE:
+                missing.append("pyqtgraph / PyOpenGL")
+            if not JOLT_AVAILABLE:
+                missing.append("Culverin / Jolt Physics")
             msg = QLabel(TXT(
-                "3D 渲染组件尚未加载。请使用新版 run.bat 启动器，它会自动安装 pyqtgraph 与 PyOpenGL。",
-                "The 3D renderer is not available. Start the app with the new run.bat launcher to install pyqtgraph and PyOpenGL automatically."
+                "3D 骰子组件尚未加载：" + "、".join(missing) +
+                "。请使用新版 run.bat，它会自动安装所需组件。",
+                "3D dice components are unavailable: " + ", ".join(missing) +
+                ". Start the app with the updated run.bat to install them automatically."
             ))
             msg.setWordWrap(True)
             msg.setAlignment(Qt.AlignCenter)
             msg.setObjectName("pageDesc")
             root.addWidget(msg, 1)
+            self.world = None
+            self.die_body = None
             return
 
+        # ---------------------- OpenGL renderer ----------------------
         self.view = gl.GLViewWidget()
         self.view.setBackgroundColor((7, 7, 7, 255))
-        self.view.opts['distance'] = 11.5
-        self.view.opts['elevation'] = 24
+        self.view.opts['distance'] = 10.4
+        self.view.opts['elevation'] = 22
         self.view.opts['azimuth'] = -42
-        self.view.setCameraPosition(pos=QVector3D(0.0, 0.25, 0.45), distance=11.5,
-                                    elevation=24, azimuth=-42)
+        self.view.setCameraPosition(
+            pos=QVector3D(0.10, 0.08, 0.38),
+            distance=10.4,
+            elevation=22,
+            azimuth=-42
+        )
         root.addWidget(self.view, 1)
 
-        # Dark tabletop grid gives depth cues while retaining the 515 aesthetic.
         self.floor = gl.GLGridItem()
-        self.floor.setSize(x=12.0, y=8.0)
+        self.floor.setSize(x=11.5, y=7.5)
         self.floor.setSpacing(x=1.0, y=1.0)
-        self.floor.setColor((42, 42, 42, 95))
+        self.floor.setColor((35, 35, 35, 78))
         self.view.addItem(self.floor)
 
-        # A single generated mesh contains both the die body and low-poly pips.
-        verts, faces, colors = self._build_die_geometry()
-        md = gl.MeshData(vertexes=np.asarray(verts, dtype=float),
-                         faces=np.asarray(faces, dtype=np.int32),
-                         faceColors=np.asarray(colors, dtype=float))
-        self.die_mesh = gl.GLMeshItem(meshdata=md, smooth=False,
-                                      drawFaces=True, drawEdges=True,
-                                      edgeColor=(0.22, 0.22, 0.22, 1.0))
+        shell_v, shell_f, shell_c = self._build_shell_geometry()
+        shell_md = gl.MeshData(
+            vertexes=np.asarray(shell_v, dtype=float),
+            faces=np.asarray(shell_f, dtype=np.int32),
+            faceColors=np.asarray(shell_c, dtype=float)
+        )
+        self.die_mesh = gl.GLMeshItem(
+            meshdata=shell_md,
+            smooth=True,
+            drawFaces=True,
+            drawEdges=False
+        )
+        self.die_mesh.setGLOptions("opaque")
         self.view.addItem(self.die_mesh)
-        self._apply_transform()
+
+        pip_v, pip_f, pip_c = self._build_pip_geometry()
+        pip_md = gl.MeshData(
+            vertexes=np.asarray(pip_v, dtype=float),
+            faces=np.asarray(pip_f, dtype=np.int32),
+            faceColors=np.asarray(pip_c, dtype=float)
+        )
+        self.pip_mesh = gl.GLMeshItem(
+            meshdata=pip_md,
+            smooth=False,
+            drawFaces=True,
+            drawEdges=False
+        )
+        self.pip_mesh.setGLOptions("opaque")
+        self.view.addItem(self.pip_mesh)
+
+        # ---------------------- Jolt physics via Culverin ----------------------
+        self.world = culverin.PhysicsWorld({
+            "gravity": (0.0, 0.0, -9.81),
+            "penetration_slop": 0.002,
+            "num_threads": 2,
+        })
+
+        # Static tabletop. Culverin/Jolt box sizes are half-extents.
+        self.floor_body = self.world.create_body(
+            pos=(0.0, 0.0, -0.06),
+            size=(6.0, 4.0, 0.06),
+            shape=culverin.SHAPE_BOX,
+            motion=culverin.MOTION_STATIC,
+            mass=0.0,
+            friction=0.72,
+            restitution=0.20,
+        )
+
+        self.die_body = None
+        self._spawn_idle_body()
+        self._apply_transform_from_world()
 
     @staticmethod
     def _pip_pattern(value):
         return {
             1: [(0, 0)],
-            2: [(-.42, -.42), (.42, .42)],
-            3: [(-.42, -.42), (0, 0), (.42, .42)],
-            4: [(-.42, -.42), (.42, -.42), (-.42, .42), (.42, .42)],
-            5: [(-.42, -.42), (.42, -.42), (0, 0), (-.42, .42), (.42, .42)],
-            6: [(-.42, -.50), (.42, -.50), (-.42, 0), (.42, 0), (-.42, .50), (.42, .50)],
+            2: [(-.48, -.48), (.48, .48)],
+            3: [(-.48, -.48), (0, 0), (.48, .48)],
+            4: [(-.48, -.48), (.48, -.48), (-.48, .48), (.48, .48)],
+            5: [(-.48, -.48), (.48, -.48), (0, 0), (-.48, .48), (.48, .48)],
+            6: [(-.48, -.56), (.48, -.56), (-.48, 0), (.48, 0), (-.48, .56), (.48, .56)],
         }[value]
 
-    @staticmethod
-    def _append_octa_sphere(verts, faces, colors, center, radius=0.075):
-        """Append a tiny octahedral pip: extremely low poly and cheap to render."""
-        cx, cy, cz = center
-        base = len(verts)
-        verts.extend([
-            (cx + radius, cy, cz), (cx - radius, cy, cz),
-            (cx, cy + radius, cz), (cx, cy - radius, cz),
-            (cx, cy, cz + radius), (cx, cy, cz - radius),
-        ])
-        tris = [(0,2,4),(2,1,4),(1,3,4),(3,0,4),
-                (2,0,5),(1,2,5),(3,1,5),(0,3,5)]
-        pip_color = (0.035, 0.035, 0.035, 1.0)
-        for tri in tris:
-            faces.append(tuple(base+i for i in tri))
-            colors.append(pip_color)
-
-    def _build_die_geometry(self):
+    def _build_shell_geometry(self):
+        """Continuous rounded cube shell; pips are drawn separately."""
         h = self.half
-        verts = [
-            (-h,-h,-h), ( h,-h,-h), ( h, h,-h), (-h, h,-h),
-            (-h,-h, h), ( h,-h, h), ( h, h, h), (-h, h, h),
-        ]
-        # Each face has its own subtle grey tone to make the low-poly form readable.
-        quad_faces = [
-            ((4,5,6,7), (0.93,0.93,0.93,1.0)),  # +Z top
-            ((1,0,3,2), (0.68,0.68,0.68,1.0)),  # -Z bottom
-            ((1,2,6,5), (0.82,0.82,0.82,1.0)),  # +X
-            ((0,4,7,3), (0.73,0.73,0.73,1.0)),  # -X
-            ((2,3,7,6), (0.87,0.87,0.87,1.0)),  # +Y
-            ((0,1,5,4), (0.78,0.78,0.78,1.0)),  # -Y
-        ]
-        faces, colors = [], []
-        for q, col in quad_faces:
-            a,b,c,d = q
-            faces.extend([(a,b,c),(a,c,d)])
-            colors.extend([col,col])
+        r = self.bevel
+        s = h - r
 
-        # Opposite faces sum to seven: top/bottom 1/6, +X/-X 3/4, +Y/-Y 2/5.
-        eps = 0.018
-        scale = h * 1.06
-        face_defs = [
-            (1, lambda u,v: (u*scale, v*scale,  h+eps)),
-            (6, lambda u,v: (u*scale, -v*scale, -h-eps)),
-            (3, lambda u,v: ( h+eps, u*scale, v*scale)),
-            (4, lambda u,v: (-h-eps, -u*scale, v*scale)),
-            (2, lambda u,v: (u*scale,  h+eps, v*scale)),
-            (5, lambda u,v: (-u*scale, -h-eps, v*scale)),
-        ]
-        for value, mapper in face_defs:
-            for u, v in self._pip_pattern(value):
-                self._append_octa_sphere(verts, faces, colors, mapper(u,v))
+        verts = []
+        faces = []
+        colors = []
+        vertex_lookup = {}
+
+        face_base = {
+            ('x',  1): 0.900,
+            ('x', -1): 0.835,
+            ('y',  1): 0.925,
+            ('y', -1): 0.860,
+            ('z',  1): 0.955,
+            ('z', -1): 0.805,
+        }
+
+        light = np.asarray((-0.30, -0.40, 0.86), dtype=float)
+        light /= np.linalg.norm(light)
+
+        def rounded_point(p):
+            p = np.asarray(p, dtype=float)
+            q = np.clip(p, -s, s)
+            d = p - q
+            n = float(np.linalg.norm(d))
+            if n < 1e-12:
+                return p
+            return q + d * (r / n)
+
+        def vertex_id(p):
+            key = tuple(round(float(v), 9) for v in p)
+            idx = vertex_lookup.get(key)
+            if idx is None:
+                idx = len(verts)
+                vertex_lookup[key] = idx
+                verts.append(tuple(float(v) for v in p))
+            return idx
+
+        def tri_color(a, b, c, base):
+            pa = np.asarray(verts[a], dtype=float)
+            pb = np.asarray(verts[b], dtype=float)
+            pc = np.asarray(verts[c], dtype=float)
+            normal = np.cross(pb - pa, pc - pa)
+            ln = float(np.linalg.norm(normal))
+            if ln > 1e-9:
+                normal /= ln
+            illum = 0.93 + 0.07 * max(0.0, float(np.dot(normal, light)))
+            shade = max(0.70, min(0.985, base * illum))
+            return (shade, shade, max(0.0, shade - 0.008), 1.0)
+
+        steps = 16
+        vals = np.linspace(-h, h, steps + 1)
+
+        def build_face(axis, sign):
+            base = face_base[(axis, sign)]
+            grid = [[None] * (steps + 1) for _ in range(steps + 1)]
+            for iu, u in enumerate(vals):
+                for iv, v in enumerate(vals):
+                    if axis == 'x':
+                        raw = (sign*h, u, v)
+                    elif axis == 'y':
+                        raw = (u, sign*h, v)
+                    else:
+                        raw = (u, v, sign*h)
+                    grid[iu][iv] = vertex_id(rounded_point(raw))
+
+            for iu in range(steps):
+                for iv in range(steps):
+                    a = grid[iu][iv]
+                    b = grid[iu+1][iv]
+                    c = grid[iu+1][iv+1]
+                    d = grid[iu][iv+1]
+                    if sign > 0:
+                        tris = ((a, b, c), (a, c, d))
+                    else:
+                        tris = ((a, c, b), (a, d, c))
+                    if axis == 'y':
+                        tris = tuple((t[0], t[2], t[1]) for t in tris)
+                    for tri in tris:
+                        faces.append(tri)
+                        colors.append(tri_color(*tri, base))
+
+        for axis in ('x', 'y', 'z'):
+            build_face(axis, 1)
+            build_face(axis, -1)
+
         return verts, faces, colors
 
-    def roll(self):
-        if self.animating or not OPENGL_3D_AVAILABLE or self.die_mesh is None:
-            return
-        self.result = random.randint(1, 6)
+    @staticmethod
+    def _append_disc(verts, faces, colors, center, axis, radius, color, segments=20):
+        cx, cy, cz = center
+        base = len(verts)
+        verts.append((cx, cy, cz))
+        for i in range(segments):
+            a = 2.0 * math.pi * i / segments
+            ca, sa = math.cos(a) * radius, math.sin(a) * radius
+            if axis == 'z':
+                verts.append((cx + ca, cy + sa, cz))
+            elif axis == 'x':
+                verts.append((cx, cy + ca, cz + sa))
+            else:
+                verts.append((cx + ca, cy, cz + sa))
 
-        # Start clearly above the table with lateral motion and tumble.
-        self.pos = [random.uniform(-1.45, -0.75),
-                    random.uniform(-0.55, 0.40),
-                    random.uniform(5.6, 6.8)]
-        self.vel = [random.uniform(2.0, 3.2),
-                    random.uniform(-0.55, 0.80),
-                    random.uniform(-0.20, 0.20)]
-        self.rot = [random.uniform(-150, 150), random.uniform(-150, 150), random.uniform(-150,150)]
-        self.ang = [random.uniform(430, 720), random.uniform(-650, -380), random.uniform(220, 480)]
-        self.sim_time = 0.0
-        self.settle_time = 0.0
-        self.bounce_count = 0
+        for i in range(segments):
+            faces.append((base, base + 1 + i, base + 1 + ((i + 1) % segments)))
+            colors.append(color)
+
+    def _build_pip_geometry(self):
+        """Opaque decals: one is red, all other pips are black."""
+        h = self.half
+        s = h - self.bevel
+        eps = 0.0065
+        scale = s * 0.88
+        radius = self.half * 0.074
+
+        verts, faces, colors = [], [], []
+        black = (0.010, 0.010, 0.010, 1.0)
+        red = (0.86, 0.025, 0.020, 1.0)
+
+        defs = [
+            (1, 'z', lambda u,v: (u*scale, v*scale,  h+eps)),
+            (6, 'z', lambda u,v: (u*scale, -v*scale, -h-eps)),
+            (3, 'x', lambda u,v: ( h+eps, u*scale, v*scale)),
+            (4, 'x', lambda u,v: (-h-eps, -u*scale, v*scale)),
+            (2, 'y', lambda u,v: (u*scale,  h+eps, v*scale)),
+            (5, 'y', lambda u,v: (-u*scale, -h-eps, v*scale)),
+        ]
+
+        for value, axis, mapper in defs:
+            color = red if value == 1 else black
+            for u, v in self._pip_pattern(value):
+                self._append_disc(verts, faces, colors, mapper(u, v), axis, radius, color)
+        return verts, faces, colors
+
+    @staticmethod
+    def _face_normals():
+        return {
+            1: np.asarray((0.0, 0.0, 1.0)),
+            6: np.asarray((0.0, 0.0,-1.0)),
+            3: np.asarray((1.0, 0.0, 0.0)),
+            4: np.asarray((-1.0,0.0, 0.0)),
+            2: np.asarray((0.0, 1.0, 0.0)),
+            5: np.asarray((0.0,-1.0, 0.0)),
+        }
+
+    @staticmethod
+    def _quat_from_euler(rx, ry, rz):
+        cr, sr = math.cos(rx*0.5), math.sin(rx*0.5)
+        cp, sp = math.cos(ry*0.5), math.sin(ry*0.5)
+        cy, sy = math.cos(rz*0.5), math.sin(rz*0.5)
+        return (
+            sr*cp*cy - cr*sp*sy,
+            cr*sp*cy + sr*cp*sy,
+            cr*cp*sy - sr*sp*cy,
+            cr*cp*cy + sr*sp*sy,
+        )
+
+    @staticmethod
+    def _rotation_matrix_from_quat(quat):
+        x, y, z, w = [float(v) for v in quat]
+        xx, yy, zz = x*x, y*y, z*z
+        xy, xz, yz = x*y, x*z, y*z
+        wx, wy, wz = w*x, w*y, w*z
+        return np.asarray((
+            (1 - 2*(yy+zz), 2*(xy-wz),     2*(xz+wy)),
+            (2*(xy+wz),     1 - 2*(xx+zz), 2*(yz-wx)),
+            (2*(xz-wy),     2*(yz+wx),     1 - 2*(xx+yy)),
+        ), dtype=float)
+
+    def _top_face_value(self, quat):
+        R = self._rotation_matrix_from_quat(quat)
+        normals = self._face_normals()
+        return max(normals, key=lambda value: float((R @ normals[value])[2]))
+
+    def _flatness(self, quat):
+        R = self._rotation_matrix_from_quat(quat)
+        return max(float((R @ n)[2]) for n in self._face_normals().values())
+
+    def _support_height(self, quat):
+        """Distance from cube center to the lowest sharp-box vertex."""
+        R = self._rotation_matrix_from_quat(quat)
+        # Support radius of an oriented box along world +Z.
+        return self.collider_half * (
+            abs(float(R[2,0])) + abs(float(R[2,1])) + abs(float(R[2,2]))
+        )
+
+    def _spawn_idle_body(self):
+        if self.die_body is not None:
+            try:
+                self.world.destroy_body(self.die_body)
+            except Exception:
+                pass
+        self.die_body = self.world.create_body(
+            pos=(0.0, 0.0, self.collider_half),
+            rot=(0.0, 0.0, 0.0, 1.0),
+            size=(self.collider_half, self.collider_half, self.collider_half),
+            shape=culverin.SHAPE_BOX,
+            motion=culverin.MOTION_DYNAMIC,
+            mass=1.0,
+            friction=0.58,
+            restitution=0.30,
+            ccd=True,
+        )
+
+    def roll(self):
+        if self.animating or self.die_body is None:
+            return
+
+        # Recreate the body for each throw. This avoids depending on private velocity
+        # setters and gives every roll a clean Jolt rigid-body state.
+        try:
+            self.world.destroy_body(self.die_body)
+        except Exception:
+            pass
+
+        quat = self._quat_from_euler(
+            random.uniform(-math.pi, math.pi),
+            random.uniform(-math.pi, math.pi),
+            random.uniform(-math.pi, math.pi),
+        )
+
+        self.die_body = self.world.create_body(
+            pos=(
+                random.uniform(-0.90, -0.48),
+                random.uniform(-0.28, 0.28),
+                random.uniform(3.9, 4.6),
+            ),
+            rot=quat,
+            size=(self.collider_half, self.collider_half, self.collider_half),
+            shape=culverin.SHAPE_BOX,
+            motion=culverin.MOTION_DYNAMIC,
+            mass=1.0,
+            friction=0.58,
+            restitution=0.30,
+            ccd=True,
+        )
+
+        # Linear impulse (mass=1) approximates the desired launch velocity.
+        self.world.apply_impulse(
+            self.die_body,
+            random.uniform(0.95, 1.45),
+            random.uniform(-0.30, 0.36),
+            random.uniform(-0.28, -0.06),
+        )
+        # Angular impulse gives natural spin; Jolt owns all later angular momentum.
+        self.world.apply_angular_impulse(
+            self.die_body,
+            random.uniform(0.050, 0.085),
+            random.uniform(-0.082, -0.048),
+            random.uniform(0.030, 0.060),
+        )
+
+        self.physics_accumulator = 0.0
+        self.sleep_time = 0.0
+        self.unstable_time = 0.0
         self.last_tick = time.perf_counter()
         self.animating = True
         self._timer.start()
-        self._apply_transform()
+        self._apply_transform_from_world()
 
     def _tick(self):
         if not self.animating:
             return
+
         now = time.perf_counter()
-        # Sub-stepping prevents fast falls from tunneling through the tabletop.
-        frame_dt = max(0.001, min(0.034, now - self.last_tick))
+        frame_dt = max(0.001, min(0.05, now - self.last_tick))
         self.last_tick = now
-        remaining = frame_dt
-        while remaining > 1e-6:
-            dt = min(0.008, remaining)
-            remaining -= dt
-            self._integrate(dt)
-        self._apply_transform()
+        self.physics_accumulator += frame_dt
 
-        # Settle after several damped contacts. A safety timeout avoids rare endless rolls.
-        speed = math.sqrt(sum(v*v for v in self.vel))
-        spin = math.sqrt(sum(a*a for a in self.ang))
-        grounded = self.pos[2] <= self.half + 0.003
-        if grounded and speed < 0.12 and spin < 18.0:
-            self.settle_time += frame_dt
+        max_steps = 14
+        steps = 0
+        while self.physics_accumulator >= self.physics_dt and steps < max_steps:
+            self._physics_step()
+            self.physics_accumulator -= self.physics_dt
+            steps += 1
+
+        self._apply_transform_from_world()
+
+        pos = self.world.get_position(self.die_body)
+        quat = self.world.get_rotation(self.die_body)
+        lv = self.world.get_velocity(self.die_body)
+        av = self.world.get_angular_velocity(self.die_body)
+        if not pos or not quat or not lv or not av:
+            return
+
+        linear_speed = math.sqrt(sum(float(v)*float(v) for v in lv))
+        angular_speed = math.sqrt(sum(float(v)*float(v) for v in av))
+        flatness = self._flatness(quat)
+
+        support = self._support_height(quat)
+        grounded = float(pos[2]) <= support + 0.010
+
+        if grounded and linear_speed < 0.055 and angular_speed < 0.17 and flatness > 0.996:
+            self.sleep_time += frame_dt
         else:
-            self.settle_time = 0.0
+            self.sleep_time = max(0.0, self.sleep_time - frame_dt * 2.2)
 
-        if self.settle_time > 0.42 or self.sim_time > 7.0:
+        if self.sleep_time > 0.46:
+            # Jolt has already physically settled the orientation; we merely end the
+            # UI animation. No orientation snap is performed.
+            self.result = self._top_face_value(quat)
             self.animating = False
-            self.pos[2] = self.half
-            self.vel = [0.0, 0.0, 0.0]
-            self.ang = [0.0, 0.0, 0.0]
-            self._orient_to_result(self.result)
-            self._apply_transform()
             self._timer.stop()
             self.rollFinished.emit(self.result)
 
-    def _integrate(self, dt):
-        self.sim_time += dt
-        # Airborne dynamics.
-        self.vel[2] += self.gravity * dt
-        self.vel[0] *= self.air_drag
-        self.vel[1] *= self.air_drag
-        for i in range(3):
-            self.pos[i] += self.vel[i] * dt
-            self.rot[i] += self.ang[i] * dt
+    def _physics_step(self):
+        pos = self.world.get_position(self.die_body)
+        quat = self.world.get_rotation(self.die_body)
+        lv = self.world.get_velocity(self.die_body)
+        av = self.world.get_angular_velocity(self.die_body)
 
-        # Plane collision using the die's conservative half-extent. The energy loss,
-        # tangential friction and angular impulse create visibly different bounces.
-        if self.pos[2] < self.half:
-            penetration = self.half - self.pos[2]
-            self.pos[2] = self.half + min(0.025, penetration * 0.15)
-            impact = -self.vel[2]
-            if impact > 0.18:
-                self.vel[2] = impact * random.uniform(self.restitution*0.91, self.restitution*1.05)
-                self.vel[0] *= random.uniform(self.surface_friction*0.92, self.surface_friction*1.03)
-                self.vel[1] *= random.uniform(self.surface_friction*0.92, self.surface_friction*1.03)
-                # Couple translation to spin at impact, approximating edge/corner contact.
-                self.ang[0] = self.ang[0]*random.uniform(.67,.79) + self.vel[1]*38 + random.uniform(-30,30)
-                self.ang[1] = self.ang[1]*random.uniform(.67,.79) - self.vel[0]*42 + random.uniform(-30,30)
-                self.ang[2] *= random.uniform(.72,.84)
-                self.vel[0] += random.uniform(-.11,.11)
-                self.vel[1] += random.uniform(-.10,.10)
-                self.bounce_count += 1
+        if pos and quat and lv and av:
+            linear_speed = math.sqrt(sum(float(v)*float(v) for v in lv))
+            angular_speed = math.sqrt(sum(float(v)*float(v) for v in av))
+            flatness = self._flatness(quat)
+            support = self._support_height(quat)
+            grounded = float(pos[2]) <= support + 0.012
+
+            # Tiny physical imperfection to eliminate measure-zero edge/corner
+            # equilibria of a mathematically perfect cube. It only activates when
+            # the body is nearly motionless and not face-flat.
+            if grounded and flatness < 0.992 and linear_speed < 0.12 and angular_speed < 0.32:
+                self.unstable_time += self.physics_dt
+                if self.unstable_time > 0.10:
+                    t = time.perf_counter()
+                    self.world.apply_torque(
+                        self.die_body,
+                        0.00020 * math.sin(t * 17.1),
+                        0.00017 * math.cos(t * 13.7),
+                        0.00008 * math.sin(t * 9.3),
+                    )
             else:
-                self.vel[2] = 0.0
-                self.vel[0] *= self.rolling_drag
-                self.vel[1] *= self.rolling_drag
-                self.ang[0] *= .86
-                self.ang[1] *= .86
-                self.ang[2] *= .82
+                self.unstable_time = 0.0
 
-        # Keep the die in the visible tabletop area using soft side bounces.
-        for axis, limit in ((0, 3.8), (1, 2.55)):
-            if self.pos[axis] > limit:
-                self.pos[axis] = limit
-                self.vel[axis] *= -.34
-            elif self.pos[axis] < -limit:
-                self.pos[axis] = -limit
-                self.vel[axis] *= -.34
+        self.world.step(self.physics_dt)
 
-    def _orient_to_result(self, value):
-        # Final readable orientations corresponding to the generated face numbering.
-        orientations = {
-            1: (0.0, 0.0, 0.0),
-            6: (180.0, 0.0, 0.0),
-            3: (0.0, -90.0, 0.0),
-            4: (0.0, 90.0, 0.0),
-            2: (90.0, 0.0, 0.0),
-            5: (-90.0, 0.0, 0.0),
-        }
-        self.rot = list(orientations[value])
-
-    def _apply_transform(self):
-        if self.die_mesh is None:
+    def _apply_transform_from_world(self):
+        if self.die_mesh is None or self.die_body is None:
             return
+
+        pos = self.world.get_position(self.die_body)
+        quat = self.world.get_rotation(self.die_body)
+        if not pos or not quat:
+            return
+
+        # Culverin/Jolt quaternion order is x, y, z, w; Qt takes w, x, y, z.
+        q = QQuaternion(float(quat[3]), float(quat[0]), float(quat[1]), float(quat[2]))
         m = QMatrix4x4()
-        m.translate(self.pos[0], self.pos[1], self.pos[2])
-        m.rotate(self.rot[2], 0, 0, 1)
-        m.rotate(self.rot[1], 0, 1, 0)
-        m.rotate(self.rot[0], 1, 0, 0)
+        m.translate(float(pos[0]), float(pos[1]), float(pos[2]))
+        m.rotate(q)
+
         self.die_mesh.setTransform(m)
+        if self.pip_mesh is not None:
+            self.pip_mesh.setTransform(m)
 
 
 class DicePage(QWidget):
@@ -3457,8 +3703,8 @@ class DicePage(QWidget):
         kicker.setObjectName("kicker")
         title = QLabel(TXT("骰子", "Dice"))
         title.setObjectName("pageTitle")
-        desc = QLabel(TXT("实体 OpenGL 骰子：从空中自由落体，碰撞桌面后自然弹跳、滚动并逐渐停止。",
-                          "Physical OpenGL die: free-falls from the air, then bounces, rolls, and settles naturally on the table."))
+        desc = QLabel(TXT("实体 OpenGL 骰子：渲染与碰撞体分离，弹跳、摩擦和角动量由开源 Jolt Physics（Culverin）刚体引擎计算。",
+                          "Physical OpenGL die: rendering is separated from its collider; bounce, friction, and angular momentum are solved by the open-source Jolt Physics engine through Culverin."))
         desc.setObjectName("pageDesc")
         desc.setWordWrap(True)
         text_col.addWidget(kicker)
