@@ -3,15 +3,30 @@ import math
 import random
 import time
 import re
+import os
+import io
+import json
+import shutil
+import zipfile
+import hashlib
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QRectF, QPointF, Signal, QSize, QTimer, QEvent
-from PySide6.QtGui import QColor, QPainter, QPen, QBrush, QFont, QPainterPath, QPixmap, QIntValidator, QMatrix4x4, QVector3D, QQuaternion, QImage
+from PySide6.QtCore import Qt, QRectF, QPointF, Signal, QSize, QTimer, QEvent, QUrl, QSettings
+from PySide6.QtGui import QColor, QPainter, QPen, QBrush, QFont, QPainterPath, QPixmap, QIntValidator, QMatrix4x4, QVector3D, QQuaternion, QImage, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel,
     QPushButton, QFrame, QButtonGroup, QStackedWidget, QSizePolicy,
-    QGraphicsDropShadowEffect, QLineEdit, QCheckBox, QComboBox, QGridLayout, QScrollArea, QBoxLayout, QProgressBar, QSlider
+    QGraphicsDropShadowEffect, QLineEdit, QCheckBox, QComboBox, QGridLayout, QScrollArea, QBoxLayout, QProgressBar, QSlider, QFontComboBox, QSpinBox, QColorDialog
 )
+
+from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+
+try:
+    from mutagen import File as MutagenFile
+    MUTAGEN_AVAILABLE = True
+except Exception:
+    MutagenFile = None
+    MUTAGEN_AVAILABLE = False
 
 try:
     import numpy as np
@@ -38,7 +53,7 @@ except Exception as exc:
     JOLT_ERROR = str(exc)
 
 APP_NAME = "5imp1e 5atebox"
-APP_VERSION = "0.14.8"
+APP_VERSION = "0.16.0"
 APP_SETTINGS = {
     "language": "zh",
     "mark_back": False,
@@ -78,6 +93,9 @@ def qt_key_name(key):
 
 BASE_DIR = Path(__file__).resolve().parent
 RESOURCE_DIR = BASE_DIR / "resource"
+# NOTE: when an EXE build is introduced, this path abstraction is the only place
+# that needs to change for the music library location.
+MUSIC_LIBRARY_DIR = RESOURCE_DIR / "music_lyrics"
 
 
 if OPENGL_3D_AVAILABLE:
@@ -2910,7 +2928,7 @@ class ClassicTarotPage(QWidget):
         choose_title = QLabel(TXT("选择经典牌阵", "Choose a Classic Spread"))
         choose_title.setObjectName("pageTitle")
         choose_desc = QLabel(TXT(
-            "先选择牌阵。选择后才会进入独立牌桌页面；每个模块会直观展示牌阵的结构或特色。",
+            "选择一个牌阵开始占卜。",
             "Choose a spread first. The reading table opens on a separate page only after selection; each module previews the spread's structure or signature."
         ))
         choose_desc.setObjectName("pageDesc")
@@ -4792,8 +4810,8 @@ class DicePage(QWidget):
         title = QLabel(TXT("骰子", "Dice"))
         title.setObjectName("pageTitle")
         desc = QLabel(TXT(
-            "当前仅开放 D6。一次可同时投掷 1–100 个实体骰子，可调节投放高度并在圆形桌面上同时碰撞；单个骰子连续跌落并恢复 10 次后会被弃用且不计入结果。",
-            "Only D6 is currently available. Roll 1–100 physical dice at once with adjustable release height on a circular table; a die that requires 10 fall recoveries is discarded and excluded from results."
+            "目前仅开放 D6 骰子。可调整数量与投放高度后开始投掷。",
+            "Only D6 dice are currently available. Adjust the quantity and release height, then roll."
         ))
         desc.setObjectName("pageDesc")
         desc.setWordWrap(True)
@@ -5293,6 +5311,975 @@ class SettingsPage(QWidget):
         self.settingsChanged.emit()
 
 
+
+AUDIO_EXTENSIONS = {".mp3", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".opus", ".wma"}
+LYRIC_EXTENSIONS = {".lrc", ".lyc"}
+
+
+def _format_ms(ms):
+    ms = max(0, int(ms or 0))
+    sec = ms // 1000
+    return f"{sec // 60}:{sec % 60:02d}"
+
+
+def _safe_extract_zip(zip_path, out_dir):
+    """Extract a zip without allowing path traversal."""
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    root = out_dir.resolve()
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        for member in zf.infolist():
+            target = (out_dir / member.filename).resolve()
+            try:
+                target.relative_to(root)
+            except ValueError:
+                continue
+            if member.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(member, "r") as src_f, open(target, "wb") as dst_f:
+                shutil.copyfileobj(src_f, dst_f)
+
+
+def _metadata_text(easy_tags, key, default=""):
+    if not easy_tags:
+        return default
+    value = easy_tags.get(key)
+    if not value:
+        return default
+    if isinstance(value, (list, tuple)):
+        return str(value[0]) if value else default
+    return str(value)
+
+
+def _extract_cover_bytes(raw_audio):
+    if raw_audio is None:
+        return None
+    try:
+        pictures = getattr(raw_audio, "pictures", None)
+        if pictures:
+            return bytes(pictures[0].data)
+    except Exception:
+        pass
+
+    tags = getattr(raw_audio, "tags", None)
+    if tags is None:
+        return None
+
+    try:
+        if hasattr(tags, "getall"):
+            apic = tags.getall("APIC")
+            if apic:
+                return bytes(apic[0].data)
+    except Exception:
+        pass
+
+    try:
+        covr = tags.get("covr")
+        if covr:
+            return bytes(covr[0])
+    except Exception:
+        pass
+
+    return None
+
+
+def _read_track_info(path):
+    path = Path(path)
+    info = {
+        "path": path,
+        "title": path.stem,
+        "artist": TXT("未知艺术家", "Unknown Artist"),
+        "album": "",
+        "track": "",
+        "year": "",
+        "duration_ms": 0,
+        "cover_bytes": None,
+        "cover_desc": TXT("无", "None"),
+        "lyrics": [],
+    }
+    if not MUTAGEN_AVAILABLE:
+        return info
+
+    try:
+        easy = MutagenFile(str(path), easy=True)
+        if easy is not None:
+            tags = getattr(easy, "tags", None) or {}
+            info["title"] = _metadata_text(tags, "title", path.stem)
+            info["artist"] = _metadata_text(tags, "artist", info["artist"])
+            info["album"] = _metadata_text(tags, "album", "")
+            info["track"] = _metadata_text(tags, "tracknumber", "")
+            info["year"] = _metadata_text(tags, "date", "")
+            length = getattr(getattr(easy, "info", None), "length", 0) or 0
+            info["duration_ms"] = int(float(length) * 1000)
+    except Exception:
+        pass
+
+    try:
+        raw = MutagenFile(str(path), easy=False)
+        cover = _extract_cover_bytes(raw)
+        if cover:
+            info["cover_bytes"] = cover
+            info["cover_desc"] = TXT("内嵌封面", "Embedded")
+    except Exception:
+        pass
+    return info
+
+
+def _parse_lrc(path):
+    rows = []
+    if not path or not Path(path).exists():
+        return rows
+    try:
+        raw = Path(path).read_text(encoding="utf-8-sig", errors="replace")
+    except Exception:
+        return rows
+
+    stamp_re = re.compile(r"\[(\d{1,3}):(\d{2})(?:[.:](\d{1,3}))?\]")
+    for line in raw.splitlines():
+        stamps = list(stamp_re.finditer(line))
+        if not stamps:
+            continue
+        lyric = stamp_re.sub("", line).strip()
+        for m in stamps:
+            minutes = int(m.group(1))
+            seconds = int(m.group(2))
+            frac = m.group(3) or "0"
+            if len(frac) == 1:
+                frac_ms = int(frac) * 100
+            elif len(frac) == 2:
+                frac_ms = int(frac) * 10
+            else:
+                frac_ms = int(frac[:3])
+            rows.append((minutes * 60000 + seconds * 1000 + frac_ms, lyric))
+    rows.sort(key=lambda x: x[0])
+    return rows
+
+
+class MusicTrackRow(QFrame):
+    clicked = Signal(int)
+
+    def __init__(self, index, track, cover_pixmap, parent=None):
+        super().__init__(parent)
+        self.index = index
+        self.setCursor(Qt.PointingHandCursor)
+        self.setObjectName("musicTrackRow")
+        self.setStyleSheet("""
+            QFrame#musicTrackRow {
+                background: transparent;
+                border: 0;
+                border-radius: 8px;
+            }
+            QFrame#musicTrackRow:hover {
+                background: rgba(255,255,255,0.045);
+            }
+        """)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(8, 7, 8, 7)
+        lay.setSpacing(10)
+
+        cover = QLabel()
+        cover.setFixedSize(48, 48)
+        cover.setPixmap(cover_pixmap.scaled(48, 48, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation))
+        cover.setStyleSheet("border-radius: 6px;")
+        lay.addWidget(cover)
+
+        words = QVBoxLayout()
+        words.setSpacing(1)
+        title = QLabel(track["title"])
+        title.setStyleSheet("font-size: 14px; font-weight: 650; color: #ededed;")
+        artist = QLabel(track["artist"])
+        artist.setStyleSheet("font-size: 12px; color: #919191;")
+        title.setTextInteractionFlags(Qt.NoTextInteraction)
+        artist.setTextInteractionFlags(Qt.NoTextInteraction)
+        words.addWidget(title)
+        words.addWidget(artist)
+        lay.addLayout(words, 1)
+
+        duration = QLabel(_format_ms(track["duration_ms"]))
+        duration.setStyleSheet("color:#969696; font-size:12px;")
+        duration.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        lay.addWidget(duration)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit(self.index)
+        super().mousePressEvent(event)
+
+
+class DesktopLyricsWindow(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(None)
+        self.setWindowFlags(
+            Qt.FramelessWindowHint
+            | Qt.Tool
+            | Qt.WindowStaysOnTopHint
+            | Qt.WindowTransparentForInput
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.label = QLabel("", self)
+        self.label.setAlignment(Qt.AlignCenter)
+        self.label.setWordWrap(True)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(26, 12, 26, 12)
+        lay.addWidget(self.label)
+
+        self.settings = {}
+        self._hue = 0
+        self.rainbow_timer = QTimer(self)
+        self.rainbow_timer.setInterval(55)
+        self.rainbow_timer.timeout.connect(self._advance_rainbow)
+        self.apply_settings({
+            "font_family": QApplication.font().family(),
+            "font_size": 30,
+            "font_weight": 700,
+            "text_color": "#ffffff",
+            "rainbow": False,
+            "background_enabled": False,
+            "background_color": "#000000",
+        })
+
+    def apply_settings(self, settings):
+        self.settings = dict(settings)
+        if self.settings.get("rainbow"):
+            self.rainbow_timer.start()
+        else:
+            self.rainbow_timer.stop()
+        self._apply_style()
+        self._reposition()
+
+    def _advance_rainbow(self):
+        self._hue = (self._hue + 3) % 360
+        self._apply_style()
+
+    def _apply_style(self):
+        font = QFont(self.settings.get("font_family", QApplication.font().family()))
+        font.setPointSize(int(self.settings.get("font_size", 30)))
+        font.setWeight(QFont.Weight(int(self.settings.get("font_weight", 700))))
+        self.label.setFont(font)
+
+        if self.settings.get("rainbow"):
+            color = QColor.fromHsv(self._hue, 220, 255).name()
+        else:
+            color = self.settings.get("text_color", "#ffffff")
+
+        if self.settings.get("background_enabled"):
+            bg = QColor(self.settings.get("background_color", "#000000"))
+            bg_rgba = f"rgba({bg.red()},{bg.green()},{bg.blue()},170)"
+        else:
+            bg_rgba = "rgba(0,0,0,0)"
+
+        self.label.setStyleSheet(
+            f"color:{color}; background:{bg_rgba}; border-radius:10px; padding:8px 16px;"
+        )
+
+    def set_lyric(self, text):
+        self.label.setText(text or "")
+        if self.isVisible():
+            self._reposition()
+
+    def _reposition(self):
+        screen = QApplication.primaryScreen()
+        if not screen:
+            return
+        geo = screen.availableGeometry()
+        width = max(520, int(geo.width() * 0.72))
+        height = 92
+        self.resize(width, height)
+        self.move(
+            geo.x() + (geo.width() - width) // 2,
+            geo.y() + geo.height() - height - 34,
+        )
+
+
+class MusicPage(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.library_dir = MUSIC_LIBRARY_DIR
+        self.library_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_dir = self.library_dir / ".music_cache"
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        self.tracks = []
+        self.current_index = -1
+        self.current_lyrics = []
+        self.current_lyric_index = -1
+        self._seeking = False
+
+        self.settings_store = QSettings("5imp1e 5atebox", "Music")
+        self.desktop_lyrics = DesktopLyricsWindow(self)
+
+        self.player = QMediaPlayer(self)
+        self.audio = QAudioOutput(self)
+        self.audio.setVolume(0.82)
+        self.player.setAudioOutput(self.audio)
+        self.player.positionChanged.connect(self._position_changed)
+        self.player.durationChanged.connect(self._duration_changed)
+        self.player.playbackStateChanged.connect(self._play_state_changed)
+        self.player.mediaStatusChanged.connect(self._media_status_changed)
+
+        self._build_ui()
+        self._load_customization()
+        QTimer.singleShot(0, self.reload_library)
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(28, 22, 28, 22)
+        root.setSpacing(12)
+
+        top = QHBoxLayout()
+        title = QLabel(TXT("听点音乐？", "Listen to some music?"))
+        title.setObjectName("pageTitle")
+        top.addWidget(title)
+        top.addStretch(1)
+
+        self.desktop_btn = QPushButton(TXT("桌面歌词", "Desktop Lyrics"))
+        self.desktop_btn.setCheckable(True)
+        self.desktop_btn.setObjectName("chipButton")
+        self.desktop_btn.toggled.connect(self._toggle_desktop_lyrics)
+        top.addWidget(self.desktop_btn)
+
+        self.refresh_btn = QPushButton(TXT("刷新音乐", "Refresh"))
+        self.refresh_btn.setObjectName("chipButton")
+        self.refresh_btn.clicked.connect(self.reload_library)
+        top.addWidget(self.refresh_btn)
+
+        self.settings_btn = QPushButton(TXT("音乐设置", "Music Settings"))
+        self.settings_btn.setCheckable(True)
+        self.settings_btn.setObjectName("chipButton")
+        self.settings_btn.toggled.connect(self._toggle_settings)
+        top.addWidget(self.settings_btn)
+        root.addLayout(top)
+
+        self.main_stack = QStackedWidget()
+        root.addWidget(self.main_stack, 1)
+        self.main_stack.addWidget(self._build_player_view())
+        self.main_stack.addWidget(self._build_settings_view())
+
+    def _build_player_view(self):
+        page = QWidget()
+        main = QHBoxLayout(page)
+        main.setContentsMargins(0, 0, 0, 0)
+        main.setSpacing(18)
+
+        # Left playlist
+        left = QFrame()
+        left.setMinimumWidth(300)
+        left.setMaximumWidth(380)
+        left.setStyleSheet("QFrame { background:#0c0c0c; border:1px solid #181818; border-radius:10px; }")
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(10, 10, 10, 10)
+        ll.setSpacing(7)
+
+        label = QLabel(TXT("歌单", "Playlist"))
+        label.setStyleSheet("font-size:15px; font-weight:700; color:#dddddd;")
+        ll.addWidget(label)
+
+        self.scan_status = QLabel("")
+        self.scan_status.setStyleSheet("color:#777; font-size:11px;")
+        self.scan_status.setWordWrap(True)
+        ll.addWidget(self.scan_status)
+
+        self.playlist_scroll = QScrollArea()
+        self.playlist_scroll.setWidgetResizable(True)
+        self.playlist_scroll.setFrameShape(QFrame.NoFrame)
+        self.playlist_host = QWidget()
+        self.playlist_layout = QVBoxLayout(self.playlist_host)
+        self.playlist_layout.setContentsMargins(0, 0, 0, 0)
+        self.playlist_layout.setSpacing(3)
+        self.playlist_layout.addStretch(1)
+        self.playlist_scroll.setWidget(self.playlist_host)
+        ll.addWidget(self.playlist_scroll, 1)
+        main.addWidget(left)
+
+        # Right detail / lyrics / transport
+        right = QFrame()
+        right.setStyleSheet("QFrame { background:#090909; border:1px solid #171717; border-radius:10px; }")
+        rl = QVBoxLayout(right)
+        rl.setContentsMargins(20, 18, 20, 18)
+        rl.setSpacing(12)
+
+        header = QHBoxLayout()
+        info_box = QWidget()
+        info_grid = QGridLayout(info_box)
+        info_grid.setContentsMargins(0, 0, 0, 0)
+        info_grid.setHorizontalSpacing(12)
+        info_grid.setVerticalSpacing(6)
+
+        self.detail_values = {}
+        details = [
+            ("Title", TXT("歌名", "Title")),
+            ("Artist", TXT("艺术家", "Artist")),
+            ("Album", TXT("专辑名", "Album")),
+            ("Track", TXT("曲目编号", "Track")),
+            ("Year", TXT("年份", "Year")),
+            ("Cover", TXT("封面", "Cover")),
+        ]
+        for row, (key, zhlabel) in enumerate(details):
+            lab = QLabel(f"{zhlabel}:")
+            lab.setStyleSheet("color:#7f7f7f; font-size:12px;")
+            val = QLabel("—")
+            val.setStyleSheet("color:#d7d7d7; font-size:12px;")
+            val.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            info_grid.addWidget(lab, row, 0)
+            info_grid.addWidget(val, row, 1)
+            self.detail_values[key] = val
+        header.addWidget(info_box, 1)
+
+        now = QVBoxLayout()
+        now.setAlignment(Qt.AlignRight | Qt.AlignTop)
+        self.hero_cover = QLabel()
+        self.hero_cover.setFixedSize(132, 132)
+        self.hero_cover.setAlignment(Qt.AlignCenter)
+        self.hero_cover.setStyleSheet("background:#121212; border:1px solid #252525; border-radius:10px;")
+        now.addWidget(self.hero_cover, 0, Qt.AlignRight)
+        self.hero_title = QLabel(TXT("未选择歌曲", "No track selected"))
+        self.hero_title.setAlignment(Qt.AlignRight)
+        self.hero_title.setWordWrap(True)
+        self.hero_title.setMaximumWidth(260)
+        self.hero_title.setStyleSheet("font-size:17px; font-weight:700; color:#eeeeee;")
+        now.addWidget(self.hero_title, 0, Qt.AlignRight)
+        self.hero_artist = QLabel("")
+        self.hero_artist.setAlignment(Qt.AlignRight)
+        self.hero_artist.setStyleSheet("color:#888; font-size:12px;")
+        now.addWidget(self.hero_artist, 0, Qt.AlignRight)
+        header.addLayout(now)
+        rl.addLayout(header)
+
+        # Large lyric roller area between metadata and transport.
+        lyric_frame = QFrame()
+        lyric_frame.setStyleSheet("QFrame { background:#070707; border:0; }")
+        lyric_lay = QVBoxLayout(lyric_frame)
+        lyric_lay.setContentsMargins(30, 12, 30, 12)
+        lyric_lay.setSpacing(4)
+
+        self.lyric_labels = []
+        for i in range(7):
+            lbl = QLabel("")
+            lbl.setAlignment(Qt.AlignCenter)
+            lbl.setWordWrap(True)
+            lbl.setMinimumHeight(34 if i != 3 else 50)
+            self.lyric_labels.append(lbl)
+            lyric_lay.addWidget(lbl)
+        rl.addWidget(lyric_frame, 1)
+
+        transport = QFrame()
+        transport.setStyleSheet("QFrame { background:#0d0d0d; border:1px solid #181818; border-radius:9px; }")
+        tl = QVBoxLayout(transport)
+        tl.setContentsMargins(14, 10, 14, 10)
+        tl.setSpacing(7)
+
+        time_row = QHBoxLayout()
+        self.current_time = QLabel("0:00")
+        self.current_time.setStyleSheet("color:#777; font-size:11px;")
+        self.total_time = QLabel("0:00")
+        self.total_time.setStyleSheet("color:#777; font-size:11px;")
+        self.progress = QSlider(Qt.Horizontal)
+        self.progress.setRange(0, 1000)
+        self.progress.sliderPressed.connect(self._seek_started)
+        self.progress.sliderReleased.connect(self._seek_finished)
+        time_row.addWidget(self.current_time)
+        time_row.addWidget(self.progress, 1)
+        time_row.addWidget(self.total_time)
+        tl.addLayout(time_row)
+
+        controls = QHBoxLayout()
+        controls.addStretch(1)
+        self.prev_btn = QPushButton("◀")
+        self.prev_btn.setFixedSize(38, 34)
+        self.prev_btn.clicked.connect(self._previous)
+        self.play_btn = QPushButton("▶")
+        self.play_btn.setFixedSize(52, 38)
+        self.play_btn.clicked.connect(self._toggle_play)
+        self.next_btn = QPushButton("▶")
+        self.next_btn.setFixedSize(38, 34)
+        self.next_btn.clicked.connect(self._next)
+        for b in (self.prev_btn, self.play_btn, self.next_btn):
+            b.setObjectName("chipButton")
+        controls.addWidget(self.prev_btn)
+        controls.addWidget(self.play_btn)
+        controls.addWidget(self.next_btn)
+
+        controls.addSpacing(14)
+        vol = QLabel(TXT("音量", "Vol"))
+        vol.setStyleSheet("color:#777; font-size:11px;")
+        controls.addWidget(vol)
+        self.volume = QSlider(Qt.Horizontal)
+        self.volume.setRange(0, 100)
+        self.volume.setValue(82)
+        self.volume.setFixedWidth(110)
+        self.volume.valueChanged.connect(lambda v: self.audio.setVolume(v / 100.0))
+        controls.addWidget(self.volume)
+        tl.addLayout(controls)
+        rl.addWidget(transport)
+
+        main.addWidget(right, 1)
+        return page
+
+    def _build_settings_view(self):
+        page = QWidget()
+        outer = QHBoxLayout(page)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(16)
+
+        rail = QFrame()
+        rail.setFixedWidth(230)
+        rail.setStyleSheet("QFrame { background:#0b0b0b; border:1px solid #181818; border-radius:10px; }")
+        rlay = QVBoxLayout(rail)
+        rlay.setContentsMargins(12, 12, 12, 12)
+
+        heading = QLabel(TXT("音乐设置", "Music Settings"))
+        heading.setStyleSheet("font-size:17px; font-weight:700;")
+        rlay.addWidget(heading)
+
+        self.customize_nav = QPushButton(TXT("自定义", "Customize"))
+        self.customize_nav.setObjectName("chipButton")
+        self.customize_nav.setCheckable(True)
+        self.customize_nav.setChecked(True)
+        rlay.addWidget(self.customize_nav)
+
+        self.open_folder_btn = QPushButton(TXT("打开音乐文件所在位置", "Open Music Folder"))
+        self.open_folder_btn.setObjectName("chipButton")
+        self.open_folder_btn.clicked.connect(self._open_music_folder)
+        rlay.addWidget(self.open_folder_btn)
+        rlay.addStretch(1)
+        outer.addWidget(rail)
+
+        custom = QScrollArea()
+        custom.setWidgetResizable(True)
+        custom.setFrameShape(QFrame.NoFrame)
+        host = QWidget()
+        grid = QGridLayout(host)
+        grid.setContentsMargins(24, 18, 24, 18)
+        grid.setHorizontalSpacing(16)
+        grid.setVerticalSpacing(12)
+
+        title = QLabel(TXT("桌面歌词自定义", "Desktop Lyrics Customization"))
+        title.setStyleSheet("font-size:20px; font-weight:700;")
+        grid.addWidget(title, 0, 0, 1, 3)
+
+        row = 1
+        grid.addWidget(QLabel(TXT("字幕大小", "Subtitle Size")), row, 0)
+        self.font_size_spin = QSpinBox()
+        self.font_size_spin.setRange(14, 72)
+        self.font_size_spin.setSuffix(" pt")
+        self.font_size_spin.valueChanged.connect(self._customization_changed)
+        grid.addWidget(self.font_size_spin, row, 1)
+        row += 1
+
+        grid.addWidget(QLabel(TXT("字体", "Font")), row, 0)
+        self.font_combo = QFontComboBox()
+        self.font_combo.currentFontChanged.connect(self._customization_changed)
+        grid.addWidget(self.font_combo, row, 1, 1, 2)
+        row += 1
+
+        grid.addWidget(QLabel(TXT("粗细", "Weight")), row, 0)
+        self.weight_combo = QComboBox()
+        self.weight_combo.addItem(TXT("常规", "Regular"), 400)
+        self.weight_combo.addItem(TXT("中等", "Medium"), 500)
+        self.weight_combo.addItem(TXT("粗体", "Bold"), 700)
+        self.weight_combo.addItem(TXT("特粗", "Extra Bold"), 800)
+        self.weight_combo.currentIndexChanged.connect(self._customization_changed)
+        grid.addWidget(self.weight_combo, row, 1)
+        row += 1
+
+        grid.addWidget(QLabel(TXT("字幕颜色", "Subtitle Color")), row, 0)
+        color_row = QHBoxLayout()
+
+        self.rgb_r = QSpinBox()
+        self.rgb_g = QSpinBox()
+        self.rgb_b = QSpinBox()
+        for prefix, spin in (("R", self.rgb_r), ("G", self.rgb_g), ("B", self.rgb_b)):
+            spin.setRange(0, 255)
+            spin.setPrefix(prefix + " ")
+            spin.setFixedWidth(76)
+            spin.valueChanged.connect(self._rgb_changed)
+            color_row.addWidget(spin)
+
+        self.text_color_edit = QLineEdit("#ffffff")
+        self.text_color_edit.setFixedWidth(92)
+        self.text_color_edit.editingFinished.connect(self._hex_color_changed)
+        color_row.addWidget(self.text_color_edit)
+
+        self.text_color_btn = QPushButton(TXT("色轮", "Color Wheel"))
+        self.text_color_btn.setObjectName("chipButton")
+        self.text_color_btn.clicked.connect(self._choose_text_color)
+        color_row.addWidget(self.text_color_btn)
+
+        self.rainbow_check = QCheckBox(TXT("彩虹模式", "Rainbow"))
+        self.rainbow_check.toggled.connect(self._customization_changed)
+        color_row.addWidget(self.rainbow_check)
+        color_row.addStretch(1)
+        grid.addLayout(color_row, row, 1, 1, 2)
+        row += 1
+
+        grid.addWidget(QLabel(TXT("字幕背景", "Subtitle Background")), row, 0)
+        bg_row = QHBoxLayout()
+        self.bg_enable = QCheckBox(TXT("启用背景", "Enable Background"))
+        self.bg_enable.toggled.connect(self._customization_changed)
+        self.bg_color_edit = QLineEdit("#000000")
+        self.bg_color_edit.setFixedWidth(100)
+        self.bg_color_edit.editingFinished.connect(self._customization_changed)
+        self.bg_color_btn = QPushButton(TXT("背景色轮", "Background Color"))
+        self.bg_color_btn.setObjectName("chipButton")
+        self.bg_color_btn.clicked.connect(self._choose_bg_color)
+        bg_row.addWidget(self.bg_enable)
+        bg_row.addWidget(self.bg_color_edit)
+        bg_row.addWidget(self.bg_color_btn)
+        bg_row.addStretch(1)
+        grid.addLayout(bg_row, row, 1, 1, 2)
+        row += 1
+
+        note = QLabel(TXT(
+            "默认背景为透明。RGB/十六进制颜色与色轮可同时使用；开启彩虹模式后字幕颜色会持续变化。",
+            "Background is transparent by default. Hex/RGB-style color entry and the color wheel can be used together; Rainbow mode continuously cycles lyric color."
+        ))
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#787878; font-size:12px;")
+        grid.addWidget(note, row, 0, 1, 3)
+        row += 1
+        grid.setRowStretch(row, 1)
+
+        custom.setWidget(host)
+        outer.addWidget(custom, 1)
+        return page
+
+    def _placeholder_cover(self):
+        pix = QPixmap(160, 160)
+        pix.fill(QColor("#151515"))
+        p = QPainter(pix)
+        p.setPen(QColor("#555555"))
+        f = QFont()
+        f.setPointSize(28)
+        f.setBold(True)
+        p.setFont(f)
+        p.drawText(pix.rect(), Qt.AlignCenter, "515")
+        p.end()
+        return pix
+
+    def _pixmap_for_track(self, track, size=160):
+        data = track.get("cover_bytes")
+        if data:
+            pix = QPixmap()
+            if pix.loadFromData(data):
+                return pix.scaled(size, size, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+        return self._placeholder_cover().scaled(size, size, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+
+    def _extract_archives_recursive(self):
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        queue = [
+            p for p in self.library_dir.rglob("*")
+            if p.is_file() and p.suffix.lower() == ".zip" and self.cache_dir not in p.parents
+        ]
+        seen = set()
+
+        while queue:
+            zp = queue.pop(0)
+            try:
+                stat = zp.stat()
+                signature = f"{zp.resolve()}|{stat.st_mtime_ns}|{stat.st_size}"
+            except Exception:
+                continue
+            digest = hashlib.sha1(signature.encode("utf-8", errors="ignore")).hexdigest()[:14]
+            if digest in seen:
+                continue
+            seen.add(digest)
+
+            out = self.cache_dir / digest
+            marker = out / ".source_signature"
+            needs_extract = True
+            if marker.exists():
+                try:
+                    needs_extract = marker.read_text(encoding="utf-8") != signature
+                except Exception:
+                    pass
+            if needs_extract:
+                if out.exists():
+                    shutil.rmtree(out, ignore_errors=True)
+                out.mkdir(parents=True, exist_ok=True)
+                try:
+                    _safe_extract_zip(zp, out)
+                    marker.write_text(signature, encoding="utf-8")
+                except Exception:
+                    continue
+
+            for nested in out.rglob("*.zip"):
+                queue.append(nested)
+
+    def reload_library(self):
+        self.scan_status.setText(TXT("正在读取音乐文件…", "Scanning music files…"))
+        QApplication.processEvents()
+
+        self._extract_archives_recursive()
+
+        all_files = [p for p in self.library_dir.rglob("*") if p.is_file()]
+        lyric_files = [p for p in all_files if p.suffix.lower() in LYRIC_EXTENSIONS]
+        audio_files = [p for p in all_files if p.suffix.lower() in AUDIO_EXTENSIONS]
+
+        # Same-folder LRC gets priority; otherwise fall back to any same-stem LRC.
+        by_stem = {}
+        for lp in lyric_files:
+            by_stem.setdefault(lp.stem.casefold(), []).append(lp)
+
+        tracks = []
+        for path in sorted(audio_files, key=lambda p: (p.name.casefold(), str(p).casefold())):
+            info = _read_track_info(path)
+            local_lrc = path.with_suffix(".lrc")
+            lrc = local_lrc if local_lrc.exists() else None
+            if lrc is None:
+                candidates = by_stem.get(path.stem.casefold(), [])
+                if candidates:
+                    lrc = candidates[0]
+            info["lyrics"] = _parse_lrc(lrc) if lrc else []
+            tracks.append(info)
+
+        self.tracks = tracks
+        self._rebuild_playlist()
+        self.scan_status.setText(TXT(
+            f"已读取 {len(tracks)} 首歌曲",
+            f"{len(tracks)} tracks loaded"
+        ))
+
+        if self.current_index >= len(self.tracks):
+            self.current_index = -1
+        if self.current_index < 0 and self.tracks:
+            self.select_track(0)
+
+    def _rebuild_playlist(self):
+        while self.playlist_layout.count() > 1:
+            item = self.playlist_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+
+        for i, track in enumerate(self.tracks):
+            row = MusicTrackRow(i, track, self._pixmap_for_track(track, 64))
+            row.clicked.connect(self.select_track)
+            self.playlist_layout.insertWidget(self.playlist_layout.count() - 1, row)
+
+    def select_track(self, index):
+        if index < 0 or index >= len(self.tracks):
+            return
+        self.current_index = index
+        track = self.tracks[index]
+        self.current_lyrics = track.get("lyrics", [])
+        self.current_lyric_index = -1
+        self.player.stop()
+        self.player.setSource(QUrl.fromLocalFile(str(track["path"])))
+
+        self.detail_values["Title"].setText(track["title"] or "—")
+        self.detail_values["Artist"].setText(track["artist"] or "—")
+        self.detail_values["Album"].setText(track["album"] or "—")
+        self.detail_values["Track"].setText(track["track"] or "—")
+        self.detail_values["Year"].setText(track["year"] or "—")
+        self.detail_values["Cover"].setText(track["cover_desc"] or "—")
+
+        self.hero_cover.setPixmap(self._pixmap_for_track(track, 132))
+        self.hero_title.setText(track["title"])
+        self.hero_artist.setText(track["artist"])
+        self.total_time.setText(_format_ms(track["duration_ms"]))
+        self.progress.setValue(0)
+        self.current_time.setText("0:00")
+        self._update_lyric_roller(-1)
+
+    def _toggle_play(self):
+        if self.current_index < 0 and self.tracks:
+            self.select_track(0)
+        if self.current_index < 0:
+            return
+        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.player.pause()
+        else:
+            self.player.play()
+
+    def _play_state_changed(self, state):
+        self.play_btn.setText("Ⅱ" if state == QMediaPlayer.PlaybackState.PlayingState else "▶")
+
+    def _next(self):
+        if not self.tracks:
+            return
+        nxt = (self.current_index + 1) % len(self.tracks)
+        self.select_track(nxt)
+        self.player.play()
+
+    def _previous(self):
+        if not self.tracks:
+            return
+        prev = (self.current_index - 1) % len(self.tracks)
+        self.select_track(prev)
+        self.player.play()
+
+    def _media_status_changed(self, status):
+        if status == QMediaPlayer.MediaStatus.EndOfMedia:
+            self._next()
+
+    def _duration_changed(self, duration):
+        self.total_time.setText(_format_ms(duration))
+
+    def _position_changed(self, pos):
+        if not self._seeking:
+            duration = self.player.duration()
+            if duration > 0:
+                self.progress.setValue(int(pos * 1000 / duration))
+        self.current_time.setText(_format_ms(pos))
+
+        idx = -1
+        for i, (stamp, _) in enumerate(self.current_lyrics):
+            if stamp <= pos:
+                idx = i
+            else:
+                break
+        if idx != self.current_lyric_index:
+            self.current_lyric_index = idx
+            self._update_lyric_roller(idx)
+
+    def _seek_started(self):
+        self._seeking = True
+
+    def _seek_finished(self):
+        self._seeking = False
+        duration = self.player.duration()
+        if duration > 0:
+            self.player.setPosition(int(duration * self.progress.value() / 1000))
+
+    def _update_lyric_roller(self, current):
+        if not self.current_lyrics:
+            texts = ["", "", "", TXT("暂无歌词", "No lyrics available"), "", "", ""]
+        else:
+            texts = []
+            for offset in range(-3, 4):
+                idx = current + offset
+                if current < 0:
+                    idx = offset + 3
+                if 0 <= idx < len(self.current_lyrics):
+                    texts.append(self.current_lyrics[idx][1])
+                else:
+                    texts.append("")
+
+        for i, (lbl, value) in enumerate(zip(self.lyric_labels, texts)):
+            lbl.setText(value)
+            dist = abs(i - 3)
+            if i == 3:
+                lbl.setStyleSheet("color:#f0f0f0; font-size:22px; font-weight:750; background:transparent; border:0;")
+            elif dist == 1:
+                lbl.setStyleSheet("color:#8d8d8d; font-size:16px; font-weight:550; background:transparent; border:0;")
+            elif dist == 2:
+                lbl.setStyleSheet("color:#565656; font-size:14px; background:transparent; border:0;")
+            else:
+                lbl.setStyleSheet("color:#343434; font-size:13px; background:transparent; border:0;")
+
+        current_text = texts[3] if len(texts) >= 4 else ""
+        self.desktop_lyrics.set_lyric(current_text)
+
+    def _toggle_desktop_lyrics(self, enabled):
+        if enabled:
+            self.desktop_lyrics.show()
+            self.desktop_lyrics.raise_()
+            self.desktop_lyrics._reposition()
+        else:
+            self.desktop_lyrics.hide()
+
+    def _toggle_settings(self, enabled):
+        self.main_stack.setCurrentIndex(1 if enabled else 0)
+        self.settings_btn.setText(
+            TXT("返回播放器", "Back to Player") if enabled else TXT("音乐设置", "Music Settings")
+        )
+
+    def _open_music_folder(self):
+        self.library_dir.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.library_dir.resolve())))
+
+    def _set_text_color_controls(self, color):
+        if not color.isValid():
+            return
+        widgets = (self.rgb_r, self.rgb_g, self.rgb_b)
+        for widget in widgets:
+            widget.blockSignals(True)
+        self.text_color_edit.blockSignals(True)
+        self.rgb_r.setValue(color.red())
+        self.rgb_g.setValue(color.green())
+        self.rgb_b.setValue(color.blue())
+        self.text_color_edit.setText(color.name())
+        self.text_color_edit.blockSignals(False)
+        for widget in widgets:
+            widget.blockSignals(False)
+
+    def _rgb_changed(self, *args):
+        color = QColor(self.rgb_r.value(), self.rgb_g.value(), self.rgb_b.value())
+        self.text_color_edit.blockSignals(True)
+        self.text_color_edit.setText(color.name())
+        self.text_color_edit.blockSignals(False)
+        self._customization_changed()
+
+    def _hex_color_changed(self):
+        color = QColor(self.text_color_edit.text())
+        if not color.isValid():
+            color = QColor("#ffffff")
+        self._set_text_color_controls(color)
+        self._customization_changed()
+
+    def _choose_text_color(self):
+        initial = QColor(self.text_color_edit.text())
+        color = QColorDialog.getColor(initial if initial.isValid() else QColor("#ffffff"), self)
+        if color.isValid():
+            self._set_text_color_controls(color)
+            self._customization_changed()
+
+    def _choose_bg_color(self):
+        initial = QColor(self.bg_color_edit.text())
+        color = QColorDialog.getColor(initial if initial.isValid() else QColor("#000000"), self)
+        if color.isValid():
+            self.bg_color_edit.setText(color.name())
+            self._customization_changed()
+
+    def _load_customization(self):
+        family = self.settings_store.value("font_family", QApplication.font().family())
+        size = int(self.settings_store.value("font_size", 30))
+        weight = int(self.settings_store.value("font_weight", 700))
+        text_color = str(self.settings_store.value("text_color", "#ffffff"))
+        rainbow = str(self.settings_store.value("rainbow", "false")).lower() == "true"
+        bg_enabled = str(self.settings_store.value("background_enabled", "false")).lower() == "true"
+        bg_color = str(self.settings_store.value("background_color", "#000000"))
+
+        self.font_combo.setCurrentFont(QFont(family))
+        self.font_size_spin.setValue(size)
+        idx = self.weight_combo.findData(weight)
+        self.weight_combo.setCurrentIndex(max(0, idx))
+        self._set_text_color_controls(QColor(text_color))
+        self.rainbow_check.setChecked(rainbow)
+        self.bg_enable.setChecked(bg_enabled)
+        self.bg_color_edit.setText(bg_color)
+        self._customization_changed()
+
+    def _customization_changed(self, *args):
+        color = QColor(self.text_color_edit.text())
+        text_color = color.name() if color.isValid() else "#ffffff"
+        bg = QColor(self.bg_color_edit.text())
+        bg_color = bg.name() if bg.isValid() else "#000000"
+
+        settings = {
+            "font_family": self.font_combo.currentFont().family(),
+            "font_size": self.font_size_spin.value(),
+            "font_weight": int(self.weight_combo.currentData() or 400),
+            "text_color": text_color,
+            "rainbow": self.rainbow_check.isChecked(),
+            "background_enabled": self.bg_enable.isChecked(),
+            "background_color": bg_color,
+        }
+
+        self.settings_store.setValue("font_family", settings["font_family"])
+        self.settings_store.setValue("font_size", settings["font_size"])
+        self.settings_store.setValue("font_weight", settings["font_weight"])
+        self.settings_store.setValue("text_color", settings["text_color"])
+        self.settings_store.setValue("rainbow", settings["rainbow"])
+        self.settings_store.setValue("background_enabled", settings["background_enabled"])
+        self.settings_store.setValue("background_color", settings["background_color"])
+        self.desktop_lyrics.apply_settings(settings)
+
+
+
 class PlaceholderPage(QWidget):
     def __init__(self, title, parent=None):
         super().__init__(parent)
@@ -5371,13 +6358,16 @@ class MainWindow(QMainWindow):
         sl.addSpacing(10)
 
         card_games = NavButton(TXT("卡牌游戏", "Card Games"), "▤")
+        music = NavButton(TXT("听点音乐？", "Listen to some music?"), "♪")
         settings = NavButton(TXT("设置", "Settings"), "⚙")
         about = NavButton(TXT("关于", "About"), "·")
         self.nav_group.addButton(card_games, 6)
-        self.nav_group.addButton(settings, 7)
-        self.nav_group.addButton(about, 8)
-        self.nav_buttons.extend([card_games, settings, about])
+        self.nav_group.addButton(music, 7)
+        self.nav_group.addButton(settings, 8)
+        self.nav_group.addButton(about, 9)
+        self.nav_buttons.extend([card_games, music, settings, about])
         sl.addWidget(card_games)
+        sl.addWidget(music)
         sl.addWidget(settings)
         sl.addWidget(about)
         sl.addStretch(1)
@@ -5428,6 +6418,8 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(PlaceholderPage(TXT("硬币", "Coin")))
         self.stack.addWidget(PlaceholderPage(TXT("抽签", "Lots")))
         self.stack.addWidget(PlaceholderPage(TXT("卡牌游戏", "Card Games")))
+        self.music_page = MusicPage()
+        self.stack.addWidget(self.music_page)
         self.settings_page = SettingsPage()
         self.settings_page.settingsChanged.connect(self._settings_changed)
         self.stack.addWidget(self.settings_page)
@@ -5523,14 +6515,25 @@ class MainWindow(QMainWindow):
 
     def _navigate(self, idx):
         self.stack.setCurrentIndex(idx)
-        names = [TXT("首页", "Home"), TXT("塔罗牌", "Tarot"), TXT("骰子", "Dice"), TXT("符文", "Runes"), TXT("硬币", "Coin"), TXT("抽签", "Lots"), TXT("卡牌游戏", "Card Games"), TXT("设置", "Settings"), TXT("关于", "About")]
+        names = [
+            TXT("首页", "Home"),
+            TXT("塔罗牌", "Tarot"),
+            TXT("骰子", "Dice"),
+            TXT("符文", "Runes"),
+            TXT("硬币", "Coin"),
+            TXT("抽签", "Lots"),
+            TXT("卡牌游戏", "Card Games"),
+            TXT("听点音乐？", "Listen to some music?"),
+            TXT("设置", "Settings"),
+            TXT("关于", "About"),
+        ]
         self.section_title.setText(names[idx])
         btn = self.nav_group.button(idx)
         if btn:
             btn.setChecked(True)
 
     def _settings_changed(self):
-        idx = self.stack.currentIndex() if hasattr(self, "stack") else 7
+        idx = self.stack.currentIndex() if hasattr(self, "stack") else 8
         new_lang = APP_SETTINGS.get("language", "zh")
         if new_lang == self._language:
             try:

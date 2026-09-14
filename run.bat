@@ -8,7 +8,7 @@ echo   5imp1e 5atebox / 515 launcher
 echo ==================================================
 echo.
 
-echo [1/5] Detecting Python...
+echo [1/6] Detecting Python...
 set "PY_CMD="
 where py >nul 2>nul
 if not errorlevel 1 set "PY_CMD=py -3"
@@ -32,7 +32,7 @@ if not defined PY_CMD (
 if errorlevel 1 goto :python_error
 
 echo.
-echo [2/5] Checking core UI dependency...
+echo [2/6] Checking core UI dependency...
 %PY_CMD% -c "import PySide6" >nul 2>nul
 if errorlevel 1 (
     echo PySide6 not found. Installing...
@@ -43,7 +43,7 @@ if errorlevel 1 (
 )
 
 echo.
-echo [3/5] Checking lightweight 3D renderer...
+echo [3/6] Checking lightweight 3D renderer...
 %PY_CMD% -c "import numpy, pyqtgraph, pyqtgraph.opengl, OpenGL" >nul 2>nul
 if errorlevel 1 (
     echo 3D packages missing. Installing pyqtgraph, PyOpenGL and numpy...
@@ -57,7 +57,7 @@ if errorlevel 1 (
 )
 
 echo.
-echo [4/5] Checking rigid-body physics engine...
+echo [4/6] Checking rigid-body physics engine...
 %PY_CMD% -c "import culverin" >nul 2>nul
 if errorlevel 1 (
     echo Culverin / Jolt Physics not found. Installing prebuilt wheel...
@@ -70,8 +70,20 @@ if errorlevel 1 (
     %PY_CMD% -c "import culverin; print('Culverin / Jolt Physics OK -', getattr(culverin, '__version__', 'installed'))"
 )
 
+
 echo.
-echo [5/5] Starting 5imp1e 5atebox...
+echo [5/6] Checking music metadata dependency...
+%PY_CMD% -c "import mutagen" >nul 2>nul
+if errorlevel 1 (
+    echo Mutagen not found. Installing...
+    %PY_CMD% -m pip install --disable-pip-version-check mutagen
+    if errorlevel 1 goto :install_error
+) else (
+    echo Mutagen OK.
+)
+
+echo.
+echo [6/6] Starting 5imp1e 5atebox...
 if not exist "main.py" (
     echo.
     echo [ERROR] main.py was not found in:

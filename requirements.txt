@@ -3,3 +3,4 @@ numpy
 pyqtgraph
 PyOpenGL
 culverin==0.14.0
+mutagen
