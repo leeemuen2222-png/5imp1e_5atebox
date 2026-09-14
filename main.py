@@ -10,7 +10,7 @@ from PySide6.QtGui import QColor, QPainter, QPen, QBrush, QFont, QPainterPath, Q
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel,
     QPushButton, QFrame, QButtonGroup, QStackedWidget, QSizePolicy,
-    QGraphicsDropShadowEffect, QLineEdit, QCheckBox, QComboBox, QGridLayout, QScrollArea, QBoxLayout, QProgressBar
+    QGraphicsDropShadowEffect, QLineEdit, QCheckBox, QComboBox, QGridLayout, QScrollArea, QBoxLayout, QProgressBar, QSlider
 )
 
 try:
@@ -38,7 +38,7 @@ except Exception as exc:
     JOLT_ERROR = str(exc)
 
 APP_NAME = "5imp1e 5atebox"
-APP_VERSION = "0.14.2"
+APP_VERSION = "0.14.8"
 APP_SETTINGS = {
     "language": "zh",
     "mark_back": False,
@@ -3260,11 +3260,12 @@ class DiceStage(QWidget):
     """Polyhedral dice renderer / Jolt stage.
 
     D4/D8/D12 code remains in this class for future work, but the current UI exposes
-    only D6. D6 can now roll up to 50 fully independent rigid bodies at once.
+    only D6. D6 can now roll up to 100 fully independent rigid bodies at once.
     """
 
     rollFinished = Signal(object)
     countsChanged = Signal(int, int, int, int, int, int)
+    populationChanged = Signal(int, int, int)
     loadingProgress = Signal(int, int)
     loadingStateChanged = Signal(bool)
 
@@ -3291,8 +3292,10 @@ class DiceStage(QWidget):
         self.dice = []
         self.roll_count = 1
         self.current_counts = {i: 0 for i in range(1, 7)}
+        self.discarded_count = 0
+        self.max_rescues_per_die = 10
 
-        # Batch-spawn state. Creating 50 OpenGL items in one UI event is the main
+        # Batch-spawn state. Creating 100 OpenGL items in one UI event is the main
         # source of the perceived "freeze"; Jolt body creation is comparatively cheap.
         # We therefore cache D6 geometry and instantiate dice in small UI-friendly
         # batches while reporting real progress.
@@ -3301,6 +3304,15 @@ class DiceStage(QWidget):
         self.spawned_count = 0
         self.spawn_batch_size = 5
         self._cached_d6_visual_data = None
+
+        # User-adjustable release height. 150% is the new, more dramatic default.
+        self.release_height_percent = 150
+
+        # Safety recovery: if a die falls well below the tabletop, move it back to
+        # its own original release position while preserving its current linear and
+        # angular momentum. This prevents out-of-world bodies from running forever.
+        self.fall_rescue_z = -2.6
+        self.rescue_cooldown = 0.45
 
         self.vertices = []
         self.render_faces = []
@@ -3340,11 +3352,13 @@ class DiceStage(QWidget):
                                     distance=10.4, elevation=22, azimuth=-42)
         root.addWidget(self.view, 1)
 
-        self.floor = gl.GLGridItem()
-        self.floor.setSize(x=11.5, y=7.5)
-        self.floor.setSpacing(x=1.0, y=1.0)
-        self.floor.setColor((35, 35, 35, 78))
-        self.view.addItem(self.floor)
+        # Circular tabletop: visual disc + outline. The physical collider is a
+        # matching static convex prism, rebuilt only when the requested table size
+        # changes before a roll.
+        self.floor = None
+        self.floor_border = None
+        self.floor_body = None
+        self.table_radius = 4.6
 
         self.die_mesh = None
         self.face_plate_mesh = None
@@ -3357,19 +3371,106 @@ class DiceStage(QWidget):
             "penetration_slop": 0.002,
             "num_threads": 2,
         })
-        self.floor_body = self.world.create_body(
-            pos=(0.0, 0.0, -0.06),
-            # Large transparent physical tabletop. The visible grid is resized
-            # dynamically according to dice count, but all rolls stay on this body.
-            size=(11.0, 8.0, 0.06),
-            shape=culverin.SHAPE_BOX,
+        self._set_circular_table_radius(self.table_radius)
+        self.die_body = None
+        self.set_die_type(6)
+
+    def _set_circular_table_radius(self, radius):
+        """Create a circular transparent grid tabletop and matching Jolt collider."""
+        radius = max(3.5, float(radius))
+        if (
+            abs(radius - getattr(self, "table_radius", 0.0)) < 0.01
+            and self.floor is not None
+            and self.floor_body is not None
+        ):
+            return
+        self.table_radius = radius
+
+        if self.floor is not None:
+            try:
+                self.view.removeItem(self.floor)
+            except Exception:
+                pass
+        if self.floor_border is not None:
+            try:
+                self.view.removeItem(self.floor_border)
+            except Exception:
+                pass
+        if self.floor_body is not None:
+            try:
+                self.world.destroy_body(self.floor_body)
+            except Exception:
+                pass
+
+        # Visual tabletop: restore the old transparent dark grid language, but clip
+        # every grid line mathematically to the circular tabletop boundary.
+        spacing = 1.0
+        grid_points = []
+        limit = int(math.floor(radius / spacing))
+
+        for i in range(-limit, limit + 1):
+            x = i * spacing
+            y_extent = math.sqrt(max(0.0, radius * radius - x * x))
+            grid_points.append((x, -y_extent, 0.008))
+            grid_points.append((x,  y_extent, 0.008))
+
+        for i in range(-limit, limit + 1):
+            y = i * spacing
+            x_extent = math.sqrt(max(0.0, radius * radius - y * y))
+            grid_points.append((-x_extent, y, 0.008))
+            grid_points.append(( x_extent, y, 0.008))
+
+        self.floor = gl.GLLinePlotItem(
+            pos=np.asarray(grid_points, dtype=float),
+            color=(0.14, 0.14, 0.14, 0.31),
+            width=1.0,
+            antialias=True,
+            mode="lines",
+        )
+        self.view.addItem(self.floor)
+
+        # Solid black circular rim around the transparent grid.
+        segments = 96
+        outline = []
+        for i in range(segments + 1):
+            a = 2.0 * math.pi * i / segments
+            outline.append((
+                math.cos(a) * radius,
+                math.sin(a) * radius,
+                0.014,
+            ))
+
+        self.floor_border = gl.GLLinePlotItem(
+            pos=np.asarray(outline, dtype=float),
+            color=(0.01, 0.01, 0.01, 1.0),
+            width=2.2,
+            antialias=True,
+            mode="line_strip",
+        )
+        self.view.addItem(self.floor_border)
+
+        # Physics remains genuinely circular: a thin many-sided static convex prism.
+        # Only the table's rendering style changed.
+        hull_points = []
+        thickness = 0.12
+        for z in (0.0, -thickness):
+            for i in range(32):
+                a = 2.0 * math.pi * i / 32
+                hull_points.append((
+                    math.cos(a) * radius,
+                    math.sin(a) * radius,
+                    z,
+                ))
+
+        self.floor_body = self.world.create_convex_hull(
+            pos=(0.0, 0.0, 0.0),
+            rot=(0.0, 0.0, 0.0, 1.0),
+            points=np.asarray(hull_points, dtype=np.float32),
             motion=culverin.MOTION_STATIC,
             mass=0.0,
             friction=0.72,
             restitution=0.18,
         )
-        self.die_body = None
-        self.set_die_type(6)
 
     @staticmethod
     def _normalize(v):
@@ -3987,7 +4088,7 @@ class DiceStage(QWidget):
         self.dice = []
 
     def _prepare_cached_d6_visual_data(self):
-        """Build immutable D6 mesh data once instead of regenerating it 50 times."""
+        """Build immutable D6 mesh data once instead of regenerating it up to 100 times."""
         if self._cached_d6_visual_data is not None:
             return self._cached_d6_visual_data
 
@@ -4105,18 +4206,26 @@ class DiceStage(QWidget):
         }
         return self._cached_d6_visual_data
 
-    def _configure_table_for_count(self, count):
-        """Scale visible table, camera and release volume with the roll size."""
-        t = max(0.0, min(1.0, (count - 1) / 49.0))
-        table_x = 11.5 + 8.5 * t
-        table_y = 7.5 + 6.5 * t
-        self.floor.setSize(x=table_x, y=table_y)
+    def set_release_height_percent(self, percent):
+        self.release_height_percent = max(100, min(300, int(percent)))
 
-        # Pull the camera back for larger groups so the whole release remains visible.
-        distance = 10.4 + 5.5 * t
-        elevation = 22 + 5 * t
+    def _configure_table_for_count(self, count):
+        """Scale visible table and camera with both batch size and release height."""
+        t = max(0.0, min(1.0, (count - 1) / 99.0))
+        height_scale = self.release_height_percent / 100.0
+
+        # Circular table grows with the number of dice.
+        table_radius = 4.6 + 3.4 * t
+        self._set_circular_table_radius(table_radius)
+
+        # Pull farther back when either the batch is large or the user raises the
+        # release height, so the top of the drop remains visible.
+        height_extra = max(0.0, height_scale - 1.0)
+        distance = 10.4 + 5.5 * t + 2.6 * height_extra
+        elevation = 22 + 5 * t + 2.0 * height_extra
+        center_z = 0.45 + 0.30 * height_extra
         self.view.setCameraPosition(
-            pos=QVector3D(0.10, 0.08, 0.45),
+            pos=QVector3D(0.10, 0.08, center_z),
             distance=distance,
             elevation=elevation,
             azimuth=-42
@@ -4254,10 +4363,12 @@ class DiceStage(QWidget):
         if self.animating or self.loading_dice or self.world is None:
             return
 
-        count = max(1, min(50, int(count)))
+        count = max(1, min(100, int(count)))
         self.roll_count = count
         self.current_counts = {i: 0 for i in range(1, 7)}
+        self.discarded_count = 0
         self.countsChanged.emit(0, 0, 0, 0, 0, 0)
+        self.populationChanged.emit(count, count, 0)
 
         self._configure_table_for_count(count)
 
@@ -4277,9 +4388,9 @@ class DiceStage(QWidget):
         self.loadingStateChanged.emit(True)
         self.loadingProgress.emit(0, count)
 
-        # For small throws we can load in a larger batch; for 30-50 dice smaller
+        # For small throws we can load in a larger batch; for large 60-100 rolls smaller
         # batches keep Qt responsive and make progress genuinely visible.
-        self.spawn_batch_size = 8 if count <= 12 else (6 if count <= 30 else 4)
+        self.spawn_batch_size = 8 if count <= 12 else (6 if count <= 30 else (4 if count <= 60 else 3))
 
         # Start the batched preparation on the next event-loop turn.
         QTimer.singleShot(0, self._spawn_next_batch)
@@ -4293,11 +4404,16 @@ class DiceStage(QWidget):
         batch = min(self.spawn_batch_size, remaining)
 
         # Larger throws use a taller and wider release volume for visual impact.
-        t = max(0.0, min(1.0, (count - 1) / 49.0))
+        # Height is additionally multiplied by the user-controlled release slider.
+        t = max(0.0, min(1.0, (count - 1) / 99.0))
+        height_scale = self.release_height_percent / 100.0
         spread_x = 2.2 + 3.2 * t
         spread_y = 1.6 + 2.6 * t
-        base_height = 3.6 + 2.6 * t
-        height_jitter = 0.7 + 1.7 * t
+
+        # Raised from the previous 3.6–6.2 world-unit baseline to 4.4–7.8,
+        # before applying the user's 100–300% multiplier.
+        base_height = (4.4 + 3.4 * t) * height_scale
+        height_jitter = (0.9 + 2.0 * t) * height_scale
 
         d6_half = 0.335
 
@@ -4350,7 +4466,15 @@ class DiceStage(QWidget):
             self.dice.append({
                 "body": body,
                 "meshes": meshes,
+                "spawn_pos": (float(x), float(y), float(z)),
+                "last_rescue": -999.0,
+                "rescue_count": 0,
+                "discarded": False,
                 "sleep_time": 0.0,
+                # A die can come to rest on top of other dice and never reach the
+                # tabletop. Track that independently so stacked dice cannot keep
+                # the whole batch alive forever.
+                "stack_quiet_time": 0.0,
                 "unstable_time": 0.0,
                 "settled": False,
                 "result": None,
@@ -4392,6 +4516,8 @@ class DiceStage(QWidget):
         newly_settled = False
 
         for die in self.dice:
+            if die.get("discarded", False):
+                continue
             body = die["body"]
             pos = self.world.get_position(body)
             quat = self.world.get_rotation(body)
@@ -4399,6 +4525,10 @@ class DiceStage(QWidget):
             av = self.world.get_angular_velocity(body)
             if not pos or not quat or not lv or not av:
                 continue
+
+            if float(pos[2]) < self.fall_rescue_z:
+                if self._rescue_fallen_die(die, pos, quat, lv, av):
+                    continue
 
             self._apply_transform_to_meshes(die["meshes"], pos, quat)
 
@@ -4409,16 +4539,32 @@ class DiceStage(QWidget):
             angular = math.sqrt(sum(float(v) * float(v) for v in av))
             grounded = float(pos[2]) < 0.72
 
-            # With many dice colliding together, tiny residual rocking can remain
-            # for a long time even though a die is visibly at rest. Count a D6 once
-            # it has stayed on the table with low linear/angular motion for a short
-            # dwell period. The face value is still read from its actual orientation.
+            # Normal tabletop settling.
             if grounded and linear < 0.115 and angular < 0.42:
                 die["sleep_time"] += frame_dt
             else:
                 die["sleep_time"] = max(0.0, die["sleep_time"] - frame_dt * 1.5)
 
-            if die["sleep_time"] > 0.34:
+            # Stacked-die settling: a die resting on top of other dice can be well
+            # above z=0.72. If it is genuinely still (or only microscopically
+            # trembling) for long enough, accept its current top-view result.
+            # The longer dwell avoids falsely counting a die at the apex of a jump.
+            if linear < 0.070 and angular < 0.30:
+                die["stack_quiet_time"] += frame_dt
+            else:
+                die["stack_quiet_time"] = max(
+                    0.0, die["stack_quiet_time"] - frame_dt * 2.0
+                )
+
+            tabletop_done = die["sleep_time"] > 0.34
+            stacked_done = die["stack_quiet_time"] > 0.78
+
+            if tabletop_done or stacked_done:
+                # For a cube, all six faces have equal area. Under orthographic
+                # projection from directly above, a face's projected area is
+                # proportional to max(0, normal_z). Therefore the face with the
+                # largest positive world-space Z normal is exactly the largest
+                # visible top projection. _d6_result_from_quat implements this.
                 value = self._d6_result_from_quat(quat)
                 die["result"] = value
                 die["settled"] = True
@@ -4444,18 +4590,124 @@ class DiceStage(QWidget):
                 self.current_counts[6],
             )
 
-        if self.dice and all(die["settled"] for die in self.dice):
-            results = [int(die["result"]) for die in self.dice]
+        if self.dice and all(die["settled"] or die.get("discarded", False) for die in self.dice):
+            results = [
+                int(die["result"])
+                for die in self.dice
+                if not die.get("discarded", False) and die.get("result") is not None
+            ]
             self.animating = False
             self._timer.stop()
             self.rollFinished.emit(results)
 
+    def _discard_die_after_rescues(self, die):
+        """Remove one pathological die after ten fall recoveries without recording it."""
+        if die.get("discarded", False):
+            return True
+
+        body = die.get("body")
+        if body is not None:
+            try:
+                self.world.destroy_body(body)
+            except Exception:
+                pass
+
+        for item in die.get("meshes", ()):
+            if item is not None:
+                try:
+                    self.view.removeItem(item)
+                except Exception:
+                    pass
+
+        die["body"] = None
+        die["meshes"] = []
+        die["discarded"] = True
+        die["settled"] = False
+        die["result"] = None
+        self.discarded_count += 1
+
+        valid = max(0, self.roll_count - self.discarded_count)
+        self.populationChanged.emit(valid, self.roll_count, self.discarded_count)
+        return True
+
+    def _rescue_fallen_die(self, die, pos, quat, lv, av):
+        """Teleport a fallen D6 back to its own release point without killing momentum.
+
+        Culverin/Jolt does not expose the same transform setter on every build, so the
+        robust fallback is to rebuild that one rigid body at the original spawn point.
+        Linear momentum is exact here because every D6 has mass 1. Angular momentum is
+        reconstructed from the solid-cube inertia I = (1/6) * side^2 for each axis.
+        The current orientation is preserved; only position changes.
+        """
+        now = time.perf_counter()
+        if now - float(die.get("last_rescue", -999.0)) < self.rescue_cooldown:
+            return False
+
+        die["rescue_count"] = int(die.get("rescue_count", 0)) + 1
+        if die["rescue_count"] >= self.max_rescues_per_die:
+            return self._discard_die_after_rescues(die)
+
+        old_body = die["body"]
+        spawn_pos = die.get("spawn_pos", (0.0, 0.0, 4.0))
+        d6_half = 0.335
+
+        # Snapshot all motion before replacing the out-of-bounds rigid body.
+        linear_velocity = tuple(float(v) for v in lv)
+        angular_velocity = tuple(float(v) for v in av)
+        orientation = tuple(float(v) for v in quat)
+
+        try:
+            self.world.destroy_body(old_body)
+        except Exception:
+            pass
+
+        new_body = self.world.create_body(
+            pos=spawn_pos,
+            rot=orientation,
+            size=(d6_half, d6_half, d6_half),
+            shape=culverin.SHAPE_BOX,
+            motion=culverin.MOTION_DYNAMIC,
+            mass=1.0,
+            friction=0.58,
+            restitution=0.28,
+            ccd=True,
+        )
+
+        # p = m*v and m == 1, so applying this impulse restores linear momentum.
+        self.world.apply_impulse(
+            new_body,
+            linear_velocity[0], linear_velocity[1], linear_velocity[2]
+        )
+
+        # Solid cube principal inertia for mass 1.0 and side length 2*h.
+        side = d6_half * 2.0
+        inertia = (side * side) / 6.0
+        self.world.apply_angular_impulse(
+            new_body,
+            angular_velocity[0] * inertia,
+            angular_velocity[1] * inertia,
+            angular_velocity[2] * inertia,
+        )
+
+        die["body"] = new_body
+        die["last_rescue"] = now
+        die["sleep_time"] = 0.0
+        die["stack_quiet_time"] = 0.0
+        die["unstable_time"] = 0.0
+        die["settled"] = False
+        die["result"] = None
+
+        # Render immediately at the restored position so there is no frame where the
+        # visual remains below the table after the physics body has been recovered.
+        self._apply_transform_to_meshes(die["meshes"], spawn_pos, orientation)
+        return True
+
     def _physics_step_multi(self):
         # Apply the tiny anti-edge equilibrium perturbation independently to every
         # D6 before advancing the shared Jolt world. Dice-dice collisions are solved
-        # by Jolt in the same world, so all 1-50 dice genuinely move together.
+        # by Jolt in the same world, so all 1-100 dice genuinely move together.
         for die in self.dice:
-            if die["settled"]:
+            if die["settled"] or die.get("discarded", False):
                 continue
 
             body = die["body"]
@@ -4464,6 +4716,12 @@ class DiceStage(QWidget):
             lv = self.world.get_velocity(body)
             av = self.world.get_angular_velocity(body)
             if not pos or not quat or not lv or not av:
+                continue
+
+            # A die that has left the visible/physical tabletop is recovered far
+            # below the surface rather than being allowed to fall forever.
+            if float(pos[2]) < self.fall_rescue_z:
+                self._rescue_fallen_die(die, pos, quat, lv, av)
                 continue
 
             linear = math.sqrt(sum(float(v) * float(v) for v in lv))
@@ -4534,8 +4792,8 @@ class DicePage(QWidget):
         title = QLabel(TXT("骰子", "Dice"))
         title.setObjectName("pageTitle")
         desc = QLabel(TXT(
-            "当前仅开放 D6。一次可同时投掷 1–50 个实体骰子，所有骰子在同一个 Jolt 物理世界中同时碰撞与弹跳。",
-            "Only D6 is currently available. Roll 1–50 physical dice at once; every die collides and bounces together in the same Jolt physics world."
+            "当前仅开放 D6。一次可同时投掷 1–100 个实体骰子，可调节投放高度并在圆形桌面上同时碰撞；单个骰子连续跌落并恢复 10 次后会被弃用且不计入结果。",
+            "Only D6 is currently available. Roll 1–100 physical dice at once with adjustable release height on a circular table; a die that requires 10 fall recoveries is discarded and excluded from results."
         ))
         desc.setObjectName("pageDesc")
         desc.setWordWrap(True)
@@ -4594,14 +4852,38 @@ class DicePage(QWidget):
 
         self.quantity_input = QLineEdit("1")
         self.quantity_input.setObjectName("settingInput")
-        self.quantity_input.setValidator(QIntValidator(1, 50, self.quantity_input))
+        self.quantity_input.setValidator(QIntValidator(1, 100, self.quantity_input))
         self.quantity_input.setFixedWidth(72)
         self.quantity_input.setAlignment(Qt.AlignCenter)
         controls.addWidget(self.quantity_input)
 
-        range_hint = QLabel(TXT("1–50 个", "1–50"))
+        range_hint = QLabel(TXT("1–100 个", "1–100"))
         range_hint.setObjectName("statusText")
         controls.addWidget(range_hint)
+
+        controls.addSpacing(18)
+
+        height_label = QLabel(TXT("投放高度", "Release height"))
+        height_label.setObjectName("statusText")
+        controls.addWidget(height_label)
+
+        self.height_slider = QSlider(Qt.Horizontal)
+        self.height_slider.setRange(100, 300)
+        self.height_slider.setSingleStep(10)
+        self.height_slider.setPageStep(25)
+        self.height_slider.setValue(150)
+        self.height_slider.setFixedWidth(180)
+        self.height_slider.setToolTip(TXT(
+            "调整骰子从桌面上方释放的高度（100%–300%）",
+            "Adjust how high above the table the dice are released (100%–300%)"
+        ))
+        controls.addWidget(self.height_slider)
+
+        self.height_value = QLabel("150%")
+        self.height_value.setObjectName("statusText")
+        self.height_value.setMinimumWidth(48)
+        controls.addWidget(self.height_value)
+
         controls.addStretch(1)
         outer.addLayout(controls)
 
@@ -4622,26 +4904,53 @@ class DicePage(QWidget):
         self.status.setObjectName("statusText")
         bottom.addWidget(self.status)
         bottom.addStretch(1)
+
+        self.population_status = QLabel()
+        self.population_status.setObjectName("statusText")
+        self.population_status.setTextFormat(Qt.RichText)
+        self.population_status.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        bottom.addWidget(self.population_status)
         outer.addLayout(bottom)
+
+        self._set_population_text(1, 1, 0)
 
         self.roll_button.clicked.connect(self._roll)
         self.stage.rollFinished.connect(self._finished)
         self.stage.countsChanged.connect(self._update_counts)
+        self.stage.populationChanged.connect(self._set_population_text)
         self.stage.loadingProgress.connect(self._loading_progress)
         self.stage.loadingStateChanged.connect(self._loading_state)
         self.quantity_input.textChanged.connect(self._quantity_changed)
+        self.height_slider.valueChanged.connect(self._height_changed)
+
+        self.stage.set_release_height_percent(self.height_slider.value())
 
         if not OPENGL_3D_AVAILABLE or not JOLT_AVAILABLE:
             self.roll_button.setEnabled(False)
             self.quantity_input.setEnabled(False)
+            self.height_slider.setEnabled(False)
             self.status.setText(TXT(
                 "缺少 3D / Jolt 组件 · 请使用新版 run.bat 启动",
                 "3D / Jolt components missing · launch with the updated run.bat"
             ))
 
+    def _set_population_text(self, valid, total, discarded):
+        valid = int(valid)
+        total = int(total)
+        discarded = int(discarded)
+        red = "#d84a4a"
+        if APP_SETTINGS.get("language") == "en":
+            prefix = "VALID "
+        else:
+            prefix = "有效 "
+        self.population_status.setText(
+            f"{prefix}<b>{valid}</b> "
+            f"<span style='color:{red}; font-weight:700'>({total}-{discarded})</span>"
+        )
+
     def _quantity(self):
         try:
-            return max(1, min(50, int(self.quantity_input.text() or "1")))
+            return max(1, min(100, int(self.quantity_input.text() or "1")))
         except ValueError:
             return 1
 
@@ -4649,6 +4958,7 @@ class DicePage(QWidget):
         if self.stage.animating:
             return
         count = self._quantity()
+        self._set_population_text(count, count, 0)
         self.status.setText(TXT(
             f"D6 · {count} 个 · 点击投掷",
             f"D6 · {count} {'die' if count == 1 else 'dice'} · press Roll"
@@ -4659,8 +4969,17 @@ class DicePage(QWidget):
         for value, count in enumerate(counts, start=1):
             self.count_labels[value].setText(str(int(count)))
 
+    def _height_changed(self, value):
+        value = int(value)
+        self.height_value.setText(f"{value}%")
+        self.stage.set_release_height_percent(value)
+        if not self.stage.animating and not self.stage.loading_dice:
+            count = self._quantity()
+            self.stage._configure_table_for_count(count)
+
     def _loading_state(self, loading):
         self.loading_bar.setVisible(bool(loading))
+        self.height_slider.setEnabled(not loading)
         if loading:
             self.loading_bar.setValue(0)
         else:
@@ -4691,6 +5010,7 @@ class DicePage(QWidget):
         self.quantity_input.setText(str(count))
         self.roll_button.setEnabled(False)
         self.quantity_input.setEnabled(False)
+        self.height_slider.setEnabled(False)
         self.status.setText(TXT(
             f"正在准备 {count} 个 D6…",
             f"Preparing {count} D6 {'die' if count == 1 else 'dice'}…"
@@ -4700,12 +5020,22 @@ class DicePage(QWidget):
     def _finished(self, results):
         self.roll_button.setEnabled(True)
         self.quantity_input.setEnabled(True)
+        self.height_slider.setEnabled(True)
         total = len(results)
         total_sum = sum(results)
-        self.status.setText(TXT(
-            f"{total} 个 D6 已停止 · 点数总和：{total_sum}",
-            f"{total} D6 {'die has' if total == 1 else 'dice have'} settled · total: {total_sum}"
-        ))
+        discarded = int(self.stage.discarded_count)
+        requested = int(self.stage.roll_count)
+        self._set_population_text(total, requested, discarded)
+        if discarded:
+            self.status.setText(TXT(
+                f"{total} 个有效 D6 已停止 · {discarded} 个弃用 · 点数总和：{total_sum}",
+                f"{total} valid D6 settled · {discarded} discarded · total: {total_sum}"
+            ))
+        else:
+            self.status.setText(TXT(
+                f"{total} 个 D6 已停止 · 点数总和：{total_sum}",
+                f"{total} D6 {'die has' if total == 1 else 'dice have'} settled · total: {total_sum}"
+            ))
 
 
 class SettingsPage(QWidget):
