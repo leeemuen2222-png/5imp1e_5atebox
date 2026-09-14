@@ -53,7 +53,7 @@ except Exception as exc:
     JOLT_ERROR = str(exc)
 
 APP_NAME = "5imp1e 5atebox"
-APP_VERSION = "0.16.0"
+APP_VERSION = "0.16.3"
 APP_SETTINGS = {
     "language": "zh",
     "mark_back": False,
@@ -5428,33 +5428,55 @@ def _read_track_info(path):
 
 
 def _parse_lrc(path):
-    rows = []
+    """Parse LRC/LYC and group same-timestamp lines into one lyric slot.
+
+    This supports bilingual lyrics naturally:
+        [00:12.00]Original language
+        [00:12.00]Translated language
+
+    Both lines are kept together and displayed at the same time.
+    More than two same-timestamp lines are also preserved.
+    """
+    grouped = {}
     if not path or not Path(path).exists():
-        return rows
+        return []
+
     try:
         raw = Path(path).read_text(encoding="utf-8-sig", errors="replace")
     except Exception:
-        return rows
+        return []
 
     stamp_re = re.compile(r"\[(\d{1,3}):(\d{2})(?:[.:](\d{1,3}))?\]")
+
     for line in raw.splitlines():
         stamps = list(stamp_re.finditer(line))
         if not stamps:
             continue
+
         lyric = stamp_re.sub("", line).strip()
+        if not lyric:
+            continue
+
         for m in stamps:
             minutes = int(m.group(1))
             seconds = int(m.group(2))
             frac = m.group(3) or "0"
+
             if len(frac) == 1:
                 frac_ms = int(frac) * 100
             elif len(frac) == 2:
                 frac_ms = int(frac) * 10
             else:
                 frac_ms = int(frac[:3])
-            rows.append((minutes * 60000 + seconds * 1000 + frac_ms, lyric))
-    rows.sort(key=lambda x: x[0])
-    return rows
+
+            stamp_ms = minutes * 60000 + seconds * 1000 + frac_ms
+            bucket = grouped.setdefault(stamp_ms, [])
+
+            # Avoid accidental duplicated bilingual lines while preserving order.
+            if lyric not in bucket:
+                bucket.append(lyric)
+
+    return [(stamp, lines) for stamp, lines in sorted(grouped.items())]
 
 
 class MusicTrackRow(QFrame):
@@ -5600,7 +5622,9 @@ class MusicPage(QWidget):
         self.library_dir = MUSIC_LIBRARY_DIR
         self.library_dir.mkdir(parents=True, exist_ok=True)
         self.cache_dir = self.library_dir / ".music_cache"
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        # The extraction cache is disposable. Rebuild it every time the app starts
+        # so ZIP contents can never become stale after users replace archives.
+        self._clear_music_cache()
 
         self.tracks = []
         self.current_index = -1
@@ -5643,7 +5667,7 @@ class MusicPage(QWidget):
 
         self.refresh_btn = QPushButton(TXT("刷新音乐", "Refresh"))
         self.refresh_btn.setObjectName("chipButton")
-        self.refresh_btn.clicked.connect(self.reload_library)
+        self.refresh_btn.clicked.connect(self._refresh_music_library)
         top.addWidget(self.refresh_btn)
 
         self.settings_btn = QPushButton(TXT("音乐设置", "Music Settings"))
@@ -5702,11 +5726,16 @@ class MusicPage(QWidget):
         rl.setSpacing(12)
 
         header = QHBoxLayout()
+        header.setSpacing(18)
+
         info_box = QWidget()
+        info_box.setMaximumWidth(430)
+        info_box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         info_grid = QGridLayout(info_box)
         info_grid.setContentsMargins(0, 0, 0, 0)
-        info_grid.setHorizontalSpacing(12)
-        info_grid.setVerticalSpacing(6)
+        info_grid.setHorizontalSpacing(8)
+        info_grid.setVerticalSpacing(2)
+        info_grid.setColumnStretch(1, 1)
 
         self.detail_values = {}
         details = [
@@ -5719,19 +5748,35 @@ class MusicPage(QWidget):
         ]
         for row, (key, zhlabel) in enumerate(details):
             lab = QLabel(f"{zhlabel}:")
-            lab.setStyleSheet("color:#7f7f7f; font-size:12px;")
+            lab.setFixedWidth(66)
+            lab.setFixedHeight(21)
+            lab.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            lab.setStyleSheet(
+                "color:#777; font-size:11px; background:transparent; border:0; padding:0;"
+            )
+
             val = QLabel("—")
-            val.setStyleSheet("color:#d7d7d7; font-size:12px;")
+            val.setFixedHeight(21)
+            val.setMinimumWidth(120)
+            val.setMaximumWidth(340)
+            val.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            val.setStyleSheet(
+                "color:#cecece; font-size:11px; background:transparent; border:0; padding:0;"
+            )
             val.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            val.setToolTip("")
+
             info_grid.addWidget(lab, row, 0)
             info_grid.addWidget(val, row, 1)
             self.detail_values[key] = val
-        header.addWidget(info_box, 1)
+
+        header.addWidget(info_box, 0, Qt.AlignLeft | Qt.AlignTop)
+        header.addStretch(1)
 
         now = QVBoxLayout()
         now.setAlignment(Qt.AlignRight | Qt.AlignTop)
         self.hero_cover = QLabel()
-        self.hero_cover.setFixedSize(132, 132)
+        self.hero_cover.setFixedSize(112, 112)
         self.hero_cover.setAlignment(Qt.AlignCenter)
         self.hero_cover.setStyleSheet("background:#121212; border:1px solid #252525; border-radius:10px;")
         now.addWidget(self.hero_cover, 0, Qt.AlignRight)
@@ -5739,7 +5784,7 @@ class MusicPage(QWidget):
         self.hero_title.setAlignment(Qt.AlignRight)
         self.hero_title.setWordWrap(True)
         self.hero_title.setMaximumWidth(260)
-        self.hero_title.setStyleSheet("font-size:17px; font-weight:700; color:#eeeeee;")
+        self.hero_title.setStyleSheet("font-size:15px; font-weight:700; color:#eeeeee;")
         now.addWidget(self.hero_title, 0, Qt.AlignRight)
         self.hero_artist = QLabel("")
         self.hero_artist.setAlignment(Qt.AlignRight)
@@ -5967,6 +6012,54 @@ class MusicPage(QWidget):
                 return pix.scaled(size, size, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
         return self._placeholder_cover().scaled(size, size, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
 
+    def _clear_music_cache(self):
+        """Completely remove the disposable extraction cache before a rescan."""
+        # QMediaPlayer on Windows may briefly retain a handle to the current source.
+        # Disconnect the source first, then give Qt a chance to release that handle.
+        try:
+            self.player.stop()
+            self.player.setSource(QUrl())
+        except Exception:
+            pass
+        QApplication.processEvents()
+
+        if self.cache_dir.exists():
+            for _ in range(3):
+                shutil.rmtree(self.cache_dir, ignore_errors=True)
+                if not self.cache_dir.exists():
+                    break
+                QApplication.processEvents()
+
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        return self.cache_dir.exists()
+
+    def _refresh_music_library(self):
+        """Refresh button path: clear cache first, then perform a clean rescan."""
+        self.refresh_btn.setEnabled(False)
+        self.scan_status.setText(TXT(
+            "正在清除音乐缓存…",
+            "Clearing music cache…"
+        ))
+        QApplication.processEvents()
+
+        self._clear_music_cache()
+
+        self.scan_status.setText(TXT(
+            "缓存已清除，正在重新读取音乐…",
+            "Cache cleared. Rescanning music…"
+        ))
+        QApplication.processEvents()
+
+        # Run the actual scan on the next event-loop turn so the user can see that
+        # cache removal completed before the library scan begins.
+        QTimer.singleShot(0, self._reload_library_after_cache_clear)
+
+    def _reload_library_after_cache_clear(self):
+        try:
+            self.reload_library(clear_cache=False)
+        finally:
+            self.refresh_btn.setEnabled(True)
+
     def _extract_archives_recursive(self):
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         queue = [
@@ -6008,9 +6101,20 @@ class MusicPage(QWidget):
             for nested in out.rglob("*.zip"):
                 queue.append(nested)
 
-    def reload_library(self):
-        self.scan_status.setText(TXT("正在读取音乐文件…", "Scanning music files…"))
-        QApplication.processEvents()
+    def reload_library(self, clear_cache=True):
+        if clear_cache:
+            self.scan_status.setText(TXT(
+                "正在清理缓存并读取音乐文件…",
+                "Clearing cache and scanning music files…"
+            ))
+            QApplication.processEvents()
+            self._clear_music_cache()
+        else:
+            self.scan_status.setText(TXT(
+                "正在重新读取音乐文件…",
+                "Rescanning music files…"
+            ))
+            QApplication.processEvents()
 
         self._extract_archives_recursive()
 
@@ -6076,7 +6180,7 @@ class MusicPage(QWidget):
         self.detail_values["Year"].setText(track["year"] or "—")
         self.detail_values["Cover"].setText(track["cover_desc"] or "—")
 
-        self.hero_cover.setPixmap(self._pixmap_for_track(track, 132))
+        self.hero_cover.setPixmap(self._pixmap_for_track(track, 112))
         self.hero_title.setText(track["title"])
         self.hero_artist.setText(track["artist"])
         self.total_time.setText(_format_ms(track["duration_ms"]))
@@ -6144,34 +6248,79 @@ class MusicPage(QWidget):
         if duration > 0:
             self.player.setPosition(int(duration * self.progress.value() / 1000))
 
+    @staticmethod
+    def _lyric_slot_text(slot):
+        """Return one display string for a bilingual/multilingual lyric slot."""
+        if not slot:
+            return ""
+        if isinstance(slot, str):
+            return slot
+        return "\n".join(str(line) for line in slot if str(line).strip())
+
+    def _lyric_slot_lines(self, slot):
+        if not slot:
+            return []
+        if isinstance(slot, str):
+            return [slot]
+        return [str(line) for line in slot if str(line).strip()]
+
     def _update_lyric_roller(self, current):
         if not self.current_lyrics:
-            texts = ["", "", "", TXT("暂无歌词", "No lyrics available"), "", "", ""]
+            slot_lines = [[], [], [], [TXT("暂无歌词", "No lyrics available")], [], [], []]
         else:
-            texts = []
+            slot_lines = []
             for offset in range(-3, 4):
                 idx = current + offset
                 if current < 0:
                     idx = offset + 3
                 if 0 <= idx < len(self.current_lyrics):
-                    texts.append(self.current_lyrics[idx][1])
+                    slot_lines.append(self._lyric_slot_lines(self.current_lyrics[idx][1]))
                 else:
-                    texts.append("")
+                    slot_lines.append([])
 
-        for i, (lbl, value) in enumerate(zip(self.lyric_labels, texts)):
+        for i, (lbl, lines) in enumerate(zip(self.lyric_labels, slot_lines)):
+            value = "\n".join(lines)
             lbl.setText(value)
-            dist = abs(i - 3)
-            if i == 3:
-                lbl.setStyleSheet("color:#f0f0f0; font-size:22px; font-weight:750; background:transparent; border:0;")
-            elif dist == 1:
-                lbl.setStyleSheet("color:#8d8d8d; font-size:16px; font-weight:550; background:transparent; border:0;")
-            elif dist == 2:
-                lbl.setStyleSheet("color:#565656; font-size:14px; background:transparent; border:0;")
-            else:
-                lbl.setStyleSheet("color:#343434; font-size:13px; background:transparent; border:0;")
 
-        current_text = texts[3] if len(texts) >= 4 else ""
+            # One timestamp = one roller position. If two languages are present,
+            # they remain stacked inside this same position instead of consuming
+            # two separate lyric rows.
+            is_bilingual = len(lines) >= 2
+            dist = abs(i - 3)
+
+            if i == 3:
+                size = 20 if is_bilingual else 22
+                min_h = 72 if is_bilingual else 50
+                lbl.setMinimumHeight(min_h)
+                lbl.setStyleSheet(
+                    f"color:#f0f0f0; font-size:{size}px; font-weight:750; "
+                    "background:transparent; border:0;"
+                )
+            elif dist == 1:
+                size = 14 if is_bilingual else 16
+                lbl.setMinimumHeight(54 if is_bilingual else 34)
+                lbl.setStyleSheet(
+                    f"color:#8d8d8d; font-size:{size}px; font-weight:550; "
+                    "background:transparent; border:0;"
+                )
+            elif dist == 2:
+                size = 13 if is_bilingual else 14
+                lbl.setMinimumHeight(48 if is_bilingual else 34)
+                lbl.setStyleSheet(
+                    f"color:#565656; font-size:{size}px; "
+                    "background:transparent; border:0;"
+                )
+            else:
+                size = 12 if is_bilingual else 13
+                lbl.setMinimumHeight(44 if is_bilingual else 34)
+                lbl.setStyleSheet(
+                    f"color:#343434; font-size:{size}px; "
+                    "background:transparent; border:0;"
+                )
+
+        current_text = "\n".join(slot_lines[3]) if len(slot_lines) >= 4 else ""
         self.desktop_lyrics.set_lyric(current_text)
+
 
     def _toggle_desktop_lyrics(self, enabled):
         if enabled:
