@@ -17,7 +17,7 @@ from PySide6.QtGui import QColor, QPainter, QPen, QBrush, QFont, QPainterPath, Q
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel,
     QPushButton, QFrame, QButtonGroup, QStackedWidget, QSizePolicy,
-    QGraphicsDropShadowEffect, QLineEdit, QCheckBox, QComboBox, QGridLayout, QScrollArea, QBoxLayout, QProgressBar, QSlider, QFontComboBox, QSpinBox, QColorDialog, QInputDialog, QMenu, QToolTip
+    QGraphicsDropShadowEffect, QLineEdit, QCheckBox, QComboBox, QGridLayout, QScrollArea, QBoxLayout, QProgressBar, QSlider, QFontComboBox, QSpinBox, QColorDialog, QInputDialog, QMenu, QToolTip, QDialog, QDialogButtonBox, QListWidget, QListWidgetItem, QAbstractItemView
 )
 
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
@@ -54,7 +54,7 @@ except Exception as exc:
     JOLT_ERROR = str(exc)
 
 APP_NAME = "5imp1e 5atebox"
-APP_VERSION = "0.17.1"
+APP_VERSION = "0.17.3"
 APP_SETTINGS = {
     "language": "zh",
     "mark_back": False,
@@ -5571,11 +5571,6 @@ class MusicTrackRow(QFrame):
         words.addWidget(artist)
         lay.addLayout(words, 1)
 
-        duration = QLabel(_format_ms(track["duration_ms"]))
-        duration.setStyleSheet("color:#969696; font-size:12px;")
-        duration.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        lay.addWidget(duration)
-
         self.favorite_btn = QPushButton()
         self.favorite_btn.setCheckable(True)
         self.favorite_btn.setChecked(bool(track.get("favorite", False)))
@@ -5809,9 +5804,122 @@ class MusicPage(QWidget):
             self.active_category = "__all__"
         self.category_combo.setCurrentIndex(ix)
         self.category_combo.blockSignals(False)
+        if hasattr(self, "batch_add_btn"):
+            self._sync_batch_add_button()
 
     def _category_changed(self, _index):
         self.active_category = self.category_combo.currentData() or "__all__"
+        self._sync_batch_add_button()
+        self._rebuild_playlist()
+
+    def _sync_batch_add_button(self):
+        custom_categories = {
+            str(x).strip()
+            for x in self.library_state.get("custom_categories", [])
+            if str(x).strip()
+        }
+        self.batch_add_btn.setVisible(self.active_category in custom_categories)
+
+    def _batch_add_to_active_category(self):
+        """Assign multiple tracks to the currently selected custom category."""
+        custom_categories = {
+            str(x).strip()
+            for x in self.library_state.get("custom_categories", [])
+            if str(x).strip()
+        }
+        category = self.active_category
+        if category not in custom_categories:
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle(TXT(
+            f"批量加入 · {category}",
+            f"Batch Add · {category}"
+        ))
+        dialog.resize(520, 620)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        title = QLabel(TXT(
+            f"选择要加入「{category}」的歌曲",
+            f"Select tracks to add to “{category}”"
+        ))
+        title.setStyleSheet("font-size:16px; font-weight:700;")
+        layout.addWidget(title)
+
+        hint = QLabel(TXT(
+            "可同时选择多首歌曲。已经属于该分类的歌曲会预先选中。",
+            "Select multiple tracks at once. Tracks already in this category are pre-selected."
+        ))
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#777; font-size:11px;")
+        layout.addWidget(hint)
+
+        track_list = QListWidget()
+        track_list.setSelectionMode(QAbstractItemView.MultiSelection)
+        track_list.setAlternatingRowColors(False)
+
+        for i, track in enumerate(self.tracks):
+            title_text = track.get("title") or Path(track["path"]).stem
+            artist_text = track.get("artist") or TXT("未知艺术家", "Unknown Artist")
+            item = QListWidgetItem(f"{title_text}   —   {artist_text}")
+            item.setData(Qt.UserRole, i)
+            track_list.addItem(item)
+            if track.get("category", "") == category:
+                item.setSelected(True)
+
+        layout.addWidget(track_list, 1)
+
+        select_row = QHBoxLayout()
+        select_all = QPushButton(TXT("全选", "Select All"))
+        select_none = QPushButton(TXT("清空选择", "Clear Selection"))
+        select_all.setObjectName("chipButton")
+        select_none.setObjectName("chipButton")
+        select_all.clicked.connect(lambda: [
+            track_list.item(i).setSelected(True)
+            for i in range(track_list.count())
+        ])
+        select_none.clicked.connect(lambda: track_list.clearSelection())
+        select_row.addWidget(select_all)
+        select_row.addWidget(select_none)
+        select_row.addStretch(1)
+        layout.addLayout(select_row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText(TXT("应用", "Apply"))
+        buttons.button(QDialogButtonBox.Cancel).setText(TXT("取消", "Cancel"))
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        selected_indices = {
+            int(item.data(Qt.UserRole))
+            for item in track_list.selectedItems()
+        }
+
+        categories = self.library_state.setdefault("categories", {})
+
+        # Batch editor semantics:
+        # - selected tracks become members of the current category;
+        # - tracks that were in this category but are now unselected are removed
+        #   from this category and return to Uncategorized.
+        for i, track in enumerate(self.tracks):
+            key = self._track_key(track["path"])
+            current = track.get("category", "")
+
+            if i in selected_indices:
+                categories[key] = category
+                track["category"] = category
+            elif current == category:
+                categories.pop(key, None)
+                track["category"] = ""
+
+        self._save_library_state()
         self._rebuild_playlist()
 
     def _create_category(self):
@@ -5973,12 +6081,29 @@ class MusicPage(QWidget):
         self.category_combo.currentIndexChanged.connect(self._category_changed)
         playlist_head.addWidget(self.category_combo)
 
-        self.add_category_btn = QPushButton("+")
-        self.add_category_btn.setFixedSize(28, 28)
+        self.add_category_btn = QPushButton("▦")
+        self.add_category_btn.setFixedSize(30, 28)
         self.add_category_btn.setToolTip(TXT("新建分类", "New Category"))
         self.add_category_btn.setObjectName("chipButton")
+        self.add_category_btn.setStyleSheet(
+            """
+            QPushButton {
+                font-size: 16px;
+                font-weight: 700;
+                padding: 0;
+            }
+            """
+        )
         self.add_category_btn.clicked.connect(self._create_category)
         playlist_head.addWidget(self.add_category_btn)
+
+        self.batch_add_btn = QPushButton("＋")
+        self.batch_add_btn.setFixedSize(30, 28)
+        self.batch_add_btn.setObjectName("chipButton")
+        self.batch_add_btn.setToolTip(TXT("批量加入歌曲", "Batch Add Tracks"))
+        self.batch_add_btn.clicked.connect(self._batch_add_to_active_category)
+        self.batch_add_btn.hide()
+        playlist_head.addWidget(self.batch_add_btn)
 
         ll.addLayout(playlist_head)
         self._rebuild_category_combo()
