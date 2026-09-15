@@ -17,7 +17,7 @@ from PySide6.QtGui import QColor, QPainter, QPen, QBrush, QFont, QPainterPath, Q
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel,
     QPushButton, QFrame, QButtonGroup, QStackedWidget, QSizePolicy,
-    QGraphicsDropShadowEffect, QLineEdit, QCheckBox, QComboBox, QGridLayout, QScrollArea, QBoxLayout, QProgressBar, QSlider, QFontComboBox, QSpinBox, QColorDialog, QInputDialog, QMenu
+    QGraphicsDropShadowEffect, QLineEdit, QCheckBox, QComboBox, QGridLayout, QScrollArea, QBoxLayout, QProgressBar, QSlider, QFontComboBox, QSpinBox, QColorDialog, QInputDialog, QMenu, QToolTip
 )
 
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
@@ -54,7 +54,7 @@ except Exception as exc:
     JOLT_ERROR = str(exc)
 
 APP_NAME = "5imp1e 5atebox"
-APP_VERSION = "0.17.0"
+APP_VERSION = "0.17.1"
 APP_SETTINGS = {
     "language": "zh",
     "mark_back": False,
@@ -5493,6 +5493,39 @@ def _parse_lrc(path):
     return [(stamp, lines) for stamp, lines in sorted(grouped.items())]
 
 
+
+class DelayedToolTipButton(QPushButton):
+    """Icon button whose help text appears only after a 1-second hover."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._hover_tip = ""
+        self._tip_timer = QTimer(self)
+        self._tip_timer.setSingleShot(True)
+        self._tip_timer.setInterval(1000)
+        self._tip_timer.timeout.connect(self._show_delayed_tip)
+        self.setMouseTracking(True)
+
+    def setDelayedToolTip(self, text):
+        self._hover_tip = str(text or "")
+
+    def enterEvent(self, event):
+        self._tip_timer.start()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._tip_timer.stop()
+        QToolTip.hideText()
+        super().leaveEvent(event)
+
+    def _show_delayed_tip(self):
+        if self.underMouse() and self._hover_tip:
+            QToolTip.showText(
+                self.mapToGlobal(QPointF(self.width() / 2, self.height()).toPoint()),
+                self._hover_tip,
+                self,
+            )
+
+
 class MusicTrackRow(QFrame):
     clicked = Signal(int)
     favoriteToggled = Signal(int, bool)
@@ -5693,10 +5726,19 @@ class MusicPage(QWidget):
         self.current_lyric_index = -1
         self._seeking = False
 
+        # One shared playback-mode control: sequence -> random -> repeat-one.
+        self.playback_modes = ("sequence", "random", "repeat_one")
+        self.playback_mode = "sequence"
+
         self.settings_store = QSettings("5imp1e 5atebox", "Music")
         self.library_state_path = self.library_dir / ".music_library_state.json"
         self.library_state = self._load_library_state()
         self.active_category = "__all__"
+
+        saved_mode = str(self.settings_store.value("playback_mode", "sequence"))
+        if saved_mode in self.playback_modes:
+            self.playback_mode = saved_mode
+
         self.desktop_lyrics = DesktopLyricsWindow(self)
 
         self.player = QMediaPlayer(self)
@@ -6094,11 +6136,19 @@ class MusicPage(QWidget):
         self.next_btn = QPushButton("▶")
         self.next_btn.setFixedSize(38, 34)
         self.next_btn.clicked.connect(self._next)
+
+        self.play_mode_btn = DelayedToolTipButton()
+        self.play_mode_btn.setFixedSize(38, 34)
+        self.play_mode_btn.setObjectName("chipButton")
+        self.play_mode_btn.clicked.connect(self._cycle_playback_mode)
+
         for b in (self.prev_btn, self.play_btn, self.next_btn):
             b.setObjectName("chipButton")
         controls.addWidget(self.prev_btn)
         controls.addWidget(self.play_btn)
         controls.addWidget(self.next_btn)
+        controls.addWidget(self.play_mode_btn)
+        self._sync_playback_mode_button()
 
         controls.addSpacing(14)
         vol = QLabel(TXT("音量", "Vol"))
@@ -6499,23 +6549,84 @@ class MusicPage(QWidget):
     def _play_state_changed(self, state):
         self.play_btn.setText("Ⅱ" if state == QMediaPlayer.PlaybackState.PlayingState else "▶")
 
+    def _playback_mode_label(self):
+        labels = {
+            "sequence": TXT("顺序播放", "Sequential playback"),
+            "random": TXT("随机播放", "Shuffle"),
+            "repeat_one": TXT("单曲循环", "Repeat one"),
+        }
+        return labels.get(self.playback_mode, labels["sequence"])
+
+    def _sync_playback_mode_button(self):
+        # Icon-only UI. The name appears only after hovering for one second.
+        icons = {
+            "sequence": "⇥",
+            "random": "⤨",
+            "repeat_one": "↻¹",
+        }
+        self.play_mode_btn.setText(icons.get(self.playback_mode, "⇥"))
+        self.play_mode_btn.setDelayedToolTip(self._playback_mode_label())
+        self.play_mode_btn.setAccessibleName(self._playback_mode_label())
+
+    def _cycle_playback_mode(self):
+        try:
+            i = self.playback_modes.index(self.playback_mode)
+        except ValueError:
+            i = 0
+        self.playback_mode = self.playback_modes[(i + 1) % len(self.playback_modes)]
+        self.settings_store.setValue("playback_mode", self.playback_mode)
+        self._sync_playback_mode_button()
+
+    def _random_track_index(self):
+        if not self.tracks:
+            return -1
+        if len(self.tracks) == 1:
+            return 0
+        choices = [i for i in range(len(self.tracks)) if i != self.current_index]
+        return random.choice(choices)
+
+    def _advance_after_end(self):
+        if not self.tracks or self.current_index < 0:
+            return
+
+        if self.playback_mode == "repeat_one":
+            # Reuse the same loaded source and restart from the beginning.
+            self.player.setPosition(0)
+            self.player.play()
+            return
+
+        if self.playback_mode == "random":
+            nxt = self._random_track_index()
+        else:
+            nxt = (self.current_index + 1) % len(self.tracks)
+
+        if nxt >= 0:
+            self.select_track(nxt)
+            self.player.play()
+
     def _next(self):
         if not self.tracks:
             return
-        nxt = (self.current_index + 1) % len(self.tracks)
-        self.select_track(nxt)
-        self.player.play()
+        if self.playback_mode == "random":
+            nxt = self._random_track_index()
+        else:
+            nxt = (self.current_index + 1) % len(self.tracks)
+        if nxt >= 0:
+            self.select_track(nxt)
+            self.player.play()
 
     def _previous(self):
         if not self.tracks:
             return
+        # Previous remains deterministic so the user can manually go back even
+        # while random playback is enabled.
         prev = (self.current_index - 1) % len(self.tracks)
         self.select_track(prev)
         self.player.play()
 
     def _media_status_changed(self, status):
         if status == QMediaPlayer.MediaStatus.EndOfMedia:
-            self._next()
+            self._advance_after_end()
 
     def _duration_changed(self, duration):
         self.total_time.setText(_format_ms(duration))
