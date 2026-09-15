@@ -8,6 +8,7 @@ import io
 import json
 import shutil
 import zipfile
+import wave
 import hashlib
 from pathlib import Path
 
@@ -53,7 +54,7 @@ except Exception as exc:
     JOLT_ERROR = str(exc)
 
 APP_NAME = "5imp1e 5atebox"
-APP_VERSION = "0.16.3"
+APP_VERSION = "0.16.4"
 APP_SETTINGS = {
     "language": "zh",
     "mark_back": False,
@@ -5312,7 +5313,7 @@ class SettingsPage(QWidget):
 
 
 
-AUDIO_EXTENSIONS = {".mp3", ".flac", ".wav", ".m4a", ".aac", ".ogg", ".opus", ".wma"}
+AUDIO_EXTENSIONS = {".mp3", ".flac", ".wav", ".wave", ".m4a", ".aac", ".ogg", ".opus", ".wma"}
 LYRIC_EXTENSIONS = {".lrc", ".lyc"}
 
 
@@ -5424,6 +5425,19 @@ def _read_track_info(path):
             info["cover_desc"] = TXT("内嵌封面", "Embedded")
     except Exception:
         pass
+
+    # Plain WAV files frequently contain no metadata. Even then, read duration
+    # directly from the RIFF/WAVE header so playlist timing still works.
+    if path.suffix.lower() in {".wav", ".wave"} and not info["duration_ms"]:
+        try:
+            with wave.open(str(path), "rb") as wf:
+                rate = wf.getframerate()
+                frames = wf.getnframes()
+                if rate:
+                    info["duration_ms"] = int((frames / float(rate)) * 1000)
+        except Exception:
+            pass
+
     return info
 
 
