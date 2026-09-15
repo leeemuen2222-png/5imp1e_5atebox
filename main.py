@@ -54,7 +54,7 @@ except Exception as exc:
     JOLT_ERROR = str(exc)
 
 APP_NAME = "5imp1e 5atebox"
-APP_VERSION = "0.16.4"
+APP_VERSION = "0.16.5"
 APP_SETTINGS = {
     "language": "zh",
     "mark_back": False,
@@ -6641,12 +6641,8 @@ class MainWindow(QMainWindow):
         self._apply_zoom()
 
     def eventFilter(self, obj, event):
-        # Ctrl + wheel zooms regardless of which child widget is under the cursor.
-        if event.type() == QEvent.Wheel and (event.modifiers() & Qt.ControlModifier):
-            delta = event.angleDelta().y()
-            if delta:
-                self._set_zoom(self.ui_scale + (.10 if delta > 0 else -.10))
-                return True
+        # Mouse-wheel UI zoom has been removed. Wheel events are left untouched so
+        # scroll areas, sliders and other widgets can handle them normally.
         if event.type() == QEvent.KeyPress:
             key = event.key()
             name = qt_key_name(key)
