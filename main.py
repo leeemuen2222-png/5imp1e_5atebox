@@ -17,7 +17,7 @@ from PySide6.QtGui import QColor, QPainter, QPen, QBrush, QFont, QPainterPath, Q
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel,
     QPushButton, QFrame, QButtonGroup, QStackedWidget, QSizePolicy,
-    QGraphicsDropShadowEffect, QLineEdit, QCheckBox, QComboBox, QGridLayout, QScrollArea, QBoxLayout, QProgressBar, QSlider, QFontComboBox, QSpinBox, QColorDialog
+    QGraphicsDropShadowEffect, QLineEdit, QCheckBox, QComboBox, QGridLayout, QScrollArea, QBoxLayout, QProgressBar, QSlider, QFontComboBox, QSpinBox, QColorDialog, QInputDialog, QMenu
 )
 
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
@@ -54,7 +54,7 @@ except Exception as exc:
     JOLT_ERROR = str(exc)
 
 APP_NAME = "5imp1e 5atebox"
-APP_VERSION = "0.16.5"
+APP_VERSION = "0.17.0"
 APP_SETTINGS = {
     "language": "zh",
     "mark_back": False,
@@ -5495,12 +5495,17 @@ def _parse_lrc(path):
 
 class MusicTrackRow(QFrame):
     clicked = Signal(int)
+    favoriteToggled = Signal(int, bool)
+    categoryRequested = Signal(int)
 
     def __init__(self, index, track, cover_pixmap, parent=None):
         super().__init__(parent)
         self.index = index
+        self.track = track
         self.setCursor(Qt.PointingHandCursor)
         self.setObjectName("musicTrackRow")
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_context_menu)
         self.setStyleSheet("""
             QFrame#musicTrackRow {
                 background: transparent;
@@ -5538,8 +5543,50 @@ class MusicTrackRow(QFrame):
         duration.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         lay.addWidget(duration)
 
+        self.favorite_btn = QPushButton()
+        self.favorite_btn.setCheckable(True)
+        self.favorite_btn.setChecked(bool(track.get("favorite", False)))
+        self.favorite_btn.setFixedSize(28, 28)
+        self.favorite_btn.setCursor(Qt.PointingHandCursor)
+        self.favorite_btn.setToolTip(TXT("收藏", "Favorite"))
+        self.favorite_btn.clicked.connect(self._favorite_clicked)
+        self._sync_star()
+        lay.addWidget(self.favorite_btn)
+
+    def _sync_star(self):
+        checked = self.favorite_btn.isChecked()
+        self.favorite_btn.setText("★" if checked else "☆")
+        self.favorite_btn.setStyleSheet(
+            """
+            QPushButton {
+                border: 0;
+                background: transparent;
+                color: %s;
+                font-size: 20px;
+                padding: 0;
+            }
+            QPushButton:hover { color: #f5d66b; }
+            """ % ("#f2cf55" if checked else "#676767")
+        )
+
+    def _favorite_clicked(self, checked):
+        self._sync_star()
+        self.favoriteToggled.emit(self.index, bool(checked))
+
+    def _show_context_menu(self, pos):
+        menu = QMenu(self)
+        category_action = menu.addAction(TXT("设置分类…", "Set Category…"))
+        chosen = menu.exec(self.mapToGlobal(pos))
+        if chosen == category_action:
+            self.categoryRequested.emit(self.index)
+
     def mousePressEvent(self, event):
+        # Clicking the star must not also select/start the row through propagation.
         if event.button() == Qt.LeftButton:
+            child = self.childAt(event.position().toPoint())
+            if child is self.favorite_btn:
+                super().mousePressEvent(event)
+                return
             self.clicked.emit(self.index)
         super().mousePressEvent(event)
 
@@ -5647,6 +5694,9 @@ class MusicPage(QWidget):
         self._seeking = False
 
         self.settings_store = QSettings("5imp1e 5atebox", "Music")
+        self.library_state_path = self.library_dir / ".music_library_state.json"
+        self.library_state = self._load_library_state()
+        self.active_category = "__all__"
         self.desktop_lyrics = DesktopLyricsWindow(self)
 
         self.player = QMediaPlayer(self)
@@ -5661,6 +5711,164 @@ class MusicPage(QWidget):
         self._build_ui()
         self._load_customization()
         QTimer.singleShot(0, self.reload_library)
+
+    def _track_key(self, path):
+        try:
+            return str(Path(path).resolve().relative_to(self.library_dir.resolve())).replace("\\", "/")
+        except Exception:
+            return str(Path(path).resolve()).replace("\\", "/")
+
+    def _load_library_state(self):
+        try:
+            if self.library_state_path.exists():
+                raw = json.loads(self.library_state_path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    raw.setdefault("favorites", {})
+                    raw.setdefault("categories", {})
+                    raw.setdefault("custom_categories", [])
+                    return raw
+        except Exception:
+            pass
+        return {"favorites": {}, "categories": {}, "custom_categories": []}
+
+    def _save_library_state(self):
+        try:
+            self.library_state_path.write_text(
+                json.dumps(self.library_state, ensure_ascii=False, indent=2),
+                encoding="utf-8"
+            )
+        except Exception:
+            pass
+
+    def _all_categories(self):
+        builtins = [
+            ("__all__", TXT("全部歌曲", "All Songs")),
+            ("__favorites__", TXT("收藏", "Favorites")),
+            ("__uncategorized__", TXT("未分类", "Uncategorized")),
+        ]
+        custom = sorted(
+            {str(x).strip() for x in self.library_state.get("custom_categories", []) if str(x).strip()},
+            key=str.casefold
+        )
+        return builtins, custom
+
+    def _rebuild_category_combo(self):
+        current = self.active_category
+        self.category_combo.blockSignals(True)
+        self.category_combo.clear()
+        builtins, custom = self._all_categories()
+        for key, label in builtins:
+            self.category_combo.addItem(label, key)
+        for name in custom:
+            self.category_combo.addItem(name, name)
+        ix = self.category_combo.findData(current)
+        if ix < 0:
+            ix = 0
+            self.active_category = "__all__"
+        self.category_combo.setCurrentIndex(ix)
+        self.category_combo.blockSignals(False)
+
+    def _category_changed(self, _index):
+        self.active_category = self.category_combo.currentData() or "__all__"
+        self._rebuild_playlist()
+
+    def _create_category(self):
+        name, ok = QInputDialog.getText(
+            self,
+            TXT("新建分类", "New Category"),
+            TXT("分类名称：", "Category name:")
+        )
+        name = str(name).strip()
+        if not ok or not name:
+            return
+        reserved = {
+            TXT("全部歌曲", "All Songs").casefold(),
+            TXT("收藏", "Favorites").casefold(),
+            TXT("未分类", "Uncategorized").casefold(),
+        }
+        if name.casefold() in reserved:
+            return
+        cats = self.library_state.setdefault("custom_categories", [])
+        if name not in cats:
+            cats.append(name)
+            self._save_library_state()
+        self.active_category = name
+        self._rebuild_category_combo()
+        self._rebuild_playlist()
+
+    def _set_track_favorite(self, index, favorite):
+        if not (0 <= index < len(self.tracks)):
+            return
+        track = self.tracks[index]
+        key = self._track_key(track["path"])
+        favs = self.library_state.setdefault("favorites", {})
+        if favorite:
+            favs[key] = True
+        else:
+            favs.pop(key, None)
+        track["favorite"] = bool(favorite)
+        self._save_library_state()
+        if self.active_category == "__favorites__":
+            self._rebuild_playlist()
+
+    def _set_track_category_dialog(self, index):
+        if not (0 <= index < len(self.tracks)):
+            return
+
+        track = self.tracks[index]
+        current = track.get("category", "")
+        custom = sorted(
+            {str(x).strip() for x in self.library_state.get("custom_categories", []) if str(x).strip()},
+            key=str.casefold
+        )
+
+        choices = [TXT("未分类", "Uncategorized")] + custom + [TXT("＋ 新建分类…", "＋ New Category…")]
+        default_index = 0
+        if current in custom:
+            default_index = custom.index(current) + 1
+
+        choice, ok = QInputDialog.getItem(
+            self,
+            TXT("歌曲分类", "Track Category"),
+            TXT("将这首歌分类到：", "Place this track in:"),
+            choices,
+            default_index,
+            False,
+        )
+        if not ok:
+            return
+
+        new_name_label = TXT("＋ 新建分类…", "＋ New Category…")
+        uncategorized_label = TXT("未分类", "Uncategorized")
+
+        if choice == new_name_label:
+            name, created = QInputDialog.getText(
+                self,
+                TXT("新建分类", "New Category"),
+                TXT("分类名称：", "Category name:")
+            )
+            if not created:
+                return
+            choice = str(name).strip()
+            if not choice:
+                return
+            cats = self.library_state.setdefault("custom_categories", [])
+            if choice not in cats:
+                cats.append(choice)
+        elif choice == uncategorized_label:
+            choice = ""
+
+        key = self._track_key(track["path"])
+        categories = self.library_state.setdefault("categories", {})
+        if choice:
+            categories[key] = choice
+        else:
+            categories.pop(key, None)
+
+        track["category"] = choice
+        self._save_library_state()
+        self._rebuild_category_combo()
+        self._rebuild_playlist()
 
     def _build_ui(self):
         root = QVBoxLayout(self)
@@ -5711,9 +5919,27 @@ class MusicPage(QWidget):
         ll.setContentsMargins(10, 10, 10, 10)
         ll.setSpacing(7)
 
+        playlist_head = QHBoxLayout()
         label = QLabel(TXT("歌单", "Playlist"))
         label.setStyleSheet("font-size:15px; font-weight:700; color:#dddddd;")
-        ll.addWidget(label)
+        playlist_head.addWidget(label)
+        playlist_head.addStretch(1)
+
+        self.category_combo = QComboBox()
+        self.category_combo.setMinimumWidth(118)
+        self.category_combo.setMaximumWidth(160)
+        self.category_combo.currentIndexChanged.connect(self._category_changed)
+        playlist_head.addWidget(self.category_combo)
+
+        self.add_category_btn = QPushButton("+")
+        self.add_category_btn.setFixedSize(28, 28)
+        self.add_category_btn.setToolTip(TXT("新建分类", "New Category"))
+        self.add_category_btn.setObjectName("chipButton")
+        self.add_category_btn.clicked.connect(self._create_category)
+        playlist_head.addWidget(self.add_category_btn)
+
+        ll.addLayout(playlist_head)
+        self._rebuild_category_combo()
 
         self.scan_status = QLabel("")
         self.scan_status.setStyleSheet("color:#777; font-size:11px;")
@@ -5794,12 +6020,25 @@ class MusicPage(QWidget):
         self.hero_cover.setAlignment(Qt.AlignCenter)
         self.hero_cover.setStyleSheet("background:#121212; border:1px solid #252525; border-radius:10px;")
         now.addWidget(self.hero_cover, 0, Qt.AlignRight)
+        hero_title_row = QHBoxLayout()
+        hero_title_row.setSpacing(6)
+        hero_title_row.addStretch(1)
+
+        self.hero_favorite_btn = QPushButton("☆")
+        self.hero_favorite_btn.setCheckable(True)
+        self.hero_favorite_btn.setFixedSize(30, 30)
+        self.hero_favorite_btn.setCursor(Qt.PointingHandCursor)
+        self.hero_favorite_btn.setToolTip(TXT("收藏", "Favorite"))
+        self.hero_favorite_btn.clicked.connect(self._hero_favorite_toggled)
+        hero_title_row.addWidget(self.hero_favorite_btn)
+
         self.hero_title = QLabel(TXT("未选择歌曲", "No track selected"))
         self.hero_title.setAlignment(Qt.AlignRight)
         self.hero_title.setWordWrap(True)
         self.hero_title.setMaximumWidth(260)
         self.hero_title.setStyleSheet("font-size:15px; font-weight:700; color:#eeeeee;")
-        now.addWidget(self.hero_title, 0, Qt.AlignRight)
+        hero_title_row.addWidget(self.hero_title)
+        now.addLayout(hero_title_row)
         self.hero_artist = QLabel("")
         self.hero_artist.setAlignment(Qt.AlignRight)
         self.hero_artist.setStyleSheet("color:#888; font-size:12px;")
@@ -6151,6 +6390,9 @@ class MusicPage(QWidget):
                 if candidates:
                     lrc = candidates[0]
             info["lyrics"] = _parse_lrc(lrc) if lrc else []
+            key = self._track_key(path)
+            info["favorite"] = bool(self.library_state.get("favorites", {}).get(key, False))
+            info["category"] = str(self.library_state.get("categories", {}).get(key, ""))
             tracks.append(info)
 
         self.tracks = tracks
@@ -6172,10 +6414,51 @@ class MusicPage(QWidget):
             if w is not None:
                 w.deleteLater()
 
+        shown = 0
         for i, track in enumerate(self.tracks):
+            category = track.get("category", "")
+            favorite = bool(track.get("favorite", False))
+
+            if self.active_category == "__favorites__" and not favorite:
+                continue
+            if self.active_category == "__uncategorized__" and category:
+                continue
+            if self.active_category not in ("__all__", "__favorites__", "__uncategorized__"):
+                if category != self.active_category:
+                    continue
+
             row = MusicTrackRow(i, track, self._pixmap_for_track(track, 64))
             row.clicked.connect(self.select_track)
+            row.favoriteToggled.connect(self._set_track_favorite)
+            row.categoryRequested.connect(self._set_track_category_dialog)
             self.playlist_layout.insertWidget(self.playlist_layout.count() - 1, row)
+            shown += 1
+
+        if shown == 0:
+            empty = QLabel(TXT("这个分类里还没有歌曲", "No tracks in this category"))
+            empty.setAlignment(Qt.AlignCenter)
+            empty.setStyleSheet("color:#606060; padding:24px 4px; border:0;")
+            self.playlist_layout.insertWidget(self.playlist_layout.count() - 1, empty)
+
+
+    def _sync_hero_favorite(self):
+        if 0 <= self.current_index < len(self.tracks):
+            favorite = bool(self.tracks[self.current_index].get("favorite", False))
+        else:
+            favorite = False
+        self.hero_favorite_btn.blockSignals(True)
+        self.hero_favorite_btn.setChecked(favorite)
+        self.hero_favorite_btn.setText("★" if favorite else "☆")
+        self.hero_favorite_btn.setStyleSheet(
+            "border:0; background:transparent; font-size:22px; color:%s;" %
+            ("#f2cf55" if favorite else "#6a6a6a")
+        )
+        self.hero_favorite_btn.blockSignals(False)
+
+    def _hero_favorite_toggled(self, checked):
+        if 0 <= self.current_index < len(self.tracks):
+            self._set_track_favorite(self.current_index, bool(checked))
+            self._sync_hero_favorite()
 
     def select_track(self, index):
         if index < 0 or index >= len(self.tracks):
@@ -6197,6 +6480,7 @@ class MusicPage(QWidget):
         self.hero_cover.setPixmap(self._pixmap_for_track(track, 112))
         self.hero_title.setText(track["title"])
         self.hero_artist.setText(track["artist"])
+        self._sync_hero_favorite()
         self.total_time.setText(_format_ms(track["duration_ms"]))
         self.progress.setValue(0)
         self.current_time.setText("0:00")
@@ -6286,7 +6570,10 @@ class MusicPage(QWidget):
             for offset in range(-3, 4):
                 idx = current + offset
                 if current < 0:
-                    idx = offset + 3
+                    # Initial state: put the very first lyric in the center slot.
+                    # Previous-lyric slots above it remain empty, while upcoming
+                    # lyrics can already appear below.
+                    idx = offset if offset >= 0 else -1
                 if 0 <= idx < len(self.current_lyrics):
                     slot_lines.append(self._lyric_slot_lines(self.current_lyrics[idx][1]))
                 else:
