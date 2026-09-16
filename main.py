@@ -54,7 +54,7 @@ except Exception as exc:
     JOLT_ERROR = str(exc)
 
 APP_NAME = "5imp1e 5atebox"
-APP_VERSION = "0.21.1"
+APP_VERSION = "0.26.4"
 APP_SETTINGS = {
     "language": "zh",
     "mark_back": False,
@@ -5287,21 +5287,86 @@ class SettingsPage(QWidget):
 
         self.reset_coin_data_btn = QPushButton(TXT(
             "重置硬币赚钱模式数据",
-            "Reset Coin Earning Data"
+            "Reset Coin Unfair Mode Data"
         ))
         self.reset_coin_data_btn.setObjectName("dangerChipButton")
         self.reset_coin_data_btn.setMinimumWidth(220)
         self.reset_coin_data_btn.clicked.connect(self._confirm_reset_coin_data)
 
         data_form.addWidget(ResponsiveSettingRow(
-            TXT("硬币赚钱模式", "Coin Earning Mode"),
+            TXT("硬币赚钱模式", "Coin Unfair Mode"),
             TXT(
-                "金钱、升级、已购买硬币、总投掷次数与正面统计均保存在当前用户的本地设置中。这里只能手动重置。",
-                "Money, upgrades, purchased coins, total flips, and heads statistics are stored locally for the current user. They can only be reset here."
+                "金钱、升级、已购买硬币、总投掷次数与正面统计均保存在当前用户本地。重置时会清除推币机中所有玩家投入的硬币，并把机器默认硬币重新摆回初始布局。",
+                "Money, upgrades, purchased coins, total flips, and heads statistics are stored locally for the current user. Resetting also removes all player-added Coin Pusher coins and rebuilds the machine's default stock in its original starting layout."
             ),
             self.reset_coin_data_btn
         ))
         layout.addWidget(data_panel)
+
+        # ---- Administrator / Debug ----
+        layout.addSpacing(4)
+        layout.addWidget(category("管理员 / Debug", "ADMIN / DEBUG"))
+        debug_panel, debug_form = make_panel()
+
+        debug_settings = QSettings(
+            "5imp1e 5atebox",
+            "Debug"
+        )
+        # Migrate the old one-feature debug switch to the new global admin switch.
+        migrated_admin = debug_settings.value(
+            "admin_mode",
+            debug_settings.value(
+                "enable_unfair_manual_settle",
+                False,
+                type=bool
+            ),
+            type=bool
+        )
+
+        self.admin_mode_check = QCheckBox(
+            TXT("启用管理员模式", "Enable Administrator Mode")
+        )
+        self.admin_mode_check.setObjectName("adminModeCheck")
+        self.admin_mode_check.setCursor(Qt.PointingHandCursor)
+        self.admin_mode_check.setMinimumWidth(190)
+        self.admin_mode_check.setChecked(bool(migrated_admin))
+        # Give this switch an explicit visible indicator instead of relying on the
+        # platform checkbox renderer, which could appear blank on the dark theme.
+        self.admin_mode_check.setStyleSheet("""
+            QCheckBox#adminModeCheck {
+                color: #dddddd;
+                spacing: 9px;
+                padding: 5px 2px;
+            }
+            QCheckBox#adminModeCheck::indicator {
+                width: 18px;
+                height: 18px;
+                border: 1px solid #5a5a5a;
+                border-radius: 4px;
+                background: #0b0b0b;
+            }
+            QCheckBox#adminModeCheck::indicator:hover {
+                border-color: #8a8a8a;
+                background: #121212;
+            }
+            QCheckBox#adminModeCheck::indicator:checked {
+                background: #e7e7e7;
+                border-color: #e7e7e7;
+            }
+        """)
+        self.admin_mode_check.toggled.connect(
+            self._admin_mode_changed
+        )
+
+        debug_form.addWidget(ResponsiveSettingRow(
+            TXT("管理员模式", "Administrator Mode"),
+            TXT(
+                "可直接勾选开启管理员 / Debug 功能。当前开启后可使用赚钱模式的“手动结算”。也可按住 Ctrl + Shift + 空格，再输入 U、W、T 快速开启；后续会加入密码锁。",
+                "Directly check this box to enable administrator/debug features. For now it enables Settle Now in Unfair Mode. You can also hold Ctrl + Shift + Space and press U, W, T to enable it; a password lock can be added later."
+            ),
+            self.admin_mode_check
+        ))
+        layout.addWidget(debug_panel)
 
         layout.addStretch(1)
 
@@ -5314,13 +5379,30 @@ class SettingsPage(QWidget):
         self.riffle_input.editingFinished.connect(self._changed)
         self.cut_input.editingFinished.connect(self._changed)
 
+    def _admin_mode_changed(self, checked):
+        debug_settings = QSettings(
+            "5imp1e 5atebox",
+            "Debug"
+        )
+        debug_settings.setValue(
+            "admin_mode",
+            bool(checked)
+        )
+        # Keep the legacy key synchronized for compatibility with older builds.
+        debug_settings.setValue(
+            "enable_unfair_manual_settle",
+            bool(checked)
+        )
+        debug_settings.sync()
+        self.settingsChanged.emit()
+
     def _confirm_reset_coin_data(self):
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Warning)
         box.setWindowTitle(TXT("确认重置", "Confirm Reset"))
         box.setText(TXT(
-            "真的要重置硬币赚钱模式的全部本地数据吗？",
-            "Are you sure you want to reset all local Coin Earning Mode data?"
+            "真的要重置硬币赚钱模式的全部本地数据吗？推币机中玩家投入的硬币会被清除，默认硬币会重新摆回初始位置。",
+            "Are you sure you want to reset all local Coin Unfair Mode data? Player-added Coin Pusher coins will be removed and the default stock will be restored to its original layout."
         ))
         box.setInformativeText(TXT(
             "这会清除金钱、升级、已购买硬币、连胜和历史投掷统计。此操作无法撤销。",
@@ -7127,7 +7209,8 @@ class CoinMeshFactory:
             return cls._coin_meshdata
 
         R = 0.28
-        H = 0.024
+        # Slightly thicker coin body. H is the half-thickness.
+        H = 0.028
         bevel = 0.010
         seg = 64
 
@@ -7228,7 +7311,7 @@ class CoinMeshFactory:
         except Exception:
             base_c = np.tile(np.asarray((0.78,0.79,0.80,1.0),dtype=float), (len(base_f),1))
 
-        thickness = 0.051
+        thickness = 0.059
         all_v, all_f, all_c = [], [], []
         offset = 0
         for i in range(count):
@@ -7297,7 +7380,7 @@ class CoinFlipCanvas(gl.GLViewWidget):
         self._coin_press_button = None
 
         self.coin_radius = 0.28
-        self.coin_half = 0.024
+        self.coin_half = 0.028
         self.coin_thickness = self.coin_half * 2
         self.physics_dt = 1.0 / 240.0
         self.physics_accumulator = 0.0
@@ -7359,8 +7442,8 @@ class CoinFlipCanvas(gl.GLViewWidget):
             shape=culverin.SHAPE_BOX,
             motion=culverin.MOTION_STATIC,
             mass=0.0,
-            friction=0.62,
-            restitution=0.24,
+            friction=0.90,
+            restitution=0.18,
         )
 
         # Invisible Jolt containment: four walls plus a ceiling. Coins can bounce
@@ -7605,6 +7688,132 @@ class CoinFlipCanvas(gl.GLViewWidget):
         self.chargeChanged.emit(0.0, 0.0)
         self._update_preview_transform()
 
+    def manual_settle_unfair(self):
+        """Immediately freeze and settle the current Unfair-mode coin state.
+
+        This is deliberately based on what the coin is showing RIGHT NOW:
+        - any still-airborne controlled coin is converted to a real Jolt body at
+          its current visible quaternion;
+        - all linear/angular motion is zeroed;
+        - payout result is read from that exact orientation;
+        - no hidden probability target is consulted.
+        """
+        if not self.coins or self.collecting:
+            return False
+
+        now = time.perf_counter()
+        elapsed_flip = max(
+            0.0,
+            now - getattr(self, "flip_started_at", now)
+        )
+
+        results = []
+
+        for coin in self.coins:
+            body = coin.get("body")
+            if body is None:
+                continue
+
+            pos = self.world.get_position(body)
+            quat = self.world.get_rotation(body)
+            if not pos or not quat:
+                continue
+
+            # During the controlled airborne phase, the rendered quaternion can
+            # differ from Jolt's internal temporary body quaternion. Preserve the
+            # ACTUAL visible orientation before stopping.
+            if (
+                coin.get("forced_probability") is not None
+                and not coin.get("physics_released", False)
+            ):
+                q_total, angle_deg, normal_z = self._unfair_air_quaternion(
+                    coin, elapsed_flip
+                )
+
+                qx = float(q_total.x())
+                qy = float(q_total.y())
+                qz = float(q_total.z())
+                qw = float(q_total.scalar())
+
+                try:
+                    self.world.destroy_body(body)
+                except Exception:
+                    pass
+
+                body = self.world.create_convex_hull(
+                    pos=(
+                        float(pos[0]),
+                        float(pos[1]),
+                        float(pos[2]),
+                    ),
+                    rot=(qx, qy, qz, qw),
+                    points=self._coin_points(),
+                    motion=culverin.MOTION_DYNAMIC,
+                    mass=.12,
+                    friction=.68,
+                    restitution=.16,
+                    ccd=True,
+                )
+                coin["body"] = body
+                coin["physics_released"] = True
+                coin["display_normal_z"] = float(normal_z)
+                coin["visual_angle_deg"] = float(angle_deg)
+
+                quat = (qx, qy, qz, qw)
+
+                # Keep the rendered state exactly aligned with the frozen body.
+                self._apply_transform(coin, pos, quat)
+
+            # Reset ALL movement immediately.
+            try:
+                self.world.set_linear_velocity(
+                    body, 0.0, 0.0, 0.0
+                )
+            except Exception:
+                pass
+            try:
+                self.world.set_angular_velocity(
+                    body, 0.0, 0.0, 0.0
+                )
+            except Exception:
+                pass
+
+            # Re-read the final quaternion after the freeze/rebuild.
+            frozen_quat = self.world.get_rotation(body)
+            if frozen_quat:
+                quat = frozen_quat
+
+            # Manual settlement is intentionally binary for Unfair Mode:
+            # whichever face has the greater upward projection at this instant
+            # wins. An exactly vertical edge is resolved by the tiny sign of the
+            # face normal rather than consulting probability.
+            R = self._quat_matrix(quat)
+            normal_z = float(
+                (R @ np.asarray((0., 0., 1.)))[2]
+            )
+            result = 1 if normal_z >= 0.0 else 0
+
+            coin["sleep"] = 999.0
+            coin["micro_motion_time"] = 999.0
+            coin["result"] = int(result)
+            coin["last_face"] = int(result)
+            coin["display_face"] = int(result)
+            coin["display_normal_z"] = normal_z
+
+            results.append(int(result))
+
+        if not results:
+            return False
+
+        self.animating = False
+        self.needs_collect = False
+        self.require_collection_after_flip = False
+        self._timer.stop()
+        self.reset_charge()
+
+        self.flipFinished.emit(results)
+        return True
+
     @staticmethod
     def _quat_matrix(quat):
         x,y,z,w=[float(q) for q in quat]
@@ -7622,71 +7831,181 @@ class CoinFlipCanvas(gl.GLViewWidget):
                 pts.append((math.cos(a)*self.coin_radius,math.sin(a)*self.coin_radius,z))
         return np.asarray(pts,dtype=np.float32)
 
-    def _earning_rotation_plan(self, current_face, probability_hit, power):
-        """Choose a visibly varied flip count whose parity targets heads/tails.
+    def _earning_rotation_plan(
+        self,
+        current_face,
+        probability_hit,
+        power,
+        start_z,
+        launch_impulse_z,
+        coin_mass=0.12,
+        start_quat=None,
+    ):
+        """Plan the whole Unfair flip before the coin leaves the table.
 
-        The configured probability only chooses the target side. Spin count then
-        varies enormously without changing that probability: many full rotations
-        are added in pairs, while the final half-turn parity determines which face
-        is intended to finish upward.
+        Physical constraints come first:
+        - current coin height,
+        - chosen vertical launch impulse,
+        - gravity,
+        - predicted first contact with the floor.
+
+        Only after the available airborne time is known do we choose a noisy natural
+        spin rate. The nearest rotation count with the required heads/tails parity is
+        then selected BEFORE launch. Nothing is added at the end of the throw.
         """
-        target = 1 if probability_hit else 0
+        current_face = 1 if int(current_face) == 1 else 0
+        target_face = 1 if probability_hit else 0
+        required_parity = 0 if current_face == target_face else 1
 
-        # If the previous physical side is known, parity is relative to it.
-        if current_face not in (0, 1):
-            current_face = random.choice((0, 1))
-        parity = 0 if current_face == target else 1
+        p = max(0.05, float(power))
+        start_z = max(float(start_z), self.coin_half)
+        g = 9.81
 
-        # Very wide count distribution: usually dozens of half-turns, occasionally
-        # hundreds. ONLY parity controls the target side; adding full turns in pairs
-        # changes visual spin count enormously without changing the probability.
-        ordinary = random.randint(3, 28)
-        long_tail = int(random.expovariate(1.0 / 26.0))
-        rare_burst = random.randint(35, 150) if random.random() < 0.10 else 0
-        full_turns = max(2, min(260, ordinary + long_tail + rare_burst))
-        half_turns = 2 * full_turns + parity
+        # Jolt body is recreated at rest, so impulse / mass gives its initial
+        # vertical velocity closely enough for a pre-launch ballistic prediction.
+        vz0 = max(0.01, float(launch_impulse_z) / float(coin_mass))
+        floor_z = self.coin_half
 
-        # Random horizontal flip axis. Z component is only a small precession term,
-        # so the coin visibly tumbles face-over-face rather than merely spinning flat.
-        axis_angle = random.uniform(0.0, math.tau)
-        axis_x = math.cos(axis_angle)
-        axis_y = math.sin(axis_angle)
-
-        # Large count differences are visible, but sqrt/log scaling keeps Jolt stable.
-        visual_spin = (
-            0.012
-            + 0.0105 * math.sqrt(half_turns)
-            + 0.0060 * math.sqrt(max(1.0, power))
+        # z(t) = z0 + vz*t - 1/2*g*t^2
+        # Positive root = predicted first floor contact.
+        disc = max(
+            0.0,
+            vz0 * vz0 + 2.0 * g * max(0.0, start_z - floor_z)
         )
-        visual_spin *= random.uniform(0.90, 1.12)
+        air_time = (vz0 + math.sqrt(disc)) / g
+        air_time = max(0.22, min(6.0, air_time))
+
+        # Predicted apex is kept for diagnostics / future tuning and makes the
+        # planning explicitly height-aware.
+        apex_z = start_z + (vz0 * vz0) / (2.0 * g)
+
+        # Natural half-turn rate. Power raises the average, but large independent
+        # variance remains just like Normal mode.
+        speed_variance = random.uniform(0.62, 1.46)
+        if random.random() < 0.16:
+            speed_variance *= random.uniform(0.62, 1.55)
+
+        natural_half_turn_rate = (
+            7.2
+            + 5.3 * math.sqrt(p)
+            + 1.5 * math.log1p(p)
+        ) * speed_variance
+
+        # Occasional "wild" throws create very large count differences naturally
+        # by changing spin speed, not by tacking on turns after the fact.
+        if random.random() < 0.09:
+            natural_half_turn_rate *= random.uniform(1.35, 2.15)
+
+        natural_half_turns = max(
+            1,
+            int(round(natural_half_turn_rate * air_time))
+        )
+
+        # Pick the closest count that already has the required parity.
+        # This tiny correction is made here, before launch.
+        candidates = []
+        for delta in (-2, -1, 0, 1, 2):
+            n = natural_half_turns + delta
+            if n >= 1 and (n & 1) == required_parity:
+                candidates.append(n)
+
+        if not candidates:
+            n = natural_half_turns
+            if (n & 1) != required_parity:
+                n += 1
+            planned_half_turns = max(1, n)
+        else:
+            min_distance = min(abs(n - natural_half_turns) for n in candidates)
+            closest = [
+                n for n in candidates
+                if abs(n - natural_half_turns) == min_distance
+            ]
+            planned_half_turns = random.choice(closest)
+
+        # Exact rate is slightly adjusted BEFORE launch so the selected number of
+        # half-turns finishes exactly at the predicted first ground contact.
+        exact_half_turn_rate = planned_half_turns / air_time
+
+        # Preserve the exact landed orientation as the airborne starting pose.
+        # Choose a world-space tumble axis perpendicular to the current face normal;
+        # this guarantees that each 180-degree half-turn flips the visible side
+        # without first snapping the coin to a canonical flat orientation.
+        if start_quat is None:
+            start_quat = (0.0, 0.0, 0.0, 1.0)
+        sx, sy, sz, sw = [float(v) for v in start_quat]
+        q_start = QQuaternion(sw, sx, sy, sz)
+        n = q_start.rotatedVector(QVector3D(0.0, 0.0, 1.0))
+        nx, ny, nz = float(n.x()), float(n.y()), float(n.z())
+
+        # Pick a random tangent direction and cross it with the normal.
+        ref_angle = random.uniform(0.0, math.tau)
+        rx, ry, rz = math.cos(ref_angle), math.sin(ref_angle), 0.0
+        ax = ny * rz - nz * ry
+        ay = nz * rx - nx * rz
+        az = nx * ry - ny * rx
+        alen = math.sqrt(ax*ax + ay*ay + az*az)
+        if alen < 1e-6:
+            ax, ay, az = 1.0, 0.0, 0.0
+            alen = 1.0
+        axis_x, axis_y, axis_z = ax / alen, ay / alen, az / alen
 
         return {
-            "target_result": target,
-            "planned_half_turns": half_turns,
-            "axis_x": axis_x,
-            "axis_y": axis_y,
-            "spin": visual_spin,
+            "start_face": current_face,
+            "target_face": target_face,
+            "planned_half_turns": int(planned_half_turns),
+            "half_turn_rate": float(exact_half_turn_rate),
+            "natural_half_turn_rate": float(natural_half_turn_rate),
+            "speed_variance": float(speed_variance),
+            "visual_duration": float(air_time),
+            "predicted_air_time": float(air_time),
+            "predicted_apex_z": float(apex_z),
+            "launch_vz": float(vz0),
+            "axis_x": float(axis_x),
+            "axis_y": float(axis_y),
+            "axis_z": float(axis_z),
+            "start_quat": tuple(float(v) for v in start_quat),
         }
 
-    def _apply_earning_launch_impulse(self, body, plan, power):
-        upward = .46 + .18 * math.sqrt(power)
-        lateral = .014 + .010 * math.sqrt(power)
-        angle = random.uniform(0, math.tau)
+    def _choose_earning_linear_impulse(self, power):
+        p = max(0.05, float(power))
+        upward = .46 + .18 * math.sqrt(p)
+        lateral = .014 + .010 * math.sqrt(p)
+        angle = random.uniform(0.0, math.tau)
 
+        ix = math.cos(angle) * random.uniform(0.0, lateral)
+        iy = math.sin(angle) * random.uniform(0.0, lateral)
+        iz = upward * random.uniform(.90, 1.10)
+        return (ix, iy, iz)
+
+    def _apply_earning_launch_impulse(
+        self,
+        body,
+        plan,
+        linear_impulse,
+        power,
+    ):
+        ix, iy, iz = linear_impulse
         self.world.apply_impulse(
             body,
-            math.cos(angle) * random.uniform(0.0, lateral),
-            math.sin(angle) * random.uniform(0.0, lateral),
-            upward * random.uniform(.92, 1.08),
+            float(ix),
+            float(iy),
+            float(iz),
         )
 
-        s = float(plan["spin"])
-        # Strong horizontal-axis tumbling, plus a modest random precession.
+        # Match the precomputed visual rate with a similarly varied physical tumble.
+        # Translation/collisions remain Jolt-driven; the exact face parity is already
+        # baked into planned_half_turns before this impulse is applied.
+        rate = float(plan["half_turn_rate"])
+        spin_impulse = (
+            .010
+            + .00165 * rate
+        ) * random.uniform(.82, 1.20)
+
         self.world.apply_angular_impulse(
             body,
-            plan["axis_x"] * s,
-            plan["axis_y"] * s,
-            random.uniform(-0.20*s, 0.20*s),
+            plan["axis_x"] * spin_impulse,
+            plan["axis_y"] * spin_impulse,
+            plan["axis_z"] * spin_impulse,
         )
 
     def _clear_dynamic(self):
@@ -7712,42 +8031,70 @@ class CoinFlipCanvas(gl.GLViewWidget):
         if self.animating or self.collecting or self.needs_collect:
             return
 
-        count=max(1,min(200,int(count)))
+        count = max(1, min(200, int(count)))
         if power is None:
-            power=self.effective_power()
-        power=max(.05,float(power))
+            power = self.effective_power()
+        power = max(.05, float(power))
 
+        unfair_mode = not bool(collisions)
         self.require_collection_after_flip = bool(collisions)
         self._release_timer.stop()
-        points=self._coin_points()
+        points = self._coin_points()
 
-        # Earning mode: after the first flip, relaunch the same coins from the
-        # positions/orientations where they last landed. No stacking/teleporting.
         can_reuse = (
-            reuse_existing
+            unfair_mode
+            and reuse_existing
             and self.coins
             and len(self.coins) == count
         )
 
         if can_reuse:
-            # A preview mesh is never a reason to respawn the physical coins.
-            # Remove the visual preview only; retain every landed body's world
-            # position and use those exact coordinates for the next launch.
+            # Keep every X/Y/Z landing position. No recentering or restacking.
             if self.preview_item is not None:
                 try:
                     self.removeItem(self.preview_item)
                 except Exception:
                     pass
                 self.preview_item = None
-            for i, coin in enumerate(self.coins):
+
+            for coin in self.coins:
                 old_body = coin.get("body")
                 pos = self.world.get_position(old_body) if old_body is not None else None
                 quat = self.world.get_rotation(old_body) if old_body is not None else None
 
                 if not pos:
-                    pos = (0.0, 0.0, self.coin_half)
+                    pos = tuple(coin.get("last_position", (0.0, 0.0, self.coin_half)))
                 if not quat:
                     quat = (0.0, 0.0, 0.0, 1.0)
+
+                # Record the side ACTUALLY visible at the end of the previous throw.
+                # This is the state used to choose odd/even rotations next time.
+                current_face = int(
+                    coin.get(
+                        "display_face",
+                        coin.get("last_face", 1)
+                    )
+                )
+                if current_face not in (0, 1):
+                    current_face = 1
+
+                probability_hit = (
+                    random.random() < float(heads_probability)
+                )
+
+                # Choose the physical launch FIRST. The predicted first ground
+                # contact time from this impulse determines how many rotations are
+                # physically available.
+                linear_impulse = self._choose_earning_linear_impulse(power)
+                plan = self._earning_rotation_plan(
+                    current_face,
+                    probability_hit,
+                    power,
+                    start_z=float(pos[2]),
+                    launch_impulse_z=float(linear_impulse[2]),
+                    coin_mass=.12,
+                    start_quat=tuple(float(v) for v in quat),
+                )
 
                 try:
                     if old_body is not None:
@@ -7755,48 +8102,63 @@ class CoinFlipCanvas(gl.GLViewWidget):
                 except Exception:
                     pass
 
-                probability_hit = random.random() < float(heads_probability)
+                # The body starts from the EXACT previous landing position AND
+                # orientation. Nothing changes face between landing and relaunch.
+                launch_rot = tuple(float(v) for v in quat)
 
-                # Earning mode remembers the previous *logical* side. The next
-                # target is chosen by probability, then an even/odd number of
-                # half-turns is selected relative to that remembered side.
-                current_face = int(coin.get("last_face", self._read_face(quat)))
-                if current_face not in (0, 1):
-                    current_face = 1
-                plan = self._earning_rotation_plan(
-                    current_face, probability_hit, power
-                )
-
-                # Start from the same landed position. Orientation is normalized to
-                # the remembered side so numerical solver drift cannot slowly turn
-                # the configured probability into an accidental ~50/50 process.
-                launch_rot = (
-                    (0.0, 0.0, 0.0, 1.0)
-                    if current_face == 1
-                    else (1.0, 0.0, 0.0, 0.0)
-                )
-
-                body=self.world.create_convex_hull(
-                    pos=(float(pos[0]), float(pos[1]), max(float(pos[2]), self.coin_half + 0.002)),
+                body = self.world.create_convex_hull(
+                    pos=(
+                        float(pos[0]),
+                        float(pos[1]),
+                        float(pos[2]),
+                    ),
                     rot=launch_rot,
                     points=points,
                     motion=culverin.MOTION_DYNAMIC,
                     mass=.12,
-                    friction=.48,
+                    friction=.68,
                     restitution=.20,
                     ccd=True,
                 )
 
-                self._apply_earning_launch_impulse(body, plan, power)
+                self._apply_earning_launch_impulse(
+                    body,
+                    plan,
+                    linear_impulse,
+                    power,
+                )
 
-                coin["body"] = body
-                coin["sleep"] = 0.0
-                coin["result"] = None
-                coin["forced_probability"] = float(heads_probability)
-                coin["probability_hit"] = probability_hit
-                coin["target_result"] = plan["target_result"]
-                coin["planned_half_turns"] = plan["planned_half_turns"]
-                coin["had_strong_collision"] = False
+                coin.update({
+                    "body": body,
+                    "sleep": 0.0,
+                    "result": None,
+                    "micro_motion_time": 0.0,
+                    "forced_probability": float(heads_probability),
+                    "probability_hit": probability_hit,
+                    "start_face": plan["start_face"],
+                    "target_face": plan["target_face"],
+                    "planned_half_turns": plan["planned_half_turns"],
+                    "half_turn_rate": plan["half_turn_rate"],
+                    "natural_half_turn_rate": plan["natural_half_turn_rate"],
+                    "speed_variance": plan["speed_variance"],
+                    "visual_spin_duration": plan["visual_duration"],
+                    "predicted_air_time": plan["predicted_air_time"],
+                    "predicted_apex_z": plan["predicted_apex_z"],
+                    "visual_axis_x": plan["axis_x"],
+                    "visual_axis_y": plan["axis_y"],
+                    "visual_axis_z": plan["axis_z"],
+                    "air_start_quat": plan["start_quat"],
+                    "physics_released": False,
+                    "first_contact_at": None,
+                    "display_face": current_face,
+                    "display_normal_z": 1.0 if current_face == 1 else -1.0,
+                    "visual_angle_deg": 0.0,
+                    "last_position": (
+                        float(pos[0]),
+                        float(pos[1]),
+                        float(pos[2]),
+                    ),
+                })
 
         else:
             self._clear_dynamic()
@@ -7806,145 +8168,309 @@ class CoinFlipCanvas(gl.GLViewWidget):
                     self.removeItem(self.preview_item)
                 except Exception:
                     pass
-                self.preview_item=None
+                self.preview_item = None
 
             for i in range(count):
-                z=self.coin_half+i*(self.coin_thickness+.004)
-                item=self._make_mesh_item()
+                z = self.coin_half + i * (self.coin_thickness + .004)
+                item = self._make_mesh_item()
                 self.addItem(item)
 
-                # Physically stacked coins; tiny offsets keep the convex hull solver
-                # away from perfectly coincident contact manifolds.
-                x0=(i%3-1)*.002
-                y0=((i//3)%3-1)*.002
+                x0 = (i % 3 - 1) * .002
+                y0 = ((i // 3) % 3 - 1) * .002
 
-                forced_probability = (
-                    float(heads_probability) if not collisions else None
-                )
-                probability_hit = (
-                    random.random() < forced_probability
-                    if forced_probability is not None else None
-                )
-                launch_rot = (0.,0.,0.,1.)
-                plan = (
-                    self._earning_rotation_plan(1, probability_hit, power)
-                    if forced_probability is not None else None
-                )
+                if unfair_mode:
+                    # Initial modeled stack shows the front / heads side upward.
+                    current_face = 1
+                    probability_hit = (
+                        random.random() < float(heads_probability)
+                    )
+                    linear_impulse = self._choose_earning_linear_impulse(power)
+                    plan = self._earning_rotation_plan(
+                        current_face,
+                        probability_hit,
+                        power,
+                        start_z=float(z),
+                        launch_impulse_z=float(linear_impulse[2]),
+                        coin_mass=.12,
+                        start_quat=(0.0, 0.0, 0.0, 1.0),
+                    )
+                    launch_rot = (0.0, 0.0, 0.0, 1.0)
+                else:
+                    current_face = None
+                    probability_hit = None
+                    plan = None
+                    launch_rot = (0.0, 0.0, 0.0, 1.0)
 
-                body=self.world.create_convex_hull(
-                    pos=(x0,y0,z),
+                body = self.world.create_convex_hull(
+                    pos=(x0, y0, z),
                     rot=launch_rot,
                     points=points,
                     motion=culverin.MOTION_DYNAMIC,
                     mass=.12,
-                    friction=.48,
-                    restitution=.31 if collisions else .20,
+                    friction=.68,
+                    restitution=.25 if collisions else .16,
                     ccd=True,
                 )
 
-                upward=.46+.18*math.sqrt(power)
-
                 if collisions:
-                    lateral=.020+.013*math.sqrt(power)
-                    angle=random.uniform(0,math.tau)
+                    # Normal mode remains unchanged: fully physical random tumble.
+                    upward = .46 + .18 * math.sqrt(power)
+                    lateral = .020 + .013 * math.sqrt(power)
+                    angle = random.uniform(0, math.tau)
                     self.world.apply_impulse(
                         body,
-                        math.cos(angle)*random.uniform(0.,lateral),
-                        math.sin(angle)*random.uniform(0.,lateral),
-                        upward*random.uniform(.92,1.08),
+                        math.cos(angle) * random.uniform(0., lateral),
+                        math.sin(angle) * random.uniform(0., lateral),
+                        upward * random.uniform(.92, 1.08),
                     )
 
-                    spin=.016+math.sqrt(power)*random.uniform(.020,.030)
+                    spin = .016 + math.sqrt(power) * random.uniform(.020, .030)
                     self.world.apply_angular_impulse(
                         body,
-                        random.uniform(-spin,spin),
-                        random.uniform(-spin,spin),
-                        random.uniform(-spin*.18,spin*.18),
+                        random.uniform(-spin, spin),
+                        random.uniform(-spin, spin),
+                        random.uniform(-spin*.18, spin*.18),
                     )
                 else:
-                    self._apply_earning_launch_impulse(body, plan, power)
+                    self._apply_earning_launch_impulse(
+                        body,
+                        plan,
+                        linear_impulse,
+                        power,
+                    )
 
                 self.coins.append({
-                    "body":body,
-                    "item":item,
-                    "sleep":0.,
-                    "result":None,
-                    "forced_probability":forced_probability,
-                    "probability_hit":probability_hit,
-                    "target_result":(
-                        plan["target_result"] if plan is not None else None
+                    "body": body,
+                    "item": item,
+                    "sleep": 0.0,
+                    "micro_motion_time": 0.0,
+                    "result": None,
+                    "forced_probability": (
+                        float(heads_probability)
+                        if unfair_mode else None
                     ),
-                    "planned_half_turns":(
-                        plan["planned_half_turns"] if plan is not None else None
+                    "probability_hit": probability_hit,
+                    "start_face": (
+                        plan["start_face"]
+                        if plan is not None else None
                     ),
-                    "last_face": 1 if forced_probability is not None else None,
-                    "had_strong_collision": False,
+                    "target_face": (
+                        plan["target_face"]
+                        if plan is not None else None
+                    ),
+                    "planned_half_turns": (
+                        plan["planned_half_turns"]
+                        if plan is not None else None
+                    ),
+                    "half_turn_rate": (
+                        plan["half_turn_rate"]
+                        if plan is not None else None
+                    ),
+                    "natural_half_turn_rate": (
+                        plan["natural_half_turn_rate"]
+                        if plan is not None else None
+                    ),
+                    "predicted_air_time": (
+                        plan["predicted_air_time"]
+                        if plan is not None else None
+                    ),
+                    "predicted_apex_z": (
+                        plan["predicted_apex_z"]
+                        if plan is not None else None
+                    ),
+                    "speed_variance": (
+                        plan["speed_variance"]
+                        if plan is not None else None
+                    ),
+                    "visual_spin_duration": (
+                        plan["visual_duration"]
+                        if plan is not None else None
+                    ),
+                    "visual_axis_x": (
+                        plan["axis_x"]
+                        if plan is not None else None
+                    ),
+                    "visual_axis_y": (
+                        plan["axis_y"]
+                        if plan is not None else None
+                    ),
+                    "visual_axis_z": (
+                        plan["axis_z"]
+                        if plan is not None else None
+                    ),
+                    "air_start_quat": (
+                        plan["start_quat"]
+                        if plan is not None else None
+                    ),
+                    "physics_released": False if unfair_mode else True,
+                    "first_contact_at": None,
+                    "display_face": (
+                        current_face if unfair_mode else None
+                    ),
+                    "display_normal_z": (
+                        1.0 if unfair_mode else None
+                    ),
+                    "visual_angle_deg": 0.0,
+                    "last_position": (x0, y0, z),
                 })
 
-        self.physics_accumulator=0.
-        self.last_tick=time.perf_counter()
-        self.flip_started_at=self.last_tick
-        self.animating=True
+        self.physics_accumulator = 0.0
+        self.last_tick = time.perf_counter()
+        self.flip_started_at = self.last_tick
+        self.auto_unfair_settle_done = False
+        self.animating = True
         self._timer.start()
 
     def _mark_strong_earning_collisions(self):
-        """Mark only clearly energetic coin/coin contacts as physical overrides.
+        # Unfair Mode outcome is now determined solely from the displayed coin face.
+        # Jolt collisions still affect position/trajectory, but do not directly write
+        # a hidden result variable.
+        return
 
-        This is deliberately conservative. Ordinary solver contact should not
-        change the configured unfair probability; only a genuinely strong collision
-        may turn a planned tails into an accidental paid heads.
+
+    @staticmethod
+    def _ease_out_cubic(t):
+        t = max(0.0, min(1.0, float(t)))
+        return 1.0 - (1.0 - t) ** 3
+
+    def _unfair_air_quaternion(self, coin, elapsed_flip):
+        """Return the currently controlled AIRBORNE orientation.
+
+        The count/rate were fixed before launch. This helper never modifies a coin
+        after the first ground contact.
         """
-        if len(self.coins) < 2:
+        duration = max(
+            0.001,
+            float(
+                coin.get("predicted_air_time")
+                or coin.get("visual_spin_duration")
+                or 1.0
+            )
+        )
+        half_turns = int(coin.get("planned_half_turns") or 0)
+        axis_x = float(coin.get("visual_axis_x") or 1.0)
+        axis_y = float(coin.get("visual_axis_y") or 0.0)
+        axis_z = float(coin.get("visual_axis_z") or 0.0)
+
+        start_quat = coin.get("air_start_quat") or (0.0, 0.0, 0.0, 1.0)
+        sx, sy, sz, sw = [float(v) for v in start_quat]
+        q_start = QQuaternion(sw, sx, sy, sz)
+
+        # Constant precomputed angular rate. If real contact happens sooner/later
+        # than the ballistic prediction, we simply use the angle reached at that
+        # instant; we DO NOT append a last-second correction turn.
+        t = max(0.0, min(float(elapsed_flip), duration))
+        progress = t / duration
+        angle_deg = float(half_turns) * 180.0 * progress
+
+        q_spin = QQuaternion.fromAxisAndAngle(
+            axis_x, axis_y, axis_z, angle_deg
+        )
+        # World-space tumble about an axis perpendicular to the starting face.
+        q_total = q_spin * q_start
+
+        normal = q_total.rotatedVector(QVector3D(0.0, 0.0, 1.0))
+        normal_z = float(normal.z())
+        return q_total, angle_deg, normal_z
+
+    def _apply_earning_visual_transform(self, coin, pos, elapsed_flip):
+        """Control only the airborne rotation. Ground motion is never overridden."""
+        q_total, angle_deg, normal_z = self._unfair_air_quaternion(
+            coin, elapsed_flip
+        )
+
+        m = QMatrix4x4()
+        m.translate(float(pos[0]), float(pos[1]), float(pos[2]))
+        m.rotate(q_total)
+        coin["item"].setTransform(m)
+
+        coin["display_normal_z"] = normal_z
+        coin["visual_angle_deg"] = float(angle_deg)
+        if normal_z > 0.15:
+            coin["display_face"] = 1
+        elif normal_z < -0.15:
+            coin["display_face"] = 0
+        else:
+            coin["display_face"] = 2
+
+        coin["last_position"] = (
+            float(pos[0]), float(pos[1]), float(pos[2])
+        )
+
+    def _release_unfair_to_physics(self, coin, pos, lv, elapsed_flip):
+        """Hand the coin to Jolt at first ground contact with NO visible snap.
+
+        The new rigid body is created at the exact visible airborne orientation,
+        position, and downward momentum. From this point onward all bounces,
+        ricochets, and face changes are entirely physical.
+        """
+        if coin.get("physics_released", False):
             return
 
-        states = []
-        for coin in self.coins:
-            if coin.get("forced_probability") is None or coin.get("result") is not None:
-                continue
-            body = coin.get("body")
-            if body is None:
-                continue
-            pos = self.world.get_position(body)
-            vel = self.world.get_velocity(body)
-            if not pos or not vel:
-                continue
-            states.append((coin, pos, vel))
+        old_body = coin.get("body")
+        q_total, angle_deg, normal_z = self._unfair_air_quaternion(
+            coin, elapsed_flip
+        )
 
-        contact_dist = self.coin_radius * 2.08
-        contact_dist2 = contact_dist * contact_dist
+        qx, qy, qz = float(q_total.x()), float(q_total.y()), float(q_total.z())
+        qw = float(q_total.scalar())
 
-        for i in range(len(states)):
-            ci, pi, vi = states[i]
-            for j in range(i + 1, len(states)):
-                cj, pj, vj = states[j]
-                dx = float(pi[0]) - float(pj[0])
-                dy = float(pi[1]) - float(pj[1])
-                dz = float(pi[2]) - float(pj[2])
-                if dx*dx + dy*dy + dz*dz > contact_dist2:
-                    continue
+        try:
+            if old_body is not None:
+                self.world.destroy_body(old_body)
+        except Exception:
+            pass
 
-                rvx = float(vi[0]) - float(vj[0])
-                rvy = float(vi[1]) - float(vj[1])
-                rvz = float(vi[2]) - float(vj[2])
-                relative_speed = math.sqrt(rvx*rvx + rvy*rvy + rvz*rvz)
+        body = self.world.create_convex_hull(
+            pos=(float(pos[0]), float(pos[1]), float(pos[2])),
+            rot=(qx, qy, qz, qw),
+            points=self._coin_points(),
+            motion=culverin.MOTION_DYNAMIC,
+            mass=.12,
+            friction=.68,
+            restitution=.20,
+            ccd=True,
+        )
 
-                # Only a clearly energetic hit is allowed to override an unfair
-                # tails plan. This keeps the long-run rate close to configuration.
-                if relative_speed > 0.90:
-                    ci["had_strong_collision"] = True
-                    cj["had_strong_collision"] = True
+        # Reapply the current linear momentum. The newly created body then owns the
+        # first collision and every subsequent bounce.
+        self.world.apply_impulse(
+            body,
+            float(lv[0]) * .12,
+            float(lv[1]) * .12,
+            float(lv[2]) * .12,
+        )
+
+        # Continue approximately the airborne angular momentum through impact.
+        rate = float(coin.get("half_turn_rate") or 0.0)
+        spin_impulse = .010 + .00165 * rate
+        self.world.apply_angular_impulse(
+            body,
+            float(coin.get("visual_axis_x") or 1.0) * spin_impulse,
+            float(coin.get("visual_axis_y") or 0.0) * spin_impulse,
+            float(coin.get("visual_axis_z") or 0.0) * spin_impulse,
+        )
+
+        coin["body"] = body
+        coin["physics_released"] = True
+        coin["first_contact_at"] = time.perf_counter()
+        coin["display_normal_z"] = normal_z
+        coin["visual_angle_deg"] = float(angle_deg)
+        coin["sleep"] = 0.0
+
+
+    def _detect_unfair_face(self, coin):
+        # Compatibility helper only. Final Unfair payout now uses the REAL Jolt
+        # quaternion after all ground bounces have finished.
+        body = coin.get("body")
+        quat = self.world.get_rotation(body) if body is not None else None
+        return self._read_face(quat) if quat else 2
 
     def _show_earning_result_face(self, coin, pos, result):
-        """Keep the visible landed face consistent with the parity-controlled result."""
-        q = (
-            QQuaternion(1.0, 0.0, 0.0, 0.0)
-            if int(result) == 1
-            else QQuaternion.fromAxisAndAngle(1.0, 0.0, 0.0, 180.0)
-        )
-        m = QMatrix4x4()
-        m.translate(float(pos[0]), float(pos[1]), max(float(pos[2]), self.coin_half))
-        m.rotate(q)
-        coin["item"].setTransform(m)
+        # Deprecated compatibility hook. Unfair Mode never corrects orientation
+        # after launch; all parity/count decisions are made before the throw.
+        return
+
 
     def _apply_transform(self,coin,pos,quat):
         q=QQuaternion(float(quat[3]),float(quat[0]),float(quat[1]),float(quat[2]))
@@ -8079,6 +8605,22 @@ class CoinFlipCanvas(gl.GLViewWidget):
         self.last_tick=now
         self.physics_accumulator+=frame_dt
 
+        # Standard Unfair-mode timeout: after 4.5 seconds, freeze every unresolved
+        # Unfair coin and settle from its ACTUAL visible/physical orientation at
+        # that exact moment. This is always active and is NOT an admin/debug option.
+        if (
+            not getattr(self, "auto_unfair_settle_done", False)
+            and (now - self.flip_started_at) >= 4.5
+            and any(
+                c.get("forced_probability") is not None
+                and c.get("result") is None
+                for c in self.coins
+            )
+        ):
+            self.auto_unfair_settle_done = True
+            self.manual_settle_unfair()
+            return
+
         steps=0
         while self.physics_accumulator>=self.physics_dt and steps<12:
             self.world.step(self.physics_dt)
@@ -8098,7 +8640,37 @@ class CoinFlipCanvas(gl.GLViewWidget):
             if not pos or not quat or not lv or not av:
                 continue
 
-            self._apply_transform(coin,pos,quat)
+            elapsed_flip = max(0.0, now - self.flip_started_at)
+
+            if coin.get("forced_probability") is None:
+                self._apply_transform(coin,pos,quat)
+            elif coin.get("physics_released", False):
+                # After first ground contact there is ZERO result control.
+                # All visible flips/bounces come directly from Jolt.
+                self._apply_transform(coin,pos,quat)
+            else:
+                self._apply_earning_visual_transform(
+                    coin, pos, elapsed_flip
+                )
+
+                # Detect actual first contact from the controlled visible tilt.
+                # A vertical coin touches the floor with its radius; a flat coin
+                # touches with half-thickness.
+                nz = abs(float(coin.get("display_normal_z", 1.0)))
+                vertical_extent = (
+                    nz * self.coin_half
+                    + math.sqrt(max(0.0, 1.0 - nz*nz)) * self.coin_radius
+                )
+                descending = float(lv[2]) <= 0.0
+                touching_floor = float(pos[2]) <= vertical_extent + 0.018
+
+                if descending and touching_floor and elapsed_flip > 0.08:
+                    self._release_unfair_to_physics(
+                        coin, pos, lv, elapsed_flip
+                    )
+                    # The body changed; defer velocity/settling checks until the
+                    # next frame so the first Jolt collision can happen naturally.
+                    continue
 
             linear=math.sqrt(sum(float(v)*float(v) for v in lv))
             angular=math.sqrt(sum(float(v)*float(v) for v in av))
@@ -8109,14 +8681,20 @@ class CoinFlipCanvas(gl.GLViewWidget):
                 except Exception:
                     pass
 
+                # Preserve XY for Unfair mode so recovery never looks like a
+                # result-changing teleport. Normal mode keeps the old center rescue.
+                rescue_x = float(pos[0]) if coin.get("forced_probability") is not None else random.uniform(-.25,.25)
+                rescue_y = float(pos[1]) if coin.get("forced_probability") is not None else random.uniform(-.25,.25)
+                rescue_z = 0.65 if coin.get("forced_probability") is not None else 3.5
+
                 body=self.world.create_convex_hull(
-                    pos=(random.uniform(-.25,.25),random.uniform(-.25,.25),3.5),
+                    pos=(rescue_x,rescue_y,rescue_z),
                     rot=quat,
                     points=self._coin_points(),
                     motion=culverin.MOTION_DYNAMIC,
                     mass=.12,
-                    friction=.48,
-                    restitution=.28,
+                    friction=.68,
+                    restitution=.22,
                     ccd=True
                 )
                 self.world.apply_impulse(
@@ -8127,6 +8705,8 @@ class CoinFlipCanvas(gl.GLViewWidget):
                 )
                 coin["body"]=body
                 coin["sleep"]=0.
+                if coin.get("forced_probability") is not None:
+                    coin["physics_released"] = True
                 continue
 
             # Large stacks can settle several world units above the table, so
@@ -8134,51 +8714,54 @@ class CoinFlipCanvas(gl.GLViewWidget):
             # many bodies are supported by other coins and keep tiny solver jitter.
             # Treat a coin as settled after sustained low kinetic motion anywhere
             # inside the room, and use its actual upward-facing side.
-            if linear < .115 and angular < .52:
+            # Higher-friction table should stop coins faster, but Jolt may still
+            # report tiny persistent solver jitter when a coin is touching another
+            # coin or resting slightly tilted. Treat sustained micro-motion as
+            # "landed" instead of waiting forever for mathematically zero velocity.
+            if linear < .105 and angular < .48:
                 coin["sleep"] += frame_dt
             else:
-                coin["sleep"] = max(0.0, coin["sleep"] - frame_dt * 1.35)
+                coin["sleep"] = max(0.0, coin["sleep"] - frame_dt * 1.45)
 
-            elapsed_flip = max(0.0, now - self.flip_started_at)
+            if linear < .185 and angular < .82:
+                coin["micro_motion_time"] = coin.get("micro_motion_time", 0.0) + frame_dt
+            else:
+                coin["micro_motion_time"] = max(
+                    0.0,
+                    coin.get("micro_motion_time", 0.0) - frame_dt * 1.65
+                )
+
+            sustained_micro_motion = coin.get("micro_motion_time", 0.0) > 0.82
             micro_jitter_fallback = (
-                elapsed_flip > 10.0
-                and linear < .22
-                and angular < .95
+                (elapsed_flip > 7.0 and linear < .24 and angular < 1.00)
+                or sustained_micro_motion
             )
 
-            if coin["sleep"] > .46 or micro_jitter_fallback:
+            physical_result_ready = (
+                coin.get("forced_probability") is None
+                or bool(coin.get("physics_released", False))
+            )
+
+            if (
+                (coin["sleep"] > .46 or micro_jitter_fallback)
+                and physical_result_ready
+            ):
                 physical_result = self._read_face(quat)
 
-                if coin["forced_probability"] is None:
-                    # Normal mode is always purely physical.
-                    result = physical_result
-                else:
-                    # Earning mode probability is represented by planned flip-count
-                    # parity. The huge random number of full turns does not change
-                    # the configured probability.
-                    target_result = int(coin.get("target_result", 0))
+                # Both Normal and Unfair now settle from the REAL Jolt quaternion.
+                # In Unfair mode, probability only influenced airborne turn count;
+                # every ground collision/bounce after first contact is uncontrolled.
+                result = physical_result
 
-                    # A miss remains tails regardless of ordinary solver noise.
-                    # The only physical override is a *strong coin-to-coin collision*
-                    # that was actually observed during this throw and leaves the
-                    # coin physically heads-up.
-                    collision_override_heads = (
-                        target_result == 0
-                        and bool(coin.get("had_strong_collision", False))
-                        and physical_result == 1
+                if coin["forced_probability"] is not None:
+                    coin["last_face"] = int(result)
+                    coin["display_face"] = int(result)
+                    R = self._quat_matrix(quat)
+                    coin["display_normal_z"] = float(
+                        (R @ np.asarray((0., 0., 1.)))[2]
                     )
 
-                    result = 1 if (
-                        target_result == 1 or collision_override_heads
-                    ) else 0
-
-                    # The visible settled coin must agree with the parity-controlled
-                    # outcome. This prevents the UI from showing heads while paying
-                    # tails (or vice versa).
-                    self._show_earning_result_face(coin, pos, result)
-                    coin["last_face"] = int(result)
-
-                coin["result"]=result
+                coin["result"] = result
 
         if self.coins and all(c["result"] is not None for c in self.coins):
             results=[int(c["result"]) for c in self.coins]
@@ -8189,32 +8772,1705 @@ class CoinFlipCanvas(gl.GLViewWidget):
             self.flipFinished.emit(results)
 
 
+
+
+
+class CoinPusherCanvas(gl.GLViewWidget):
+    """True 3D rigid-body coin pusher.
+
+    All coins are Culverin/Jolt dynamic rigid bodies. The pusher is a real
+    kinematic box body with the exact same dimensions/position as its rendered
+    mesh, so it physically collides with and pushes coins. Falling coins are never
+    snapped to shelves; gravity, shelves, coins, walls, tray, and pusher contacts
+    determine where they land.
+    """
+
+    stateChanged = Signal(object)
+    refundEarned = Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(760, 520)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setBackgroundColor((6, 6, 7, 255))
+        self.setCameraPosition(
+            pos=QVector3D(0.0, 1.15, 0.70),
+            distance=9.6,
+            elevation=24,
+            azimuth=-90,
+        )
+
+        # Machine proportions.
+        self.machine_width = 4.10
+        self.upper_width = 3.42
+        self.lower_width = 3.72
+
+        self.upper_back = -1.18
+        self.upper_front = 0.56
+        self.lower_back = 0.28
+        self.lower_front = 2.50
+
+        # These are actual top-surface Z coordinates.
+        self.upper_z = 0.66
+        self.lower_z = 0.28
+        self.basket_z = -0.34
+
+        self.upper_plate_t = 0.10
+        self.lower_plate_t = 0.11
+
+        self.coin_radius = 0.105
+        self._reference_coin_radius = 0.28
+        self._coin_visual_scale = self.coin_radius / self._reference_coin_radius
+        self.coin_half = 0.028 * self._coin_visual_scale
+        self.coin_mass = 0.008
+
+        # Pusher geometry. self.pusher_y is its CENTER, both visually and physically.
+        self.pusher_back = -1.12
+        self.pusher_stroke = 0.56
+        self.pusher_depth = 0.28
+        self.pusher_height = 0.19
+        self.pusher_period = 1.85
+        self.pusher_phase = 0.0
+        self.pusher_y = self.pusher_back
+
+        # Lower deck gets its own solid slider/pusher. It is phase-offset from
+        # the upper one so the machine has a more natural two-stage shove cycle.
+        self.lower_pusher_back = self.lower_back + 0.16
+        self.lower_pusher_stroke = 0.50
+        self.lower_pusher_depth = 0.26
+        self.lower_pusher_height = 0.17
+        self.lower_pusher_y = self.lower_pusher_back
+        self.lower_pusher_phase_offset = 0.50  # half a cycle behind upper
+
+        # The space between upper and lower decks is intentionally OPEN so coins
+        # can fall freely from the upper shelf onto the lower shelf. The lower
+        # triangular deflector may still send some coins behind the lower pusher,
+        # where they can enter the rear-loss area.
+        self.lower_backstop_y = self.lower_back - 0.055
+        self.lower_backstop_h = 0.74
+        self.lower_backstop_t = 0.10
+        self.rear_loss_half_width = 0.64
+
+        # Small triangular prism mounted on top of the lower pusher.
+        self.lower_deflector_depth = self.lower_pusher_depth * 0.96
+        self.lower_deflector_height = 0.16
+        self.lower_deflector_width = self.lower_width - 0.18
+
+        self.drop_lane_x = [-1.18, -0.60, 0.0, 0.60, 1.18]
+
+        # Most chute exits now sit noticeably farther forward, directly over the
+        # upper shelf instead of just behind its rear edge.
+        self.drop_start_y = -0.90
+        self.drop_start_z = 2.38
+
+        # Keep a deliberate minority "rear miss" route: these coins release near /
+        # just behind the upper rear edge and can still be caught/swept backward.
+        self.rear_drop_chance = 0.14
+        self.rear_drop_y = self.upper_back - 0.10
+
+        self.payout_half_width = 1.18
+
+        # Per-user local persistence. QSettings is stored in the current OS user's
+        # profile, so every Windows user gets an independent coin-pusher machine.
+        self.pusher_settings = QSettings(
+            '5imp1e 5atebox',
+            'CoinPusher'
+        )
+        self._restoring_state = False
+
+        self.pending = []
+        self.coins = []
+        self.basket_count = 0
+        self.lost_count = 0
+        self.inserted_total = 0
+        self.paid_out_total = 0
+        self.cascade_count = 0
+        self.refunded_total = 0
+        self._last_emitted = None
+
+        # Paid cabinet shake: a short, gentle left-right vibration.
+        # Coins are nudged through physics impulses; they are never teleported.
+        self.shake_active = False
+        self.shake_started_at = 0.0
+
+        # Base paid shake. Every successful shake increments shake_chain_count.
+        # The 10th shake is guaranteed to become a 3-second sustained shake with
+        # +15% amplitude, then the counter resets.
+        self.base_shake_duration = 0.95
+        self.base_shake_strength = 0.52
+        self.shake_duration = self.base_shake_duration
+        self.shake_strength = self.base_shake_strength
+        self.shake_prev_offset = 0.0
+        self.shake_axis = "x"          # x = left/right, y = front/back
+        self.shake_is_sustained = False
+        self.shake_chain_count = 0
+
+        # Shared rendered coin mesh, same as the flip module.
+        self._coin_mesh = CoinMeshFactory.coin_meshdata()
+        self._coin_hull_points = self._make_coin_hull_points()
+
+        # Actual Jolt world. Physics is deliberately faster than render cadence.
+        self.physics_dt = 1.0 / 180.0
+        self.physics_accumulator = 0.0
+        self.last_tick = time.perf_counter()
+
+        self.world = culverin.PhysicsWorld({
+            "gravity": (0.0, 0.0, -9.81),
+            "max_bodies": 900,
+            "num_threads": 2,
+            "penetration_slop": 0.0012,
+        })
+
+        self.static_bodies = []
+        self.pusher_body = None
+        self.lower_pusher_body = None
+        self.lower_deflector_body = None
+
+        self._build_machine_visuals()
+        self._build_physics_machine()
+
+        # Restore the exact previous machine if one exists. Only first-time users
+        # receive a freshly seeded machine.
+        if not self._restore_local_state():
+            self._seed_machine()
+            self._save_local_state()
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start()
+
+        # Save moving rigid-body state periodically and once more when the
+        # application exits, so reopening shows the same machine layout.
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setInterval(1500)
+        self._autosave_timer.timeout.connect(self._save_local_state)
+        self._autosave_timer.start()
+
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self._save_local_state)
+
+        self._emit_state(force=True)
+
+    # ------------------------------------------------------------------
+    # Per-user local persistence
+    # ------------------------------------------------------------------
+    def _coin_snapshot(self, coin):
+        body = coin.get("body")
+        if body is None or not self.world.is_alive(body):
+            return None
+
+        pos = self.world.get_position(body)
+        quat = self.world.get_rotation(body)
+        vel = self.world.get_velocity(body)
+        ang = self.world.get_angular_velocity(body)
+        if not pos or not quat:
+            return None
+
+        return {
+            "pos": [float(v) for v in pos],
+            "rot": [float(v) for v in quat],
+            "vel": [float(v) for v in (vel or (0.0,0.0,0.0))],
+            "ang": [float(v) for v in (ang or (0.0,0.0,0.0))],
+            "player_inserted": bool(coin.get("player_inserted", False)),
+            "is_default": bool(
+                coin.get(
+                    "is_default",
+                    not coin.get("player_inserted", False)
+                )
+            ),
+            "basket": bool(coin.get("basket", False)),
+            "counted_basket": bool(coin.get("counted_basket", False)),
+        }
+
+    def _save_local_state(self):
+        if self._restoring_state:
+            return
+
+        coins = []
+        for coin in self.coins:
+            snap = self._coin_snapshot(coin)
+            if snap is not None:
+                coins.append(snap)
+
+        now = time.perf_counter()
+        pending = []
+        for p in self.pending:
+            pending.append({
+                "delay": max(0.0, float(p.get("release_at", now)) - now),
+                "x": float(p.get("x", 0.0)),
+                "y": float(p.get("y", self.drop_start_y)),
+            })
+
+        payload = {
+            "version": 2,
+            "coins": coins,
+            "pending": pending,
+            "basket_count": int(self.basket_count),
+            "lost_count": int(self.lost_count),
+            "inserted_total": int(self.inserted_total),
+            "paid_out_total": int(self.paid_out_total),
+            "cascade_count": int(self.cascade_count),
+            "refunded_total": int(self.refunded_total),
+            "pusher_phase": float(self.pusher_phase),
+            "shake_chain_count": int(self.shake_chain_count),
+        }
+
+        try:
+            self.pusher_settings.setValue(
+                "machine_state_json",
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
+            self.pusher_settings.sync()
+        except Exception:
+            # Persistence failure must never break the running machine.
+            pass
+
+    def _restore_local_state(self):
+        raw = str(
+            self.pusher_settings.value(
+                "machine_state_json",
+                ""
+            ) or ""
+        )
+        if not raw:
+            return False
+
+        try:
+            data = json.loads(raw)
+            coins = data.get("coins", [])
+            if not isinstance(coins, list) or not coins:
+                return False
+        except Exception:
+            return False
+
+        self._restoring_state = True
+        try:
+            # No default stock is created before restoration, so every restored
+            # rigid body corresponds exactly to a saved coin.
+            for c in list(self.coins):
+                self._destroy_coin(c)
+            self.coins.clear()
+            self.pending.clear()
+
+            self.basket_count = int(data.get("basket_count", 0))
+            self.lost_count = int(data.get("lost_count", 0))
+            self.inserted_total = int(data.get("inserted_total", 0))
+            self.paid_out_total = int(data.get("paid_out_total", 0))
+            self.cascade_count = int(data.get("cascade_count", 0))
+            self.refunded_total = int(data.get("refunded_total", 0))
+            self.shake_chain_count = max(
+                0,
+                min(9, int(data.get("shake_chain_count", 0)))
+            )
+
+            self.pusher_phase = float(data.get("pusher_phase", 0.0)) % 1.0
+
+            # Put both kinematic pushers at the saved phase immediately, rather
+            # than letting them jump there on the first rendered frame.
+            upper_y, _ = self._pusher_desired_state(lower=False)
+            lower_y, _ = self._pusher_desired_state(lower=True)
+
+            self.world.set_position(
+                self.pusher_body,
+                0.0,
+                upper_y,
+                self.upper_z + self.pusher_height*.5,
+            )
+            self.world.set_linear_velocity(
+                self.pusher_body, 0.0, 0.0, 0.0
+            )
+
+            self.world.set_position(
+                self.lower_pusher_body,
+                0.0,
+                lower_y,
+                self.lower_z + self.lower_pusher_height*.5,
+            )
+            self.world.set_linear_velocity(
+                self.lower_pusher_body, 0.0, 0.0, 0.0
+            )
+
+            self.world.set_position(
+                self.lower_deflector_body,
+                0.0,
+                lower_y,
+                self.lower_z
+                + self.lower_pusher_height
+                + self.lower_deflector_height*.5,
+            )
+            self.world.set_linear_velocity(
+                self.lower_deflector_body, 0.0, 0.0, 0.0
+            )
+
+            self.pusher_y = upper_y
+            self.lower_pusher_y = lower_y
+
+            for snap in coins:
+                pos = snap.get("pos", (0.0,0.0,1.0))
+                rot = snap.get("rot", (0.0,0.0,0.0,1.0))
+                vel = snap.get("vel", (0.0,0.0,0.0))
+                ang = snap.get("ang", (0.0,0.0,0.0))
+
+                if len(pos) != 3 or len(rot) != 4:
+                    continue
+
+                self._spawn_coin_body(
+                    float(pos[0]),
+                    float(pos[1]),
+                    float(pos[2]),
+                    rot=tuple(float(v) for v in rot),
+                    velocity=tuple(float(v) for v in vel[:3]),
+                    angular=tuple(float(v) for v in ang[:3]),
+                    player_inserted=bool(
+                        snap.get("player_inserted", False)
+                    ),
+                    basket=bool(snap.get("basket", False)),
+                    is_default=bool(
+                        snap.get(
+                            "is_default",
+                            not snap.get("player_inserted", False)
+                        )
+                    ),
+                )
+                restored = self.coins[-1]
+                restored["counted_basket"] = bool(
+                    snap.get(
+                        "counted_basket",
+                        snap.get("basket", False)
+                    )
+                )
+
+            now = time.perf_counter()
+            for p in data.get("pending", []):
+                try:
+                    self.pending.append({
+                        "release_at": now + max(
+                            0.0,
+                            float(p.get("delay", 0.0))
+                        ),
+                        "x": float(p.get("x", 0.0)),
+                        "y": float(
+                            p.get("y", self.drop_start_y)
+                        ),
+                    })
+                except Exception:
+                    continue
+            self.pending.sort(
+                key=lambda p: p["release_at"]
+            )
+
+            self._sync_pusher_render_from_physics()
+            for coin in self.coins:
+                self._sync_coin_render(coin)
+
+            return bool(self.coins)
+        except Exception:
+            # A corrupt/old snapshot falls back to a clean initial machine.
+            for c in list(self.coins):
+                self._destroy_coin(c)
+            self.coins.clear()
+            self.pending.clear()
+            return False
+        finally:
+            self._restoring_state = False
+
+    # ------------------------------------------------------------------
+    # Rendering helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _box_meshdata(sx, sy, sz, color):
+        hx, hy, hz = sx * .5, sy * .5, sz * .5
+        v = np.asarray([
+            (-hx,-hy,-hz),( hx,-hy,-hz),( hx, hy,-hz),(-hx, hy,-hz),
+            (-hx,-hy, hz),( hx,-hy, hz),( hx, hy, hz),(-hx, hy, hz),
+        ], dtype=float)
+        f = np.asarray([
+            (0,1,2),(0,2,3),
+            (4,6,5),(4,7,6),
+            (0,4,5),(0,5,1),
+            (1,5,6),(1,6,2),
+            (2,6,7),(2,7,3),
+            (3,7,4),(3,4,0),
+        ], dtype=np.int32)
+        fc = np.tile(np.asarray(color, dtype=float), (len(f), 1))
+        return gl.MeshData(vertexes=v, faces=f, faceColors=fc)
+
+    def _make_box_item(self, sx, sy, sz, color, pos):
+        item = gl.GLMeshItem(
+            meshdata=self._box_meshdata(sx, sy, sz, color),
+            smooth=False,
+            drawFaces=True,
+            drawEdges=False,
+            shader="shaded",
+            computeNormals=True,
+        )
+        item.setGLOptions("opaque")
+        m = QMatrix4x4()
+        m.translate(*pos)
+        item.setTransform(m)
+        self.addItem(item)
+        return item
+
+    @staticmethod
+    def _triangular_prism_meshdata(width, depth, height, color):
+        """Prism with ridge along X: coins can slide to front or rear."""
+        hx = width * 0.5
+        hy = depth * 0.5
+        hz = height * 0.5
+
+        # Cross-section in Y/Z:
+        # rear base (-hy,-hz), ridge (0,+hz), front base (+hy,-hz)
+        v = np.asarray([
+            (-hx, -hy, -hz),
+            (-hx,  0.0,  hz),
+            (-hx,  hy, -hz),
+            ( hx, -hy, -hz),
+            ( hx,  0.0,  hz),
+            ( hx,  hy, -hz),
+        ], dtype=float)
+        f = np.asarray([
+            (0, 1, 2),       # left cap
+            (3, 5, 4),       # right cap
+            (0, 3, 4), (0, 4, 1),   # rear slope
+            (1, 4, 5), (1, 5, 2),   # front slope
+            (0, 2, 5), (0, 5, 3),   # bottom
+        ], dtype=np.int32)
+        fc = np.tile(np.asarray(color, dtype=float), (len(f), 1))
+        return gl.MeshData(vertexes=v, faces=f, faceColors=fc)
+
+    def _lower_deflector_hull_points(self):
+        hx = self.lower_deflector_width * 0.5
+        hy = self.lower_deflector_depth * 0.5
+        hz = self.lower_deflector_height * 0.5
+        return np.asarray([
+            (-hx, -hy, -hz),
+            (-hx,  0.0,  hz),
+            (-hx,  hy, -hz),
+            ( hx, -hy, -hz),
+            ( hx,  0.0,  hz),
+            ( hx,  hy, -hz),
+        ], dtype=np.float32)
+
+    def _new_coin_item(self):
+        item = gl.GLMeshItem(
+            meshdata=self._coin_mesh,
+            smooth=False,
+            drawFaces=True,
+            drawEdges=False,
+            shader="shaded",
+            computeNormals=True,
+        )
+        item.setGLOptions("opaque")
+        self.addItem(item)
+        return item
+
+    def _make_coin_hull_points(self):
+        pts = []
+        seg = 24
+        for z in (-self.coin_half, self.coin_half):
+            for i in range(seg):
+                a = 2.0 * math.pi * i / seg
+                pts.append((
+                    math.cos(a) * self.coin_radius,
+                    math.sin(a) * self.coin_radius,
+                    z,
+                ))
+        return np.asarray(pts, dtype=np.float32)
+
+    def _build_machine_visuals(self):
+        # Back and side cabinet.
+        self._make_box_item(
+            self.machine_width, 0.12, 2.60,
+            (0.055,0.055,0.065,1.0),
+            (0.0, -1.62, 1.00)
+        )
+        self._make_box_item(
+            0.10, 4.80, 1.35,
+            (0.065,0.065,0.075,1.0),
+            (-self.machine_width/2, 0.50, 0.55)
+        )
+        self._make_box_item(
+            0.10, 4.80, 1.35,
+            (0.065,0.065,0.075,1.0),
+            ( self.machine_width/2, 0.50, 0.55)
+        )
+
+        # Upper/lower decks.
+        self._make_box_item(
+            self.upper_width,
+            self.upper_front-self.upper_back,
+            self.upper_plate_t,
+            (0.16,0.165,0.18,1.0),
+            (
+                0.0,
+                (self.upper_back+self.upper_front)/2,
+                self.upper_z-self.upper_plate_t/2,
+            )
+        )
+        self._make_box_item(
+            self.lower_width,
+            self.lower_front-self.lower_back,
+            self.lower_plate_t,
+            (0.19,0.195,0.21,1.0),
+            (
+                0.0,
+                (self.lower_back+self.lower_front)/2,
+                self.lower_z-self.lower_plate_t/2,
+            )
+        )
+
+        # Two side lips only; the center stays open so coins physically fall out.
+        side_lip_w = (self.lower_width - self.payout_half_width*2.0) * .5
+        if side_lip_w > 0:
+            for side in (-1, 1):
+                x = side * (self.payout_half_width + side_lip_w*.5)
+                self._make_box_item(
+                    side_lip_w, .09, .08,
+                    (0.24,0.24,0.26,1.0),
+                    (x, self.lower_front+.02, self.lower_z-.02)
+                )
+
+        # Dark side gutters.
+        for sx in (-1, 1):
+            gx = sx * (self.lower_width/2 - .19)
+            self._make_box_item(
+                .34, .82, .05,
+                (0.025,0.025,0.03,1.0),
+                (gx, self.lower_front+.22, self.lower_z-.13)
+            )
+
+        # Physical payout tray visuals.
+        self._make_box_item(
+            2.70, 0.82, 0.12,
+            (0.10,0.105,0.12,1.0),
+            (0.0, self.lower_front+.74, self.basket_z)
+        )
+        self._make_box_item(
+            2.82, 0.08, 0.38,
+            (0.14,0.145,0.16,1.0),
+            (0.0, self.lower_front+1.11, self.basket_z+.16)
+        )
+
+        # Visible pusher box. Physics body uses exact same full dimensions.
+        self.pusher_item = gl.GLMeshItem(
+            meshdata=self._box_meshdata(
+                self.upper_width-.10,
+                self.pusher_depth,
+                self.pusher_height,
+                (0.44,0.45,0.48,1.0),
+            ),
+            smooth=False,
+            drawFaces=True,
+            drawEdges=False,
+            shader="shaded",
+            computeNormals=True,
+        )
+        self.pusher_item.setGLOptions("opaque")
+        self.addItem(self.pusher_item)
+
+        # Second visible slider on the lower shelf. As with the upper pusher,
+        # the rigid body and mesh use exactly the same full dimensions.
+        self.lower_pusher_item = gl.GLMeshItem(
+            meshdata=self._box_meshdata(
+                self.lower_width-.12,
+                self.lower_pusher_depth,
+                self.lower_pusher_height,
+                (0.40,0.41,0.445,1.0),
+            ),
+            smooth=False,
+            drawFaces=True,
+            drawEdges=False,
+            shader="shaded",
+            computeNormals=True,
+        )
+        self.lower_pusher_item.setGLOptions("opaque")
+        self.addItem(self.lower_pusher_item)
+
+        # Triangular deflector rides on top of the lower pusher. Because the ridge
+        # is centered, a coin landing on it can physically slide toward either the
+        # playable front side or the rear loss slot.
+        self.lower_deflector_item = gl.GLMeshItem(
+            meshdata=self._triangular_prism_meshdata(
+                self.lower_deflector_width,
+                self.lower_deflector_depth,
+                self.lower_deflector_height,
+                (0.49, 0.50, 0.535, 1.0),
+            ),
+            smooth=False,
+            drawFaces=True,
+            drawEdges=False,
+            shader="shaded",
+            computeNormals=True,
+        )
+        self.lower_deflector_item.setGLOptions("opaque")
+        self.addItem(self.lower_deflector_item)
+
+        # Top guide rails are only the visible guide system. Coins are released from
+        # their exits as dynamic rigid bodies and then gravity/collisions take over.
+        for lane_x in self.drop_lane_x:
+            # The visible rails now reach farther over the upper deck.
+            pts = np.asarray([
+                (0.0, -1.48, 2.55),
+                (lane_x*.42, -1.27, 2.28),
+                (lane_x, self.drop_start_y, 1.72),
+            ], dtype=float)
+            rail = gl.GLLinePlotItem(
+                pos=pts,
+                color=(0.70,0.58,0.28,1.0),
+                width=2.0,
+                antialias=True,
+                mode="line_strip",
+            )
+            self.addItem(rail)
+
+        grid = gl.GLGridItem()
+        grid.setSize(x=5.0, y=5.2)
+        grid.setSpacing(x=.5, y=.5)
+        grid.setColor((26,26,30,75))
+        m = QMatrix4x4()
+        m.translate(0.0, .55, -.42)
+        grid.setTransform(m)
+        self.addItem(grid)
+
+    # ------------------------------------------------------------------
+    # Real physics machine
+    # ------------------------------------------------------------------
+    def _create_static_box(self, sx, sy, sz, pos, friction=.65, restitution=.02):
+        body = self.world.create_body(
+            pos=pos,
+            size=(sx*.5, sy*.5, sz*.5),
+            shape=culverin.SHAPE_BOX,
+            motion=culverin.MOTION_STATIC,
+            mass=0.0,
+            friction=friction,
+            restitution=restitution,
+        )
+        self.static_bodies.append(body)
+        return body
+
+    def _build_physics_machine(self):
+        # Upper and lower shelves.
+        self._create_static_box(
+            self.upper_width,
+            self.upper_front-self.upper_back,
+            self.upper_plate_t,
+            (
+                0.0,
+                (self.upper_back+self.upper_front)/2,
+                self.upper_z-self.upper_plate_t/2,
+            ),
+            friction=.58,
+            restitution=.03,
+        )
+        self._create_static_box(
+            self.lower_width,
+            self.lower_front-self.lower_back,
+            self.lower_plate_t,
+            (
+                0.0,
+                (self.lower_back+self.lower_front)/2,
+                self.lower_z-self.lower_plate_t/2,
+            ),
+            # Slightly less grip so coins arriving from above can fan outward
+            # instead of wedging into a tall stationary mound.
+            friction=.64,
+            restitution=.020,
+        )
+
+        # Back wall and physical side rails/cabinet walls.
+        self._create_static_box(
+            self.machine_width, .12, 2.60,
+            (0.0, -1.62, 1.00),
+            friction=.55,
+            restitution=.04,
+        )
+        for side in (-1, 1):
+            self._create_static_box(
+                .10, 4.80, 1.35,
+                (side*self.machine_width/2, .50, .55),
+                friction=.55,
+                restitution=.04,
+            )
+
+        # Side front lips; central payout opening remains physically open.
+        side_lip_w = (self.lower_width - self.payout_half_width*2.0) * .5
+        if side_lip_w > 0:
+            for side in (-1, 1):
+                x = side * (self.payout_half_width + side_lip_w*.5)
+                self._create_static_box(
+                    side_lip_w, .09, .08,
+                    (x, self.lower_front+.02, self.lower_z-.02),
+                    friction=.70,
+                    restitution=.02,
+                )
+
+        # Basket floor and walls. Paid coins actually fall into and collide inside it.
+        tray_y = self.lower_front + .74
+        self._create_static_box(
+            2.70, .82, .12,
+            (0.0, tray_y, self.basket_z),
+            friction=.78,
+            restitution=.04,
+        )
+        self._create_static_box(
+            2.82, .08, .38,
+            (0.0, self.lower_front+1.11, self.basket_z+.16),
+            friction=.65,
+            restitution=.04,
+        )
+        for side in (-1, 1):
+            self._create_static_box(
+                .08, .90, .38,
+                (side*1.39, tray_y, self.basket_z+.16),
+                friction=.65,
+                restitution=.04,
+            )
+
+        # Real solid pusher body. It is kinematic so coins cannot push it backwards,
+        # but its motion generates real contact impulses on all dynamic coins.
+        self.pusher_body = self.world.create_body(
+            pos=(
+                0.0,
+                self.pusher_y,
+                self.upper_z + self.pusher_height*.5,
+            ),
+            size=(
+                (self.upper_width-.10)*.5,
+                self.pusher_depth*.5,
+                self.pusher_height*.5,
+            ),
+            shape=culverin.SHAPE_BOX,
+            motion=culverin.MOTION_KINEMATIC,
+            mass=80.0,
+            friction=.58,
+            restitution=.01,
+            ccd=True,
+        )
+
+        # Real lower pusher: same principle, independent kinematic body.
+        self.lower_pusher_body = self.world.create_body(
+            pos=(
+                0.0,
+                self.lower_pusher_y,
+                self.lower_z + self.lower_pusher_height*.5,
+            ),
+            size=(
+                (self.lower_width-.12)*.5,
+                self.lower_pusher_depth*.5,
+                self.lower_pusher_height*.5,
+            ),
+            shape=culverin.SHAPE_BOX,
+            motion=culverin.MOTION_KINEMATIC,
+            mass=90.0,
+            friction=.60,
+            restitution=.01,
+            ccd=True,
+        )
+
+        # Real triangular-prism collider, moving with the lower pusher.
+        self.lower_deflector_body = self.world.create_convex_hull(
+            pos=(
+                0.0,
+                self.lower_pusher_y,
+                self.lower_z
+                + self.lower_pusher_height
+                + self.lower_deflector_height*.5,
+            ),
+            rot=(0.0,0.0,0.0,1.0),
+            points=self._lower_deflector_hull_points(),
+            motion=culverin.MOTION_KINEMATIC,
+            mass=40.0,
+            friction=.62,
+            restitution=.012,
+            ccd=True,
+        )
+
+        self._sync_pusher_render_from_physics()
+
+    def _pusher_desired_state(self, lower=False):
+        # Smooth reciprocation. Both pushers are real kinematic bodies; the lower
+        # one is half a cycle offset so it receives coins after the upper shove.
+        phase = self.pusher_phase
+        if lower:
+            phase = (phase + self.lower_pusher_phase_offset) % 1.0
+            back = self.lower_pusher_back
+            stroke = self.lower_pusher_stroke
+        else:
+            back = self.pusher_back
+            stroke = self.pusher_stroke
+
+        wave = .5 - .5 * math.cos(phase * math.tau)
+        desired_y = back + stroke * wave
+        desired_vy = (
+            stroke * math.pi / self.pusher_period
+            * math.sin(phase * math.tau)
+        )
+        return desired_y, desired_vy
+
+    def _drive_one_pusher(self, body, fallback_y, lower=False):
+        if body is None:
+            return
+        desired_y, desired_vy = self._pusher_desired_state(lower=lower)
+        pos = self.world.get_position(body)
+        current_y = float(pos[1]) if pos else fallback_y
+
+        # Velocity feedback corrects numerical drift without teleportation.
+        error = desired_y - current_y
+        correction = max(-.55, min(.55, error * 7.5))
+        self.world.set_linear_velocity(
+            body,
+            0.0,
+            desired_vy + correction,
+            0.0,
+        )
+
+    def _drive_pusher(self, dt):
+        self._drive_one_pusher(
+            self.pusher_body,
+            self.pusher_y,
+            lower=False,
+        )
+        self._drive_one_pusher(
+            self.lower_pusher_body,
+            self.lower_pusher_y,
+            lower=True,
+        )
+        self._drive_one_pusher(
+            self.lower_deflector_body,
+            self.lower_pusher_y,
+            lower=True,
+        )
+
+    def _sync_pusher_render_from_physics(self):
+        pos = self.world.get_position(self.pusher_body) if self.pusher_body else None
+        if pos:
+            self.pusher_y = float(pos[1])
+            x, y, z = float(pos[0]), float(pos[1]), float(pos[2])
+        else:
+            x, y, z = 0.0, self.pusher_y, self.upper_z+self.pusher_height*.5
+
+        m = QMatrix4x4()
+        m.translate(x, y, z)
+        self.pusher_item.setTransform(m)
+
+        lower_pos = (
+            self.world.get_position(self.lower_pusher_body)
+            if self.lower_pusher_body else None
+        )
+        if lower_pos:
+            self.lower_pusher_y = float(lower_pos[1])
+            lx, ly, lz = (
+                float(lower_pos[0]),
+                float(lower_pos[1]),
+                float(lower_pos[2]),
+            )
+        else:
+            lx, ly, lz = (
+                0.0,
+                self.lower_pusher_y,
+                self.lower_z+self.lower_pusher_height*.5,
+            )
+
+        lm = QMatrix4x4()
+        lm.translate(lx, ly, lz)
+        self.lower_pusher_item.setTransform(lm)
+
+        def_pos = (
+            self.world.get_position(self.lower_deflector_body)
+            if self.lower_deflector_body else None
+        )
+        if def_pos:
+            dx, dy, dz = (
+                float(def_pos[0]),
+                float(def_pos[1]),
+                float(def_pos[2]),
+            )
+        else:
+            dx, dy, dz = (
+                0.0,
+                self.lower_pusher_y,
+                self.lower_z
+                + self.lower_pusher_height
+                + self.lower_deflector_height*.5,
+            )
+
+        dm = QMatrix4x4()
+        dm.translate(dx, dy, dz)
+        self.lower_deflector_item.setTransform(dm)
+
+    # ------------------------------------------------------------------
+    # Dynamic coin bodies
+    # ------------------------------------------------------------------
+    def _spawn_coin_body(
+        self,
+        x, y, z,
+        *,
+        rot=(0.0,0.0,0.0,1.0),
+        velocity=(0.0,0.0,0.0),
+        angular=(0.0,0.0,0.0),
+        player_inserted=False,
+        basket=False,
+        is_default=False,
+    ):
+        item = self._new_coin_item()
+
+        body = self.world.create_convex_hull(
+            pos=(float(x),float(y),float(z)),
+            rot=rot,
+            points=self._coin_hull_points,
+            motion=culverin.MOTION_DYNAMIC,
+            mass=self.coin_mass,
+            # Lower coin/coin friction lets steep overlapping piles relax and
+            # spread horizontally instead of continually building upward.
+            friction=.47,
+            restitution=.035,
+            ccd=True,
+        )
+        self.world.set_linear_velocity(
+            body,
+            float(velocity[0]), float(velocity[1]), float(velocity[2])
+        )
+        self.world.set_angular_velocity(
+            body,
+            float(angular[0]), float(angular[1]), float(angular[2])
+        )
+
+        c = {
+            "body": body,
+            "item": item,
+            "player_inserted": bool(player_inserted),
+            "is_default": bool(is_default),
+            "basket": bool(basket),
+            "counted_basket": bool(basket),
+        }
+        self.coins.append(c)
+        self._sync_coin_render(c)
+        return c
+
+    def _sync_coin_render(self, coin):
+        body = coin.get("body")
+        if body is None:
+            return
+        pos = self.world.get_position(body)
+        quat = self.world.get_rotation(body)
+        if not pos or not quat:
+            return
+
+        q = QQuaternion(
+            float(quat[3]),
+            float(quat[0]),
+            float(quat[1]),
+            float(quat[2]),
+        )
+        m = QMatrix4x4()
+        m.translate(float(pos[0]), float(pos[1]), float(pos[2]))
+        m.rotate(q)
+        m.scale(self._coin_visual_scale)
+        coin["item"].setTransform(m)
+
+    def _destroy_coin(self, coin):
+        body = coin.get("body")
+        if body is not None:
+            try:
+                self.world.destroy_body(body)
+            except Exception:
+                pass
+        try:
+            self.removeItem(coin["item"])
+        except Exception:
+            pass
+        try:
+            self.coins.remove(coin)
+        except ValueError:
+            pass
+
+    def _seed_machine(self):
+        # Upper shelf: loose dynamic stock.
+        for row in range(4):
+            y = self.upper_back + .43 + row * .31
+            for col in range(10):
+                x = -1.33 + col * .295 + (row % 2) * .12
+                if abs(x) > self.upper_width*.5-self.coin_radius:
+                    continue
+                if random.random() < .08:
+                    continue
+                self._spawn_coin_body(
+                    x + random.uniform(-.018,.018),
+                    y + random.uniform(-.014,.014),
+                    self.upper_z + self.coin_half + random.uniform(.002,.008),
+                    rot=(0.0,0.0,math.sin(math.radians(random.uniform(0,180))*.5),
+                         math.cos(math.radians(random.uniform(0,180))*.5)),
+                    is_default=True,
+                )
+
+        # Lower shelf: dense stock but not perfectly tiled.
+        # IMPORTANT: calculate lower_seed_start before tower_y. This fixes the
+        # UnboundLocalError seen in v0.25.3.
+        lower_seed_start = (
+            self.lower_pusher_back
+            + self.lower_pusher_stroke
+            + self.lower_pusher_depth*.5
+            + self.coin_radius
+            + .08
+        )
+        tower_y = min(
+            self.lower_front - .62,
+            lower_seed_start + .54
+        )
+        tower_centers = [(-.52,tower_y),(.52,tower_y)]
+        for row in range(5):
+            y = lower_seed_start + row * .31
+            for col in range(11):
+                x = -1.47 + col * .295 + (row % 2) * .11
+                if abs(x) > self.lower_width*.5-self.coin_radius:
+                    continue
+                if any(
+                    abs(x-tx) < self.coin_radius*1.35
+                    and abs(y-ty) < self.coin_radius*1.35
+                    for tx,ty in tower_centers
+                ):
+                    continue
+                if random.random() < .08:
+                    continue
+                self._spawn_coin_body(
+                    x + random.uniform(-.018,.018),
+                    y + random.uniform(-.014,.014),
+                    self.lower_z + self.coin_half + random.uniform(.002,.008),
+                    is_default=True,
+                )
+
+        # Two genuine rigid-body towers. Every layer has its own mass and collides.
+        for tx, ty in tower_centers:
+            for level in range(8):
+                self._spawn_coin_body(
+                    tx + random.uniform(-.004,.004),
+                    ty + random.uniform(-.004,.004),
+                    self.lower_z
+                    + self.coin_half
+                    + level * (self.coin_half*2.0 + .003),
+                    rot=(0.0,0.0,0.0,1.0),
+                    is_default=True,
+                )
+
+        # Let the preloaded pile settle naturally for a short simulated time.
+        for _ in range(90):
+            self._drive_pusher(self.physics_dt)
+            self.world.step(self.physics_dt)
+            self.pusher_phase = (
+                self.pusher_phase + self.physics_dt/self.pusher_period
+            ) % 1.0
+
+        for c in self.coins:
+            self._sync_coin_render(c)
+        self._sync_pusher_render_from_physics()
+
+    # ------------------------------------------------------------------
+    # Public pusher actions
+    # ------------------------------------------------------------------
+    def reset_to_default_layout(self):
+        """Rebuild the machine exactly from its default starting stock.
+
+        All player-added coins are removed, and every original/default coin is
+        recreated at the initial seed layout rather than being kept wherever it
+        happened to drift during previous play.
+        """
+        self.pending.clear()
+
+        for coin in list(self.coins):
+            self._destroy_coin(coin)
+        self.coins.clear()
+
+        self.basket_count = 0
+        self.lost_count = 0
+        self.inserted_total = 0
+        self.paid_out_total = 0
+        self.cascade_count = 0
+        self.refunded_total = 0
+        self.shake_active = False
+        self.shake_prev_offset = 0.0
+        self.shake_chain_count = 0
+        self.shake_axis = "x"
+        self.shake_is_sustained = False
+        self.shake_duration = self.base_shake_duration
+        self.shake_strength = self.base_shake_strength
+
+        # Restore both physical pushers to their initial phase/positions.
+        self.pusher_phase = 0.0
+        self.world.set_position(
+            self.pusher_body,
+            0.0,
+            self.pusher_back,
+            self.upper_z + self.pusher_height * .5,
+        )
+        self.world.set_linear_velocity(
+            self.pusher_body, 0.0, 0.0, 0.0
+        )
+
+        self.world.set_position(
+            self.lower_pusher_body,
+            0.0,
+            self.lower_pusher_back,
+            self.lower_z + self.lower_pusher_height * .5,
+        )
+        self.world.set_linear_velocity(
+            self.lower_pusher_body, 0.0, 0.0, 0.0
+        )
+
+        self.world.set_position(
+            self.lower_deflector_body,
+            0.0,
+            self.lower_pusher_back,
+            self.lower_z
+            + self.lower_pusher_height
+            + self.lower_deflector_height * .5,
+        )
+        self.world.set_linear_velocity(
+            self.lower_deflector_body, 0.0, 0.0, 0.0
+        )
+
+        self.pusher_y = self.pusher_back
+        self.lower_pusher_y = self.lower_pusher_back
+
+        # Recreate only the factory/default stock and its two default towers.
+        self._seed_machine()
+
+        self._emit_state(force=True)
+        self._save_local_state()
+        self.update()
+
+    def clear_nondefault_coins(self):
+        """Remove user-added pusher coins while preserving original machine stock.
+
+        Default stock keeps its current physical location/orientation. We do not
+        reseed or teleport those coins, so the persistent machine remains visually
+        continuous after a user-data reset.
+        """
+        self.pending.clear()
+
+        for coin in list(self.coins):
+            if not bool(
+                coin.get(
+                    "is_default",
+                    not coin.get("player_inserted", False)
+                )
+            ):
+                self._destroy_coin(coin)
+
+        # Recalculate basket contents from default coins that are still physically
+        # present there. User-inserted basket coins were removed above.
+        self.basket_count = sum(
+            1
+            for coin in self.coins
+            if bool(coin.get("basket", False))
+            and bool(
+                coin.get(
+                    "is_default",
+                    not coin.get("player_inserted", False)
+                )
+            )
+        )
+
+        # Clear player-history counters associated with the removed paid coins.
+        self.lost_count = 0
+        self.inserted_total = 0
+        self.paid_out_total = 0
+        self.cascade_count = 0
+        self.refunded_total = 0
+        self.shake_active = False
+        self.shake_prev_offset = 0.0
+        self.shake_chain_count = 0
+        self.shake_axis = "x"
+        self.shake_is_sustained = False
+        self.shake_duration = self.base_shake_duration
+        self.shake_strength = self.base_shake_strength
+
+        self._emit_state(force=True)
+        self._save_local_state()
+        self.update()
+
+    def clear(self):
+        for c in list(self.coins):
+            self._destroy_coin(c)
+        self.pending.clear()
+
+        self.basket_count = 0
+        self.lost_count = 0
+        self.inserted_total = 0
+        self.paid_out_total = 0
+        self.cascade_count = 0
+        self.refunded_total = 0
+
+        self.pusher_phase = 0.0
+        self.world.set_position(
+            self.pusher_body,
+            0.0,
+            self.pusher_back,
+            self.upper_z+self.pusher_height*.5,
+        )
+        self.world.set_linear_velocity(
+            self.pusher_body, 0.0, 0.0, 0.0
+        )
+
+        self.world.set_position(
+            self.lower_pusher_body,
+            0.0,
+            self.lower_pusher_back,
+            self.lower_z+self.lower_pusher_height*.5,
+        )
+        self.world.set_linear_velocity(
+            self.lower_pusher_body, 0.0, 0.0, 0.0
+        )
+
+        self.world.set_position(
+            self.lower_deflector_body,
+            0.0,
+            self.lower_pusher_back,
+            self.lower_z
+            + self.lower_pusher_height
+            + self.lower_deflector_height*.5,
+        )
+        self.world.set_linear_velocity(
+            self.lower_deflector_body, 0.0, 0.0, 0.0
+        )
+
+        self.lower_pusher_y = self.lower_pusher_back
+
+        self._seed_machine()
+        self._emit_state(force=True)
+        self._save_local_state()
+
+    def can_insert(self, count):
+        count = int(count)
+        return (
+            count > 0
+            and len(self.pending) + len(self.coins) + count <= 520
+            and self.world.remaining_capacity > count + 20
+        )
+
+    def insert_coins(self, count):
+        count = max(0, int(count))
+        if not self.can_insert(count):
+            return 0
+
+        now = time.perf_counter()
+        for i in range(count):
+            lane = random.randrange(len(self.drop_lane_x))
+
+            if random.random() < self.rear_drop_chance:
+                # Rare path: release at/just behind the upper rear edge, retaining
+                # the possibility that the moving rear mechanism sweeps it away.
+                release_y = (
+                    self.rear_drop_y
+                    + random.uniform(-0.07, 0.055)
+                )
+            else:
+                # Normal path: safely over the upper shelf, with enough spread to
+                # avoid every coin landing in an identical strip.
+                release_y = (
+                    self.drop_start_y
+                    + random.uniform(-0.10, 0.16)
+                )
+
+            self.pending.append({
+                "release_at": now + i * random.uniform(.09,.16),
+                "x": self.drop_lane_x[lane] + random.uniform(-.05,.05),
+                "y": release_y,
+            })
+        self.pending.sort(key=lambda p: p["release_at"])
+
+        self.inserted_total += count
+        self._emit_state(force=True)
+        self._save_local_state()
+        return count
+
+    def cash_out(self):
+        basket_coins = [c for c in self.coins if c.get("basket")]
+        amount = min(int(self.basket_count), len(basket_coins))
+        if amount <= 0:
+            return 0
+
+        # Remove actual physical coins from the tray.
+        for c in basket_coins[:amount]:
+            self._destroy_coin(c)
+
+        self.basket_count -= amount
+        self._emit_state(force=True)
+        self._save_local_state()
+        return amount
+
+    def _spawn_pending(self, now):
+        while self.pending and self.pending[0]["release_at"] <= now:
+            p = self.pending.pop(0)
+
+            release_y = float(
+                p.get("y", self.drop_start_y)
+            )
+            rear_path = (
+                release_y < self.upper_back - 0.015
+            )
+
+            # True free-fall coin from the chosen chute exit. There is still no
+            # scripted shelf snap: gravity and rigid-body contacts decide landing.
+            self._spawn_coin_body(
+                p["x"],
+                release_y,
+                self.drop_start_z,
+                velocity=(
+                    random.uniform(-.08,.08),
+                    (
+                        random.uniform(.10,.25)
+                        if rear_path
+                        else random.uniform(.30,.50)
+                    ),
+                    random.uniform(-.12,.05),
+                ),
+                angular=(
+                    random.uniform(-8.0,8.0),
+                    random.uniform(-8.0,8.0),
+                    random.uniform(-5.0,5.0),
+                ),
+                player_inserted=True,
+                is_default=False,
+            )
+
+    def shake_machine(self):
+        """Start one paid machine shake.
+
+        Normal shakes are left/right. Each use has a 2.5% chance to become a
+        front/back shake. Every 10th successful use is guaranteed to become a
+        3-second sustained shake at +15% amplitude.
+        """
+        if self.shake_active:
+            return False
+
+        # Count only successfully started paid shakes.
+        self.shake_chain_count += 1
+        guaranteed_sustained = self.shake_chain_count >= 10
+
+        if guaranteed_sustained:
+            self.shake_chain_count = 0
+
+        # Direction roll is independent of the 10-use guarantee.
+        self.shake_axis = (
+            "y"
+            if random.random() < 0.025
+            else "x"
+        )
+
+        self.shake_is_sustained = bool(guaranteed_sustained)
+        if self.shake_is_sustained:
+            self.shake_duration = 3.0
+            self.shake_strength = self.base_shake_strength * 1.15
+        else:
+            self.shake_duration = self.base_shake_duration
+            self.shake_strength = self.base_shake_strength
+
+        self.shake_active = True
+        self.shake_started_at = time.perf_counter()
+        self.shake_prev_offset = 0.0
+
+        # Save the progress immediately so closing/reopening the app cannot reset
+        # the guaranteed 10-use cycle.
+        self._save_local_state()
+        self._emit_state(force=True)
+        return True
+
+    def _apply_machine_shake_step(self, now):
+        if not self.shake_active:
+            return
+
+        elapsed = now - self.shake_started_at
+        if elapsed >= self.shake_duration:
+            self.shake_active = False
+            self.shake_prev_offset = 0.0
+            self.shake_duration = self.base_shake_duration
+            self.shake_strength = self.base_shake_strength
+            self.shake_axis = "x"
+            self.shake_is_sustained = False
+            self._emit_state(force=True)
+            return
+
+        t = elapsed / self.shake_duration
+
+        # Normal shakes fade out. The guaranteed 3-second event stays much more
+        # consistent through most of its duration, then eases out near the end.
+        if self.shake_is_sustained:
+            envelope = 1.0 if t < 0.82 else max(0.0, (1.0 - t) / 0.18)
+        else:
+            envelope = (1.0 - t) ** 1.35
+
+        offset = (
+            math.sin(elapsed * math.tau * 5.2)
+            * self.shake_strength
+            * envelope
+        )
+        delta = offset - self.shake_prev_offset
+        self.shake_prev_offset = offset
+
+        impulse = delta * 0.0038
+        ix = float(impulse) if self.shake_axis == "x" else 0.0
+        iy = float(impulse) if self.shake_axis == "y" else 0.0
+
+        for coin in self.coins:
+            body = coin.get("body")
+            if body is None or not self.world.is_alive(body):
+                continue
+            try:
+                self.world.apply_impulse(
+                    body,
+                    ix,
+                    iy,
+                    0.0,
+                )
+            except Exception:
+                pass
+
+    def _relax_high_coin_piles(self):
+        """Very gently destabilize only unusually tall Coin Pusher piles."""
+        for coin in self.coins:
+            if coin.get("basket", False):
+                continue
+
+            body = coin.get("body")
+            if body is None or not self.world.is_alive(body):
+                continue
+
+            pos = self.world.get_position(body)
+            if not pos:
+                continue
+
+            x, y, z = float(pos[0]), float(pos[1]), float(pos[2])
+
+            # Determine which shelf the coin is over. Normal 1–3 coin overlap is
+            # untouched; only clearly tall heaps receive the settling assist.
+            if self.upper_back - .12 <= y <= self.upper_front + .12:
+                base_z = self.upper_z
+            elif self.lower_back - .18 <= y <= self.lower_front + .18:
+                base_z = self.lower_z
+            else:
+                continue
+
+            excess = z - (base_z + self.coin_half * 7.0)
+            if excess <= 0.0:
+                continue
+
+            # Tiny outward-biased nudge. The sign alternates with horizontal
+            # position so a mound tends to spread rather than drift as one block.
+            direction = 1.0 if x >= 0.0 else -1.0
+            strength = min(1.0, excess / max(.03, self.coin_half * 10.0))
+            try:
+                self.world.apply_impulse(
+                    body,
+                    direction * (0.000035 + 0.000055 * strength),
+                    random.uniform(-0.000025, 0.000025),
+                    -0.000018 * strength,
+                )
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # Main simulation
+    # ------------------------------------------------------------------
+    def _tick(self):
+        now = time.perf_counter()
+        frame_dt = max(.001, min(.050, now-self.last_tick))
+        self.last_tick = now
+        self.physics_accumulator += frame_dt
+
+        self._spawn_pending(now)
+
+        if not hasattr(self, "_last_pile_relax_at"):
+            self._last_pile_relax_at = now
+        if now - self._last_pile_relax_at >= 0.18:
+            self._last_pile_relax_at = now
+            self._relax_high_coin_piles()
+
+        steps = 0
+        sim_now = now
+        while self.physics_accumulator >= self.physics_dt and steps < 14:
+            self.pusher_phase = (
+                self.pusher_phase + self.physics_dt/self.pusher_period
+            ) % 1.0
+
+            # The pushers remain real kinematic rigid bodies.
+            self._drive_pusher(self.physics_dt)
+
+            # Gentle paid machine vibration.
+            self._apply_machine_shake_step(sim_now)
+
+            self.world.step(self.physics_dt)
+
+            self.physics_accumulator -= self.physics_dt
+            sim_now += self.physics_dt
+            steps += 1
+
+        self._sync_pusher_render_from_physics()
+
+        # Render from physics and classify payout/loss only after real movement.
+        for coin in list(self.coins):
+            body = coin.get("body")
+            if body is None or not self.world.is_alive(body):
+                continue
+
+            self._sync_coin_render(coin)
+
+            pos = self.world.get_position(body)
+            if not pos:
+                continue
+            x, y, z = float(pos[0]), float(pos[1]), float(pos[2])
+
+            # Once a coin has physically fallen through the center payout opening
+            # into the tray, count it exactly once but leave it as a real rigid body
+            # so subsequent tray coins collide with it.
+            if (
+                not coin.get("counted_basket", False)
+                and y > self.lower_front + .12
+                and abs(x) <= self.payout_half_width + .10
+                and z < self.lower_z - .06
+            ):
+                coin["basket"] = True
+                coin["counted_basket"] = True
+                self.basket_count += 1
+                self.paid_out_total += 1
+                self.cascade_count += 1
+
+            # Side-gutter or world-loss coins are truly falling; only destroy them
+            # after they are well below the playable machine.
+            side_gutter = (
+                y > self.lower_front + .10
+                and abs(x) > self.payout_half_width + .10
+                and z < self.lower_z - .16
+            )
+
+            # New rear-loss hole behind the lower pusher. The triangular ridge can
+            # physically send coins backward into this opening.
+            rear_loss_hole = (
+                y < self.lower_back - .07
+                and abs(x) <= self.rear_loss_half_width + .08
+                and z < self.lower_z - .10
+            )
+
+            escaped = (
+                abs(x) > self.machine_width*.62
+                or y < self.upper_back - 1.0
+                or y > self.lower_front + 2.2
+                or z < -1.15
+            )
+
+            if (
+                (side_gutter or rear_loss_hole or escaped)
+                and not coin.get("basket", False)
+            ):
+                self.lost_count += 1
+
+                # Only a coin actually purchased/inserted by the player can be
+                # "returned". A lost house-stock coin does not generate free money.
+                if (
+                    coin.get("player_inserted", False)
+                    and random.random() < 0.05
+                ):
+                    self.refunded_total += 1
+                    self.refundEarned.emit(1)
+
+                self._destroy_coin(coin)
+
+        self._emit_state()
+        self.update()
+
+    # ------------------------------------------------------------------
+    # State reporting
+    # ------------------------------------------------------------------
+    def _state_tuple(self):
+        active = sum(1 for c in self.coins if not c.get("basket", False))
+        return (
+            self.basket_count,
+            self.lost_count,
+            len(self.pending),
+            active,
+            self.inserted_total,
+            self.paid_out_total,
+            self.cascade_count,
+            self.refunded_total,
+            bool(self.shake_active),
+            str(self.shake_axis),
+            bool(self.shake_is_sustained),
+            int(self.shake_chain_count),
+        )
+
+    def _emit_state(self, force=False):
+        st = self._state_tuple()
+        if not force and st == self._last_emitted:
+            return
+        self._last_emitted = st
+        (
+            basket,lost,queued,active,inserted,paid,cascades,refunded,
+            shaking,shake_axis,shake_sustained,shake_chain
+        ) = st
+        self.stateChanged.emit({
+            "basket": basket,
+            "lost": lost,
+            "queued": queued,
+            "in_machine": active,
+            "inserted_total": inserted,
+            "paid_out_total": paid,
+            "cascades": cascades,
+            "refunded_total": refunded,
+            "shake_active": bool(shaking),
+            "shake_axis": str(shake_axis),
+            "shake_sustained": bool(shake_sustained),
+            "shake_chain": int(shake_chain),
+        })
+
+
 class CoinPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         COIN_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
-        self.settings = QSettings("5imp1e 5atebox", "Coin")
-        self.mode = "normal"
+        self.settings = QSettings('5imp1e 5atebox', 'Coin')
+        self.debug_settings = QSettings(
+            '5imp1e 5atebox',
+            'Debug'
+        )
+        self.mode = 'normal'
+        self._last_pusher_state = {
+            'basket': 0,
+            'lost': 0,
+            'queued': 0,
+            'in_machine': 0,
+            'inserted_total': 0,
+            'paid_out_total': 0,
+            'cascades': 0,
+            'refunded_total': 0,
+            'shake_active': False,
+            'shake_axis': 'x',
+            'shake_sustained': False,
+            'shake_chain': 0,
+        }
 
-        self.front_path = str(self.settings.value("front_path", "") or "")
-        self.back_path = str(self.settings.value("back_path", "") or "")
+        self.front_path = str(self.settings.value('front_path', '') or '')
+        self.back_path = str(self.settings.value('back_path', '') or '')
 
-        # Earning-mode progression. Inspired by Unfair Flips but intentionally
-        # simplified and mechanically distinct.
-        self.money = float(self.settings.value("earn_money", 0.0))
-        self.streak = int(self.settings.value("earn_streak", 0))
-        self.best_streak = int(self.settings.value("earn_best", 0))
-        self.luck_level = int(self.settings.value("earn_luck_level", 0))
-        self.value_level = int(self.settings.value("earn_value_level", 0))
-        self.combo_level = int(self.settings.value("earn_combo_level", 0))
-        self.earn_coin_count = max(1, int(self.settings.value("earn_coin_count", 1)))
-        self.earn_total_flips = max(0, int(self.settings.value("earn_total_flips", 0)))
-        self.earn_total_heads = max(0, int(self.settings.value("earn_total_heads", 0)))
+        self.money = float(self.settings.value('earn_money', 0.0))
+        self.streak = int(self.settings.value('earn_streak', 0))
+        self.best_streak = int(self.settings.value('earn_best', 0))
+        self.luck_level = int(self.settings.value('earn_luck_level', 0))
+        self.value_level = int(self.settings.value('earn_value_level', 0))
+        self.combo_level = int(self.settings.value('earn_combo_level', 0))
+        self.earn_coin_count = max(1, int(self.settings.value('earn_coin_count', 1)))
+        self.earn_total_flips = max(0, int(self.settings.value('earn_total_flips', 0)))
+        self.earn_total_heads = max(0, int(self.settings.value('earn_total_heads', 0)))
 
         self._build_ui()
         self.canvas.set_face_paths(self.front_path or None, self.back_path or None)
         self._sync_mode()
         self._sync_earning_ui()
+        self._sync_pusher_ui()
 
     def _build_ui(self):
         root = QVBoxLayout(self)
@@ -8224,48 +10480,50 @@ class CoinPage(QWidget):
         header = QHBoxLayout()
         text_col = QVBoxLayout()
         text_col.setSpacing(3)
-        kick = QLabel("COIN / PHYSICAL FLIP")
-        kick.setObjectName("kicker")
-        title = QLabel(TXT("翻硬币", "Coin Flip"))
-        title.setObjectName("pageTitle")
+        kick = QLabel('COIN / PHYSICAL FLIP')
+        kick.setObjectName('kicker')
+        title = QLabel(TXT('翻硬币', 'Coin Flip'))
+        title.setObjectName('pageTitle')
         desc = QLabel(TXT(
-            "点击硬币可直接翻转；或持续向后滚动滚轮蓄力，停下片刻后自动释放。当前硬币使用立体浮雕样式。",
-            "Click the coin to flip immediately, or keep scrolling down to charge and pause briefly to auto-release. The coin currently uses a modeled embossed style."
+            '点击硬币可直接翻转；或持续向后滚动滚轮蓄力，停下片刻后自动释放。当前提供普通、赚钱与花钱（推币机）三种玩法。',
+            'Click the coin to flip immediately, or keep scrolling down to charge and pause briefly to auto-release. Three play styles are currently available: Normal, Unfair, and Coin Pusher.'
         ))
-        desc.setObjectName("pageDesc")
+        desc.setObjectName('pageDesc')
         text_col.addWidget(kick)
         text_col.addWidget(title)
         text_col.addWidget(desc)
         header.addLayout(text_col, 1)
 
-        self.mode_normal = QPushButton(TXT("普通", "Normal"))
-        self.mode_earn = QPushButton(TXT("赚钱", "Earning"))
-        for b in (self.mode_normal, self.mode_earn):
+        self.mode_normal = QPushButton(TXT('普通', 'Normal'))
+        self.mode_earn = QPushButton(TXT('赚钱', 'Unfair'))
+        self.mode_pusher = QPushButton(TXT('花钱', 'Coin Pusher'))
+        for b in (self.mode_normal, self.mode_earn, self.mode_pusher):
             b.setCheckable(True)
-            b.setObjectName("chipButton")
+            b.setObjectName('chipButton')
             header.addWidget(b)
         self.mode_normal.setChecked(True)
-        self.mode_normal.clicked.connect(lambda: self._set_mode("normal"))
-        self.mode_earn.clicked.connect(lambda: self._set_mode("earning"))
+        self.mode_normal.clicked.connect(lambda: self._set_mode('normal'))
+        self.mode_earn.clicked.connect(lambda: self._set_mode('earning'))
+        self.mode_pusher.clicked.connect(lambda: self._set_mode('pusher'))
         root.addLayout(header)
 
         controls = QHBoxLayout()
         controls.setSpacing(8)
 
-        self.count_label = QLabel(TXT("硬币数量", "Coins"))
+        self.count_label = QLabel(TXT('硬币数量', 'Coins'))
         self.count_input = QSpinBox()
         self.count_input.setRange(1, 200)
         self.count_input.setValue(1)
         self.count_input.setFixedWidth(74)
 
-        self.front_btn = QPushButton(TXT("正面 PNG", "Heads PNG"))
-        self.back_btn = QPushButton(TXT("反面 PNG", "Tails PNG"))
-        self.front_btn.setObjectName("chipButton")
-        self.back_btn.setObjectName("chipButton")
+        self.front_btn = QPushButton(TXT('正面 PNG', 'Heads PNG'))
+        self.back_btn = QPushButton(TXT('反面 PNG', 'Tails PNG'))
+        self.front_btn.setObjectName('chipButton')
+        self.back_btn.setObjectName('chipButton')
         self.front_btn.setEnabled(False)
         self.back_btn.setEnabled(False)
-        self.front_btn.setToolTip(TXT("立体硬币版本暂不使用 PNG 贴图", "The modeled 3D coin does not use PNG decals yet"))
-        self.back_btn.setToolTip(TXT("立体硬币版本暂不使用 PNG 贴图", "The modeled 3D coin does not use PNG decals yet"))
+        self.front_btn.setToolTip(TXT('立体硬币版本暂不使用 PNG 贴图', 'The modeled 3D coin does not use PNG decals yet'))
+        self.back_btn.setToolTip(TXT('立体硬币版本暂不使用 PNG 贴图', 'The modeled 3D coin does not use PNG decals yet'))
 
         controls.addWidget(self.count_label)
         controls.addWidget(self.count_input)
@@ -8274,34 +10532,33 @@ class CoinPage(QWidget):
         controls.addWidget(self.back_btn)
         controls.addStretch(1)
 
-        self.collect_btn = QPushButton(TXT("整理硬币", "Collect Coins"))
-        self.collect_btn.setObjectName("collectCoinButton")
+        self.collect_btn = QPushButton(TXT('整理硬币', 'Collect Coins'))
+        self.collect_btn.setObjectName('collectCoinButton')
         self.collect_btn.setMinimumSize(138, 44)
         self.collect_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.collect_btn.setCursor(Qt.PointingHandCursor)
         self.collect_btn.setVisible(False)
         self.collect_btn.clicked.connect(self._collect_coins)
         controls.addWidget(self.collect_btn)
-
         root.addLayout(controls)
 
-        # Result / power strip
         strip = QHBoxLayout()
-        self.power_label = QLabel(TXT("蓄力 0.0", "Power 0.0"))
-        self.power_label.setObjectName("statusText")
-        self.normal_stats = QLabel(TXT(
-            "正面 0 · 反面 0 · 立起 0",
-            "Heads 0 · Tails 0 · Edge 0"
-        ))
-        self.normal_stats.setObjectName("statusText")
+        self.power_label = QLabel(TXT('蓄力 0.0', 'Power 0.0'))
+        self.power_label.setObjectName('statusText')
+        self.normal_stats = QLabel(TXT('正面 0 · 反面 0 · 立起 0', 'Heads 0 · Tails 0 · Edge 0'))
+        self.normal_stats.setObjectName('statusText')
+        self.pusher_strip = QLabel('')
+        self.pusher_strip.setObjectName('statusText')
         strip.addWidget(self.power_label)
         strip.addStretch(1)
         strip.addWidget(self.normal_stats)
+        strip.addWidget(self.pusher_strip)
         root.addLayout(strip)
 
         body = QHBoxLayout()
         body.setSpacing(12)
 
+        self.scene_stack = QStackedWidget()
         self.canvas = CoinFlipCanvas(self)
         self.canvas.flipFinished.connect(self._flip_finished)
         self.canvas.chargeChanged.connect(self._charge_changed)
@@ -8309,248 +10566,364 @@ class CoinPage(QWidget):
         self.canvas.collectFinished.connect(self._collection_finished)
         self.count_input.valueChanged.connect(self.canvas.set_preview_count)
         self.canvas.set_preview_count(self._desired_preview_count())
-        body.addWidget(self.canvas, 1)
+        self.scene_stack.addWidget(self.canvas)
+
+        self.pusher_canvas = CoinPusherCanvas(self)
+        self.pusher_canvas.stateChanged.connect(self._pusher_state_changed)
+        self.pusher_canvas.refundEarned.connect(self._pusher_refund)
+        self.scene_stack.addWidget(self.pusher_canvas)
+        body.addWidget(self.scene_stack, 1)
+
+        self.side_stack = QStackedWidget()
+        self.side_stack.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        self.side_blank = QWidget()
+        self.side_blank.setFixedWidth(0)
+        self.side_stack.addWidget(self.side_blank)
 
         self.earning_panel = QFrame()
         self.earning_panel.setFixedWidth(290)
-        self.earning_panel.setObjectName("configPanel")
+        self.earning_panel.setObjectName('configPanel')
         ep = QVBoxLayout(self.earning_panel)
         ep.setContentsMargins(14, 14, 14, 14)
         ep.setSpacing(9)
-
         earn_head = QHBoxLayout()
         earn_head.setSpacing(8)
-
-        earn_title = QLabel(TXT("赚钱模式", "EARNING MODE"))
-        earn_title.setObjectName("settingCategory")
+        earn_title = QLabel(TXT('赚钱模式', 'UNFAIR MODE'))
+        earn_title.setObjectName('settingCategory')
         earn_head.addWidget(earn_title)
-
         earn_head.addStretch(1)
-
         self.earn_lifetime_stats = QLabel()
         self.earn_lifetime_stats.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.earn_lifetime_stats.setStyleSheet(
-            "color:#777; font-size:10px; background:transparent; border:0;"
-        )
+        self.earn_lifetime_stats.setStyleSheet('color:#777; font-size:10px; background:transparent; border:0;')
         earn_head.addWidget(self.earn_lifetime_stats)
-
         ep.addLayout(earn_head)
 
         self.money_label = QLabel()
-        self.money_label.setStyleSheet("font-size:24px; font-weight:800;")
+        self.money_label.setStyleSheet('font-size:24px; font-weight:800;')
         ep.addWidget(self.money_label)
-
         self.earn_stats = QLabel()
         self.earn_stats.setWordWrap(True)
-        self.earn_stats.setObjectName("statusText")
+        self.earn_stats.setObjectName('statusText')
         ep.addWidget(self.earn_stats)
 
-        ep.addSpacing(6)
-        up_title = QLabel(TXT("基础升级", "Basic upgrades"))
-        up_title.setStyleSheet("font-weight:700;")
-        ep.addWidget(up_title)
+        self.manual_settle_btn = QPushButton(
+            TXT('手动结算', 'Settle Now')
+        )
+        self.manual_settle_btn.setObjectName('chipButton')
+        self.manual_settle_btn.setMinimumHeight(38)
+        self.manual_settle_btn.setToolTip(TXT(
+            '立即停止所有硬币的移动，并按照此刻实际朝上的一面进行结算。',
+            'Immediately stop every coin and settle using whichever face is actually up right now.'
+        ))
+        self.manual_settle_btn.clicked.connect(
+            self._manual_settle_unfair
+        )
+        ep.addWidget(self.manual_settle_btn)
 
+        ep.addSpacing(6)
+        up_title = QLabel(TXT('基础升级', 'Basic upgrades'))
+        up_title.setStyleSheet('font-weight:700;')
+        ep.addWidget(up_title)
         self.luck_btn = QPushButton()
         self.value_btn = QPushButton()
         self.combo_btn = QPushButton()
         self.coin_buy_btn = QPushButton()
         for b in (self.luck_btn, self.value_btn, self.combo_btn, self.coin_buy_btn):
-            b.setObjectName("chipButton")
+            b.setObjectName('chipButton')
             b.setMinimumHeight(38)
             ep.addWidget(b)
-
-        self.luck_btn.clicked.connect(lambda: self._buy_upgrade("luck"))
-        self.value_btn.clicked.connect(lambda: self._buy_upgrade("value"))
-        self.combo_btn.clicked.connect(lambda: self._buy_upgrade("combo"))
-        self.coin_buy_btn.clicked.connect(lambda: self._buy_upgrade("coin"))
-
+        self.luck_btn.clicked.connect(lambda: self._buy_upgrade('luck'))
+        self.value_btn.clicked.connect(lambda: self._buy_upgrade('value'))
+        self.combo_btn.clicked.connect(lambda: self._buy_upgrade('combo'))
+        self.coin_buy_btn.clicked.connect(lambda: self._buy_upgrade('coin'))
         ep.addStretch(1)
-
-        credit = QLabel(
-            TXT(
-                "玩法灵感：Unfair Flips — HEATHER FLOWERS\n本模式使用原创界面、数值与规则变体。",
-                "Gameplay inspiration: Unfair Flips — HEATHER FLOWERS\nThis mode uses original UI, tuning, and rule variations."
-            )
-        )
+        credit = QLabel(TXT(
+            '玩法灵感：Unfair Flips — HEATHER FLOWERS\n本模式使用原创界面、数值与规则变体。',
+            'Gameplay inspiration: Unfair Flips — HEATHER FLOWERS\nThis mode uses original UI, tuning, and rule variations.'
+        ))
         credit.setWordWrap(True)
-        credit.setStyleSheet("font-size:10px; color:#565656;")
+        credit.setStyleSheet('font-size:10px; color:#565656;')
         ep.addWidget(credit)
+        self.side_stack.addWidget(self.earning_panel)
 
-        body.addWidget(self.earning_panel)
+        self.pusher_panel = QFrame()
+        self.pusher_panel.setFixedWidth(320)
+        self.pusher_panel.setObjectName('configPanel')
+        pp = QVBoxLayout(self.pusher_panel)
+        pp.setContentsMargins(14, 14, 14, 14)
+        pp.setSpacing(10)
+        pusher_title = QLabel(TXT('花钱模式', 'COIN PUSHER'))
+        pusher_title.setObjectName('settingCategory')
+        pp.addWidget(pusher_title)
+        self.pusher_money_label = QLabel()
+        self.pusher_money_label.setStyleSheet('font-size:24px; font-weight:800;')
+        pp.addWidget(self.pusher_money_label)
+        self.pusher_desc = QLabel(TXT(
+            '将赚钱模式中的余额换成实体硬币投入推币机：$1 = 1 枚硬币。硬币会从顶部随机轨道落下，经上层平台、推板与下层平台后，掉入篮子或从侧边漏失。',
+            'Spend your Unfair balance as real coins in the pusher: $1 = 1 coin. Coins fall from random top rails, ride the upper shelf, meet the pusher, reach the lower shelf, and then either land in the basket or vanish into side gutters.'
+        ))
+        self.pusher_desc.setWordWrap(True)
+        self.pusher_desc.setObjectName('statusText')
+        pp.addWidget(self.pusher_desc)
+        row = QHBoxLayout()
+        row.addWidget(QLabel(TXT('投入数量', 'Insert')))
+        self.pusher_drop_input = QSpinBox()
+        self.pusher_drop_input.setRange(1, 999)
+        self.pusher_drop_input.setValue(1)
+        self.pusher_drop_input.setFixedWidth(78)
+        self.pusher_drop_input.valueChanged.connect(self._sync_pusher_ui)
+        row.addWidget(self.pusher_drop_input)
+        self.pusher_insert_btn = QPushButton(TXT('投入机器', 'Insert'))
+        self.pusher_insert_btn.setObjectName('chipButton')
+        self.pusher_insert_btn.clicked.connect(self._pusher_insert)
+        row.addWidget(self.pusher_insert_btn, 1)
+        pp.addLayout(row)
+        self.pusher_cash_btn = QPushButton(TXT('提现篮子', 'Cash out basket'))
+        self.pusher_cash_btn.setObjectName('chipButton')
+        self.pusher_cash_btn.setMinimumHeight(38)
+        self.pusher_cash_btn.clicked.connect(self._pusher_cash_out)
+        pp.addWidget(self.pusher_cash_btn)
+
+        self.pusher_shake_btn = QPushButton(
+            TXT('震动机器  $0.25', 'Shake Machine  $0.25')
+        )
+        self.pusher_shake_btn.setObjectName('chipButton')
+        self.pusher_shake_btn.setMinimumHeight(38)
+        self.pusher_shake_btn.setToolTip(TXT(
+            '轻微晃动机器，让硬币重新分布。每次花费 $0.25；有 2.5% 概率变为前后晃动，每连续 10 次必定触发一次持续 3 秒、振幅 +15% 的强化晃动。',
+            'Gently shake the machine to redistribute coins. Costs $0.25 each time; there is a 2.5% chance of a front/back shake, and every 10th shake guarantees a 3-second sustained shake with 15% more amplitude.'
+        ))
+        self.pusher_shake_btn.clicked.connect(self._pusher_shake)
+        pp.addWidget(self.pusher_shake_btn)
+
+        self.pusher_status = QLabel()
+        self.pusher_status.setWordWrap(True)
+        self.pusher_status.setObjectName('statusText')
+        pp.addWidget(self.pusher_status)
+        self.pusher_stats = QLabel()
+        self.pusher_stats.setWordWrap(True)
+        self.pusher_stats.setObjectName('statusText')
+        pp.addWidget(self.pusher_stats)
+        pp.addStretch(1)
+        note = QLabel(TXT(
+            '3D 推币机使用双层台面、实体推板、三角挡条、随机落轨与真实硬币碰撞。硬币可能掉入前方篮子，也可能从侧边或后方遗失洞流失；玩家投入后遗失的硬币有 5% 概率返还 $1。可花费 $0.25 轻微震动机器。',
+            'The 3D pusher uses two shelves, solid pushers, a triangular deflector, random drop rails, and real coin collisions. Coins can reach the front basket or be lost through side/rear gutters; a lost player-inserted coin has a 5% chance to refund $1. You can lightly shake the machine for $0.25.'
+        ))
+        note.setWordWrap(True)
+        note.setStyleSheet('font-size:10px; color:#565656;')
+        pp.addWidget(note)
+        self.side_stack.addWidget(self.pusher_panel)
+
+        body.addWidget(self.side_stack)
         root.addLayout(body, 1)
 
     def _set_mode(self, mode):
-        if self.canvas.animating or self.canvas.collecting or self.canvas.needs_collect:
+        if self.mode in ('normal', 'earning') and (self.canvas.animating or self.canvas.collecting or self.canvas.needs_collect):
             return
         previous = self.mode
         self.mode = mode
-        self.mode_normal.setChecked(mode == "normal")
-        self.mode_earn.setChecked(mode == "earning")
-
-        # Earning coins are allowed to remain scattered only while staying in
-        # earning mode. Switching modes starts the destination mode cleanly.
-        if previous != mode and self.canvas.coins:
+        self.mode_normal.setChecked(mode == 'normal')
+        self.mode_earn.setChecked(mode == 'earning')
+        self.mode_pusher.setChecked(mode == 'pusher')
+        if previous != mode and previous in ('normal', 'earning') and self.canvas.coins:
             self.canvas._clear_dynamic()
             self.canvas._rebuild_preview()
-
         self._sync_mode()
 
+    def _admin_mode_enabled(self):
+        return self.debug_settings.value(
+            "admin_mode",
+            self.debug_settings.value(
+                "enable_unfair_manual_settle",
+                False,
+                type=bool
+            ),
+            type=bool
+        )
+
+    def _admin_manual_settle_enabled(self):
+        # Manual settlement is currently one of the Administrator Mode tools.
+        return self._admin_mode_enabled()
+
     def _desired_preview_count(self):
-        return self.earn_coin_count if self.mode == "earning" else self.count_input.value()
+        return self.earn_coin_count if self.mode == 'earning' else self.count_input.value()
 
     def _sync_mode(self):
-        earning = self.mode == "earning"
-        self.earning_panel.setVisible(earning)
-        self.count_input.setEnabled(not earning)
-        self.count_label.setEnabled(not earning)
+        normal = self.mode == 'normal'
+        pusher = self.mode == 'pusher'
+        self.scene_stack.setCurrentIndex(1 if pusher else 0)
+        self.side_stack.setCurrentIndex(0 if normal else (1 if self.mode == 'earning' else 2))
+        self.side_stack.setVisible(not normal)
+        self.count_input.setEnabled(normal)
+        self.count_label.setEnabled(normal)
+        self.front_btn.setVisible(not pusher)
+        self.back_btn.setVisible(not pusher)
+        self.count_input.setVisible(not pusher)
+        self.count_label.setVisible(not pusher)
+        self.collect_btn.setVisible(normal and self.canvas.needs_collect)
+        self.collect_btn.setEnabled(not self.canvas.collecting)
+        self.normal_stats.setVisible(normal)
+        self.power_label.setVisible(not pusher)
+        self.pusher_strip.setVisible(pusher)
         self.canvas.set_preview_count(self._desired_preview_count())
-        self.normal_stats.setVisible(not earning)
+
+        if hasattr(self, 'manual_settle_btn'):
+            debug_manual = self._admin_manual_settle_enabled()
+            self.manual_settle_btn.setVisible(
+                self.mode == 'earning'
+                and debug_manual
+            )
+            self.manual_settle_btn.setEnabled(
+                self.mode == 'earning'
+                and debug_manual
+                and bool(self.canvas.coins)
+                and not self.canvas.collecting
+            )
+
+        if normal:
+            self.power_label.setText(TXT('蓄力 0.0', 'Power 0.0'))
+        self._sync_pusher_ui()
 
     def _find_existing_face(self, side):
         candidates = []
-        roots = [
-            COIN_IMAGE_DIR,
-            RESOURCE_DIR / "coins",
-            RESOURCE_DIR / "coin_faces",
-            RESOURCE_DIR / "coin_flip",
-        ]
-        names = (
-            ["heads.png", "head.png", "front.png", "obverse.png", "正面.png"]
-            if side == "front"
-            else ["tails.png", "tail.png", "back.png", "reverse.png", "反面.png"]
-        )
+        roots = [COIN_IMAGE_DIR, RESOURCE_DIR / 'coins', RESOURCE_DIR / 'coin_faces', RESOURCE_DIR / 'coin_flip']
+        names = ['heads.png', 'head.png', 'front.png', 'obverse.png', '正面.png'] if side == 'front' else ['tails.png', 'tail.png', 'back.png', 'reverse.png', '反面.png']
         for root in roots:
             for name in names:
                 p = root / name
                 if p.exists():
                     return p
             if root.exists():
-                candidates.extend(sorted(root.glob("*.png")))
+                candidates.extend(sorted(root.glob('*.png')))
         if len(candidates) >= 2:
-            return candidates[0] if side == "front" else candidates[1]
+            return candidates[0] if side == 'front' else candidates[1]
         return None
 
     def _choose_face(self, side):
         start = str(COIN_IMAGE_DIR)
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            TXT("选择硬币 PNG", "Choose coin PNG"),
-            start,
-            "PNG (*.png)"
-        )
+        path, _ = QFileDialog.getOpenFileName(self, TXT('选择硬币 PNG', 'Choose coin PNG'), start, 'PNG (*.png)')
         if not path:
             return
-        # Copy selected art into the project resource folder so the development
-        # build does not depend on arbitrary external file locations.
-        target = COIN_IMAGE_DIR / ("heads.png" if side == "front" else "tails.png")
+        target = COIN_IMAGE_DIR / ('heads.png' if side == 'front' else 'tails.png')
         try:
             shutil.copy2(path, target)
             path = str(target)
         except Exception:
             pass
-        if side == "front":
+        if side == 'front':
             self.front_path = path
-            self.settings.setValue("front_path", path)
+            self.settings.setValue('front_path', path)
         else:
             self.back_path = path
-            self.settings.setValue("back_path", path)
+            self.settings.setValue('back_path', path)
         self.canvas.set_face_paths(self.front_path or None, self.back_path or None)
 
     def _ensure_faces(self):
         if not self.front_path or not Path(self.front_path).exists():
-            p = self._find_existing_face("front")
-            self.front_path = str(p) if p else ""
+            p = self._find_existing_face('front')
+            self.front_path = str(p) if p else ''
         if not self.back_path or not Path(self.back_path).exists():
-            p = self._find_existing_face("back")
-            self.back_path = str(p) if p else ""
+            p = self._find_existing_face('back')
+            self.back_path = str(p) if p else ''
         self.canvas.set_face_paths(self.front_path or None, self.back_path or None)
 
     def _charge_changed(self, charge, held):
         power = self.canvas.effective_power()
         if held > 3.0:
-            self.power_label.setText(TXT(
-                f"蓄力 {power:.1f} · 手抖 {held-3.0:.1f}s",
-                f"Power {power:.1f} · shake {held-3.0:.1f}s"
-            ))
+            self.power_label.setText(TXT(f'蓄力 {power:.1f} · 手抖 {held-3.0:.1f}s', f'Power {power:.1f} · shake {held-3.0:.1f}s'))
         else:
-            self.power_label.setText(TXT(f"蓄力 {power:.1f}", f"Power {power:.1f}"))
+            self.power_label.setText(TXT(f'蓄力 {power:.1f}', f'Power {power:.1f}'))
 
     def _collect_coins(self):
         if not self.canvas.needs_collect or self.canvas.collecting:
             return
         self.collect_btn.setEnabled(False)
-        self.collect_btn.setText(TXT("整理中…", "Collecting…"))
+        self.collect_btn.setText(TXT('整理中…', 'Collecting…'))
         self.count_input.setEnabled(False)
         self.mode_normal.setEnabled(False)
         self.mode_earn.setEnabled(False)
+        self.mode_pusher.setEnabled(False)
         self.canvas.collect_coins()
 
     def _collection_finished(self):
         self.collect_btn.setVisible(False)
         self.collect_btn.setEnabled(True)
-        self.collect_btn.setText(TXT("整理硬币", "Collect Coins"))
+        self.collect_btn.setText(TXT('整理硬币', 'Collect Coins'))
         self.mode_normal.setEnabled(True)
         self.mode_earn.setEnabled(True)
-        self.count_input.setEnabled(self.mode == "normal")
+        self.mode_pusher.setEnabled(True)
+        self.count_input.setEnabled(self.mode == 'normal')
         self.canvas.set_preview_count(self._desired_preview_count())
-        self.power_label.setText(TXT("蓄力 0.0", "Power 0.0"))
+        self.power_label.setText(TXT('蓄力 0.0', 'Power 0.0'))
+
+    def _manual_settle_unfair(self):
+        if self.mode != 'earning':
+            return
+        if not self._admin_manual_settle_enabled():
+            return
+        if not self.canvas.coins:
+            return
+
+        # Administrator/debug action only.
+        self.canvas.manual_settle_unfair()
 
     def release_requested(self):
+        if self.mode == 'pusher':
+            return
         if self.canvas.animating or self.canvas.collecting or self.canvas.needs_collect:
             return
-        if self.mode == "normal":
-            self.canvas.start_flip(
-                self.count_input.value(),
-                0.5,
-                power=self.canvas.effective_power(),
-                collisions=True
-            )
+        if self.mode == 'normal':
+            self.canvas.start_flip(self.count_input.value(), 0.5, power=self.canvas.effective_power(), collisions=True)
         else:
             self.canvas.start_flip(
                 self.earn_coin_count,
                 self._heads_probability(),
                 power=self.canvas.effective_power(),
                 collisions=False,
-                reuse_existing=bool(self.canvas.coins),
+                reuse_existing=bool(self.canvas.coins)
             )
+            if hasattr(self, 'manual_settle_btn'):
+                self.manual_settle_btn.setEnabled(
+                    self._admin_manual_settle_enabled()
+                    and bool(self.canvas.coins)
+                )
 
     def _flip_finished(self, results):
         heads = sum(1 for x in results if x == 1)
         edges = sum(1 for x in results if x == 2)
         tails = sum(1 for x in results if x == 0)
-
-        if self.mode == "normal":
+        if self.mode == 'normal':
             self.collect_btn.setVisible(True)
             self.collect_btn.setEnabled(True)
             self.count_input.setEnabled(False)
             self.mode_normal.setEnabled(False)
             self.mode_earn.setEnabled(False)
-            self.normal_stats.setText(TXT(
-                f"正面 {heads} · 反面 {tails} · 立起 {edges}",
-                f"Heads {heads} · Tails {tails} · Edge {edges}"
-            ))
+            self.mode_pusher.setEnabled(False)
+            self.normal_stats.setText(TXT(f'正面 {heads} · 反面 {tails} · 立起 {edges}', f'Heads {heads} · Tails {tails} · Edge {edges}'))
             return
-
-        # Earning mode intentionally skips collection. The same landed coins stay
-        # where they are and can immediately be clicked or charged for the next flip.
         self.collect_btn.setVisible(False)
         self.collect_btn.setEnabled(True)
         self.mode_normal.setEnabled(True)
         self.mode_earn.setEnabled(True)
+        self.mode_pusher.setEnabled(True)
         self.count_input.setEnabled(False)
+        if hasattr(self, 'manual_settle_btn'):
+            self.manual_settle_btn.setEnabled(
+                self._admin_manual_settle_enabled()
+                and bool(self.canvas.coins)
+            )
 
-        # Lifetime statistics count physical coin tosses, not rounds.
         self.earn_total_flips += len(results)
         self.earn_total_heads += heads
-
-        # Earning mode: all owned coins flip simultaneously. A round succeeds if
-        # at least one coin lands heads; every head earns the current round payout.
         if heads:
             self.streak += 1
             self.best_streak = max(self.best_streak, self.streak)
-            base = self._coin_value()
-            multiplier = 1.0 + max(0, self.streak - 1) * self._combo_bonus()
-            self.money += heads * base * multiplier
+            base = max(0.01, float(self._coin_value()))
+            multiplier = max(1.0, 1.0 + max(0, self.streak - 1) * self._combo_bonus())
+            payout = heads * base * multiplier
+            if payout <= 0.0:
+                payout = heads * max(1.0, base)
+            self.money += payout
             if self.streak >= 8:
                 self.money += 25.0 + 5.0 * max(0, self.earn_coin_count - 1)
                 self.streak = 0
@@ -8558,10 +10931,9 @@ class CoinPage(QWidget):
             self.streak = 0
         self._save_earning()
         self._sync_earning_ui()
+        self._sync_pusher_ui()
 
     def _heads_probability(self):
-        # Earning mode begins at 5%. Each Heads Bias purchase adds exactly
-        # +1.25 percentage points.
         return min(.80, .05 + .0125 * self.luck_level)
 
     def _coin_value(self):
@@ -8571,59 +10943,49 @@ class CoinPage(QWidget):
         return .15 + .10 * self.combo_level
 
     def _upgrade_cost(self, kind):
-        if kind == "coin":
-            # Extra earning coins are intentionally expensive and escalate sharply.
-            # Coin #2 starts at $40; later coins cost substantially more.
+        if kind == 'coin':
             owned_extra = max(0, self.earn_coin_count - 1)
             return 40.0 * (2.15 ** owned_extra)
-
-        level = {
-            "luck": self.luck_level,
-            "value": self.value_level,
-            "combo": self.combo_level,
-        }[kind]
-        base = {"luck": 4.0, "value": 3.0, "combo": 5.0}[kind]
+        level = {'luck': self.luck_level, 'value': self.value_level, 'combo': self.combo_level}[kind]
+        base = {'luck': 4.0, 'value': 3.0, 'combo': 5.0}[kind]
         return base * (1.75 ** level)
 
     def _buy_upgrade(self, kind):
         cost = self._upgrade_cost(kind)
         if self.money + 1e-9 < cost:
             return
-        if kind == "luck" and self._heads_probability() >= .80:
+        if kind == 'luck' and self._heads_probability() >= .80:
             return
-        if kind == "coin" and self.earn_coin_count >= 20:
+        if kind == 'coin' and self.earn_coin_count >= 20:
             return
-
         self.money -= cost
-        if kind == "luck":
+        if kind == 'luck':
             self.luck_level += 1
-        elif kind == "value":
+        elif kind == 'value':
             self.value_level += 1
-        elif kind == "combo":
+        elif kind == 'combo':
             self.combo_level += 1
         else:
             self.earn_coin_count += 1
-            if self.mode == "earning" and not self.canvas.animating and not self.canvas.needs_collect:
+            if self.mode == 'earning' and not self.canvas.animating and not self.canvas.needs_collect:
                 self.canvas.set_preview_count(self.earn_coin_count)
-
         self._save_earning()
         self._sync_earning_ui()
+        self._sync_pusher_ui()
 
     def _save_earning(self):
-        self.settings.setValue("earn_money", self.money)
-        self.settings.setValue("earn_streak", self.streak)
-        self.settings.setValue("earn_best", self.best_streak)
-        self.settings.setValue("earn_luck_level", self.luck_level)
-        self.settings.setValue("earn_value_level", self.value_level)
-        self.settings.setValue("earn_combo_level", self.combo_level)
-        self.settings.setValue("earn_coin_count", self.earn_coin_count)
-        self.settings.setValue("earn_total_flips", self.earn_total_flips)
-        self.settings.setValue("earn_total_heads", self.earn_total_heads)
+        self.settings.setValue('earn_money', self.money)
+        self.settings.setValue('earn_streak', self.streak)
+        self.settings.setValue('earn_best', self.best_streak)
+        self.settings.setValue('earn_luck_level', self.luck_level)
+        self.settings.setValue('earn_value_level', self.value_level)
+        self.settings.setValue('earn_combo_level', self.combo_level)
+        self.settings.setValue('earn_coin_count', self.earn_coin_count)
+        self.settings.setValue('earn_total_flips', self.earn_total_flips)
+        self.settings.setValue('earn_total_heads', self.earn_total_heads)
         self.settings.sync()
 
     def reset_local_earning_data(self):
-        # This method is intentionally invoked only from the main Settings page,
-        # after a destructive-action confirmation dialog.
         self.money = 0.0
         self.streak = 0
         self.best_streak = 0
@@ -8633,80 +10995,163 @@ class CoinPage(QWidget):
         self.earn_coin_count = 1
         self.earn_total_flips = 0
         self.earn_total_heads = 0
-
-        for key in (
-            "earn_money",
-            "earn_streak",
-            "earn_best",
-            "earn_luck_level",
-            "earn_value_level",
-            "earn_combo_level",
-            "earn_coin_count",
-            "earn_total_flips",
-            "earn_total_heads",
-        ):
+        for key in ('earn_money', 'earn_streak', 'earn_best', 'earn_luck_level', 'earn_value_level', 'earn_combo_level', 'earn_coin_count', 'earn_total_flips', 'earn_total_heads'):
             self.settings.remove(key)
-        self.settings.sync()
+        self._save_earning()
+
+        # Reset the Coin Pusher too: remove every player-added coin AND rebuild
+        # all factory/default coins at their original starting positions.
+        self.pusher_canvas.reset_to_default_layout()
 
         if not self.canvas.animating and not self.canvas.collecting:
             self.canvas.needs_collect = False
             self.canvas._clear_dynamic()
             self.canvas.preview_count = 1
             self.canvas._rebuild_preview()
-
         self._sync_earning_ui()
+        self._sync_pusher_ui()
 
     def _sync_earning_ui(self):
-        self.money_label.setText(f"${self.money:,.2f}")
-
-        empirical = (
-            (self.earn_total_heads / self.earn_total_flips) * 100.0
-            if self.earn_total_flips > 0
-            else 0.0
-        )
-        self.earn_lifetime_stats.setText(TXT(
-            f"总投掷 {self.earn_total_flips} · 实际正面率 {empirical:.2f}%",
-            f"Total flips {self.earn_total_flips} · actual heads {empirical:.2f}%"
-        ))
-
+        self.money_label.setText(f'${self.money:,.2f}')
+        empirical = ((self.earn_total_heads / self.earn_total_flips) * 100.0 if self.earn_total_flips > 0 else 0.0)
+        self.earn_lifetime_stats.setText(TXT(f'总投掷 {self.earn_total_flips} · 实际正面率 {empirical:.2f}%', f'Total flips {self.earn_total_flips} · observed heads {empirical:.2f}%'))
         self.earn_stats.setText(TXT(
-            f"拥有硬币 {self.earn_coin_count} 枚 · 当前正面概率 {self._heads_probability()*100:.2f}%\n"
-            f"当前连胜 {self.streak}/8 · 最佳 {self.best_streak}\n"
-            f"每个实际正面价值 ${self._coin_value():.2f} · 连胜加成 +{self._combo_bonus():.2f}×/轮",
-            f"Owned coins {self.earn_coin_count} · current heads chance {self._heads_probability()*100:.2f}%\n"
-            f"Current streak {self.streak}/8 · best {self.best_streak}\n"
-            f"Each actual heads ${self._coin_value():.2f} · streak bonus +{self._combo_bonus():.2f}×/round"
+            f'拥有硬币 {self.earn_coin_count} 枚 · 当前正面概率 {self._heads_probability()*100:.2f}%\n'
+            f'当前连胜 {self.streak}/8 · 最佳 {self.best_streak}\n'
+            f'每个实际正面价值 ${self._coin_value():.2f} · 连胜加成 +{self._combo_bonus():.2f}×/轮',
+            f'Owned coins {self.earn_coin_count} · current heads chance {self._heads_probability()*100:.2f}%\n'
+            f'Current streak {self.streak}/8 · best {self.best_streak}\n'
+            f'Each actual heads ${self._coin_value():.2f} · streak bonus +{self._combo_bonus():.2f}×/round'
         ))
-
-        luck_cost = self._upgrade_cost("luck")
-        value_cost = self._upgrade_cost("value")
-        combo_cost = self._upgrade_cost("combo")
-        coin_cost = self._upgrade_cost("coin")
+        luck_cost = self._upgrade_cost('luck')
+        value_cost = self._upgrade_cost('value')
+        combo_cost = self._upgrade_cost('combo')
+        coin_cost = self._upgrade_cost('coin')
         luck_max = self._heads_probability() >= .80
         coin_max = self.earn_coin_count >= 20
-
-        self.luck_btn.setText(TXT(
-            "偏向正面：已满级" if luck_max else f"偏向正面 +1.25%   ${luck_cost:.2f}",
-            "Heads bias: MAX" if luck_max else f"Heads bias +1.25%   ${luck_cost:.2f}"
-        ))
+        self.luck_btn.setText(TXT('偏向正面：已满级' if luck_max else f'偏向正面 +1.25%   ${luck_cost:.2f}', 'Heads bias: MAX' if luck_max else f'Heads bias +1.25%   ${luck_cost:.2f}'))
         self.luck_btn.setEnabled(not luck_max and self.money >= luck_cost)
-        self.value_btn.setText(TXT(
-            f"硬币价值 +$0.50   ${value_cost:.2f}",
-            f"Coin value +$0.50   ${value_cost:.2f}"
-        ))
+        self.value_btn.setText(TXT(f'硬币价值 +$0.50   ${value_cost:.2f}', f'Coin value +$0.50   ${value_cost:.2f}'))
         self.value_btn.setEnabled(self.money >= value_cost)
-        self.combo_btn.setText(TXT(
-            f"连胜倍率 +0.10×   ${combo_cost:.2f}",
-            f"Streak bonus +0.10×   ${combo_cost:.2f}"
-        ))
+        self.combo_btn.setText(TXT(f'连胜倍率 +0.10×   ${combo_cost:.2f}', f'Streak bonus +0.10×   ${combo_cost:.2f}'))
         self.combo_btn.setEnabled(self.money >= combo_cost)
-
-        self.coin_buy_btn.setText(TXT(
-            "购买硬币：已满" if coin_max else f"购买第 {self.earn_coin_count + 1} 枚硬币   ${coin_cost:,.2f}",
-            "Buy coin: MAX" if coin_max else f"Buy coin #{self.earn_coin_count + 1}   ${coin_cost:,.2f}"
-        ))
+        self.coin_buy_btn.setText(TXT('购买硬币：已满' if coin_max else f'购买第 {self.earn_coin_count + 1} 枚硬币   ${coin_cost:,.2f}', 'Buy coin: MAX' if coin_max else f'Buy coin #{self.earn_coin_count + 1}   ${coin_cost:,.2f}'))
         self.coin_buy_btn.setEnabled(not coin_max and self.money >= coin_cost)
 
+    def _pusher_refund(self, count):
+        count = max(0, int(count))
+        if count <= 0:
+            return
+        self.money += float(count)
+        self._save_earning()
+        self._sync_earning_ui()
+        self._sync_pusher_ui()
+
+    def _pusher_state_changed(self, state):
+        self._last_pusher_state = dict(state or {})
+        self._sync_pusher_ui()
+
+    def _sync_pusher_ui(self):
+        balance = max(0.0, float(self.money))
+        available_coins = int(math.floor(balance + 1e-9))
+        self.pusher_money_label.setText(f'${balance:,.2f}')
+        self.pusher_drop_input.setMaximum(max(1, available_coins if available_coins > 0 else 1))
+        if available_coins > 0 and self.pusher_drop_input.value() > available_coins:
+            self.pusher_drop_input.setValue(available_coins)
+        st = self._last_pusher_state
+        basket = int(st.get('basket', 0))
+        lost = int(st.get('lost', 0))
+        queued = int(st.get('queued', 0))
+        in_machine = int(st.get('in_machine', 0))
+        inserted = int(st.get('inserted_total', 0))
+        paid = int(st.get('paid_out_total', 0))
+        cascades = int(st.get('cascades', 0))
+        refunded = int(st.get('refunded_total', 0))
+        shaking = bool(st.get('shake_active', False))
+        shake_axis = str(st.get('shake_axis', 'x'))
+        shake_sustained = bool(st.get('shake_sustained', False))
+        shake_chain = int(st.get('shake_chain', 0))
+        self.pusher_strip.setText(TXT(
+            f'篮子 {basket} · 漏失 {lost} · 返还 {refunded} · 机内 {in_machine} · 待落 {queued}',
+            f'Basket {basket} · Lost {lost} · Refunded {refunded} · In machine {in_machine} · Queued {queued}'
+        ))
+        self.pusher_status.setText(TXT(f'可投入 {available_coins} 枚（按 $1 = 1 枚换算）\n当前篮子 {basket} 枚，可随时提现回余额。', f'{available_coins} coins available to insert ($1 = 1 coin).\nBasket holds {basket} coins and can be cashed back into your balance at any time.'))
+        self.pusher_stats.setText(TXT(
+            f'累计投入 {inserted} · 篮子兑现 {paid} · 遗失 {lost} · 5%返还 {refunded}\n'
+            f'当前机内 {in_machine} · 待落轨道 {queued} · 触发前缘坍塌 {cascades}',
+            f'Total inserted {inserted} · Cashed from basket {paid} · Lost {lost} · 5% refunds {refunded}\n'
+            f'Currently in machine {in_machine} · Waiting on rails {queued} · Edge cascades {cascades}'
+        ))
+        self.pusher_insert_btn.setEnabled(
+            available_coins > 0
+            and self.pusher_canvas.can_insert(
+                self.pusher_drop_input.value()
+            )
+        )
+        self.pusher_cash_btn.setEnabled(basket > 0)
+        self.pusher_shake_btn.setEnabled(
+            self.money >= 0.25
+            and not shaking
+        )
+        if shaking:
+            if shake_sustained:
+                shake_label = TXT(
+                    '持续晃动中…',
+                    'Sustained shake…'
+                )
+            elif shake_axis == 'y':
+                shake_label = TXT(
+                    '前后晃动中…',
+                    'Front/back shake…'
+                )
+            else:
+                shake_label = TXT(
+                    '震动中…',
+                    'Shaking…'
+                )
+        else:
+            shake_label = TXT(
+                '震动机器  $0.25',
+                'Shake Machine  $0.25'
+            )
+        self.pusher_shake_btn.setText(shake_label)
+
+    def _pusher_insert(self):
+        available = int(math.floor(max(0.0, float(self.money)) + 1e-9))
+        count = max(1, int(self.pusher_drop_input.value()))
+        count = min(count, available)
+        if count <= 0:
+            return
+        inserted = self.pusher_canvas.insert_coins(count)
+        if inserted <= 0:
+            return
+        self.money -= float(inserted)
+        self._save_earning()
+        self._sync_earning_ui()
+        self._sync_pusher_ui()
+
+    def _pusher_cash_out(self):
+        amount = self.pusher_canvas.cash_out()
+        if amount <= 0:
+            return
+        self.money += float(amount)
+        self._save_earning()
+        self._sync_earning_ui()
+        self._sync_pusher_ui()
+
+    def _pusher_shake(self):
+        cost = 0.25
+        if self.money + 1e-9 < cost:
+            return
+        if self.pusher_canvas.shake_active:
+            return
+        if not self.pusher_canvas.shake_machine():
+            return
+
+        self.money -= cost
+        self._save_earning()
+        self._sync_earning_ui()
+        self._sync_pusher_ui()
 
 
 class PlaceholderPage(QWidget):
@@ -8735,6 +11180,12 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(self._base_window_min)
         self._language = APP_SETTINGS.get("language", "zh")
         self.ui_scale = 1.0
+
+        # Hidden administrator quick-enable chord state.
+        # Hold Ctrl + Shift + Space and press U, W, T (any order).
+        self._admin_shortcut_tokens = set()
+        self._admin_space_held = False
+
         self._build_ui()
         app = QApplication.instance()
         if app is not None:
@@ -8911,11 +11362,88 @@ class MainWindow(QMainWindow):
         self.ui_scale = value
         self._apply_zoom()
 
+    def _enable_administrator_mode(self):
+        debug_settings = QSettings(
+            "5imp1e 5atebox",
+            "Debug"
+        )
+        already = debug_settings.value(
+            "admin_mode",
+            False,
+            type=bool
+        )
+
+        debug_settings.setValue("admin_mode", True)
+        debug_settings.setValue(
+            "enable_unfair_manual_settle",
+            True
+        )
+        debug_settings.sync()
+
+        # Reflect the change immediately in Settings if that page already exists.
+        try:
+            if hasattr(self, "settings_page"):
+                box = getattr(
+                    self.settings_page,
+                    "admin_mode_check",
+                    None
+                )
+                if box is not None:
+                    old_block = box.blockSignals(True)
+                    box.setChecked(True)
+                    box.blockSignals(old_block)
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self, "coin_page"):
+                self.coin_page._sync_mode()
+        except Exception:
+            pass
+
+        # Trigger the normal settings refresh path once.
+        if not already:
+            try:
+                self._settings_changed()
+            except Exception:
+                pass
+
     def eventFilter(self, obj, event):
         # Mouse-wheel UI zoom has been removed. Wheel events are left untouched so
         # scroll areas, sliders and other widgets can handle them normally.
         if event.type() == QEvent.KeyPress:
             key = event.key()
+
+            # Administrator shortcut:
+            # hold Ctrl + Shift + Space, then press U/W/T in any order.
+            if not event.isAutoRepeat():
+                if key == Qt.Key_Space:
+                    self._admin_space_held = True
+                    self._admin_shortcut_tokens.clear()
+
+                mods = event.modifiers()
+                ctrl_shift = bool(
+                    mods & Qt.ControlModifier
+                    and mods & Qt.ShiftModifier
+                )
+
+                if (
+                    self._admin_space_held
+                    and ctrl_shift
+                    and key in (Qt.Key_U, Qt.Key_W, Qt.Key_T)
+                ):
+                    token = {
+                        Qt.Key_U: "U",
+                        Qt.Key_W: "W",
+                        Qt.Key_T: "T",
+                    }[key]
+                    self._admin_shortcut_tokens.add(token)
+
+                    if self._admin_shortcut_tokens >= {"U", "W", "T"}:
+                        self._enable_administrator_mode()
+                        self._admin_shortcut_tokens.clear()
+                        return True
+
             name = qt_key_name(key)
             if name and not event.isAutoRepeat():
                 HELD_KEYS.add(name)
@@ -8936,7 +11464,18 @@ class MainWindow(QMainWindow):
                 self._set_zoom(1.0)
                 return True
         if event.type() == QEvent.KeyRelease:
-            name = qt_key_name(event.key())
+            released_key = event.key()
+            if not event.isAutoRepeat():
+                if released_key == Qt.Key_Space:
+                    self._admin_space_held = False
+                    self._admin_shortcut_tokens.clear()
+                elif released_key in (
+                    Qt.Key_Control,
+                    Qt.Key_Shift,
+                ):
+                    self._admin_shortcut_tokens.clear()
+
+            name = qt_key_name(released_key)
             if name and not event.isAutoRepeat():
                 HELD_KEYS.discard(name)
                 for stage in self.findChildren(TarotStage):
@@ -8970,6 +11509,11 @@ class MainWindow(QMainWindow):
                 mark_back = APP_SETTINGS.get("mark_back", False)
                 self.tarot.custom.stage.configure_runtime(mark_back=mark_back)
                 self.tarot.classic.stage.configure_runtime(mark_back=mark_back)
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "coin_page"):
+                    self.coin_page._sync_mode()
             except Exception:
                 pass
             return
