@@ -54,7 +54,7 @@ except Exception as exc:
     JOLT_ERROR = str(exc)
 
 APP_NAME = "5imp1e 5atebox"
-APP_VERSION = "0.18.0"
+APP_VERSION = "0.20.1"
 APP_SETTINGS = {
     "language": "zh",
     "mark_back": False,
@@ -6972,287 +6972,842 @@ class MusicPage(QWidget):
 
 
 
-class CoinFlipCanvas(QWidget):
+
+
+class CoinMeshFactory:
+    """Build cached triangle meshes for a beveled coin and its relief artwork.
+
+    Important: all visible geometry is GLMeshItem/MeshData-based. This lets
+    pyqtgraph's GLViewWidget apply its current model-view/projection pipeline
+    correctly, unlike raw fixed-function immediate-mode drawing in a custom
+    GLGraphicsItem.paint().
+    """
+    _coin_meshdata = None
+    _stack_cache = {}
+
+    @staticmethod
+    def _add_tri(verts, faces, colors, a, b, c, color):
+        base = len(verts)
+        verts.extend((tuple(a), tuple(b), tuple(c)))
+        faces.append((base, base + 1, base + 2))
+        colors.append(color)
+
+    @staticmethod
+    def _add_quad(verts, faces, colors, a, b, c, d, color):
+        CoinMeshFactory._add_tri(verts, faces, colors, a, b, c, color)
+        CoinMeshFactory._add_tri(verts, faces, colors, a, c, d, color)
+
+    @staticmethod
+    def _add_ring_surface(verts, faces, colors, ring_a, ring_b, color_fn):
+        n = len(ring_a)
+        for i in range(n):
+            j = (i + 1) % n
+            color = color_fn(i, n)
+            CoinMeshFactory._add_quad(
+                verts, faces, colors,
+                ring_a[i], ring_a[j], ring_b[j], ring_b[i], color
+            )
+
+    @staticmethod
+    def _disc(center_z, radius, segments, reverse=False):
+        center = np.asarray((0.0, 0.0, center_z), dtype=float)
+        ring = []
+        for i in range(segments):
+            a = 2.0 * math.pi * i / segments
+            ring.append(np.asarray((math.cos(a)*radius, math.sin(a)*radius, center_z), dtype=float))
+        return center, ring, reverse
+
+    @staticmethod
+    def _add_disc(verts, faces, colors, z, radius, segments, color, reverse=False):
+        center, ring, _ = CoinMeshFactory._disc(z, radius, segments, reverse)
+        for i in range(segments):
+            j = (i + 1) % segments
+            if reverse:
+                CoinMeshFactory._add_tri(verts, faces, colors, center, ring[j], ring[i], color)
+            else:
+                CoinMeshFactory._add_tri(verts, faces, colors, center, ring[i], ring[j], color)
+
+    @staticmethod
+    def _add_strip_prism(verts, faces, colors, p0, p1, width, z0, z1, top_color, side_color, bottom=False):
+        p0 = np.asarray(p0, dtype=float)
+        p1 = np.asarray(p1, dtype=float)
+        d = p1 - p0
+        n = float(np.linalg.norm(d))
+        if n < 1e-9:
+            return
+        d /= n
+        perp = np.asarray((-d[1], d[0]), dtype=float) * (width * 0.5)
+        a2 = p0 + perp
+        b2 = p1 + perp
+        c2 = p1 - perp
+        d2 = p0 - perp
+
+        if not bottom:
+            a0=(a2[0],a2[1],z0); b0=(b2[0],b2[1],z0); c0=(c2[0],c2[1],z0); d0=(d2[0],d2[1],z0)
+            a1=(a2[0],a2[1],z1); b1=(b2[0],b2[1],z1); c1=(c2[0],c2[1],z1); d1=(d2[0],d2[1],z1)
+        else:
+            # For the underside, z1 is farther outward (more negative).
+            a0=(a2[0],a2[1],z0); b0=(b2[0],b2[1],z0); c0=(c2[0],c2[1],z0); d0=(d2[0],d2[1],z0)
+            a1=(a2[0],a2[1],z1); b1=(b2[0],b2[1],z1); c1=(c2[0],c2[1],z1); d1=(d2[0],d2[1],z1)
+
+        # outer/top cap
+        if bottom:
+            CoinMeshFactory._add_quad(verts, faces, colors, a1, d1, c1, b1, top_color)
+        else:
+            CoinMeshFactory._add_quad(verts, faces, colors, a1, b1, c1, d1, top_color)
+
+        # side walls
+        for q0, q1, q2, q3 in ((a0,b0,b1,a1),(b0,c0,c1,b1),(c0,d0,d1,c1),(d0,a0,a1,d1)):
+            CoinMeshFactory._add_quad(verts, faces, colors, q0,q1,q2,q3, side_color)
+
+    @staticmethod
+    def _polyline_segments(points, closed=False):
+        pts = [np.asarray(p, dtype=float) for p in points]
+        segs = list(zip(pts[:-1], pts[1:]))
+        if closed and len(pts) > 2:
+            segs.append((pts[-1], pts[0]))
+        return segs
+
+    @staticmethod
+    def _circle_poly(cx, cy, radius, segments=40, a0=0.0, a1=math.tau):
+        return [
+            (cx + math.cos(a0 + (a1-a0)*i/segments)*radius,
+             cy + math.sin(a0 + (a1-a0)*i/segments)*radius)
+            for i in range(segments + 1)
+        ]
+
+    @classmethod
+    def coin_meshdata(cls):
+        if cls._coin_meshdata is not None:
+            return cls._coin_meshdata
+
+        R = 0.28
+        H = 0.024
+        bevel = 0.010
+        seg = 64
+
+        verts, faces, colors = [], [], []
+
+        # Metallic palette; face variation gives readable curvature without textures.
+        top_face = (0.78, 0.79, 0.80, 1.0)
+        bottom_face = (0.71, 0.72, 0.73, 1.0)
+        bevel_light = (0.88, 0.89, 0.90, 1.0)
+        bevel_dark = (0.54, 0.55, 0.57, 1.0)
+        edge_base = (0.45, 0.46, 0.48, 1.0)
+        relief_top = (0.89, 0.90, 0.91, 1.0)
+        relief_side = (0.34, 0.35, 0.37, 1.0)
+        groove = (0.31, 0.32, 0.34, 1.0)
+
+        # Beveled body rings.
+        radii = [R*0.90, R, R, R*0.90]
+        zs = [H, H-bevel, -H+bevel, -H]
+        rings = []
+        for radius, z in zip(radii, zs):
+            ring = []
+            for i in range(seg):
+                a = 2*math.pi*i/seg
+                ring.append(np.asarray((math.cos(a)*radius, math.sin(a)*radius, z), dtype=float))
+            rings.append(ring)
+
+        def light_color(i, n):
+            a = 2*math.pi*(i+0.5)/n
+            illum = 0.72 + 0.25*max(0.0, math.cos(a+0.6))
+            return (edge_base[0]*illum, edge_base[1]*illum, edge_base[2]*illum, 1.0)
+
+        cls._add_ring_surface(verts, faces, colors, rings[0], rings[1],
+                              lambda i,n: bevel_light if math.cos(2*math.pi*i/n+0.7) > 0 else bevel_dark)
+        cls._add_ring_surface(verts, faces, colors, rings[1], rings[2], light_color)
+        cls._add_ring_surface(verts, faces, colors, rings[2], rings[3],
+                              lambda i,n: bevel_dark if math.cos(2*math.pi*i/n+0.7) > 0 else bevel_light)
+
+        cls._add_disc(verts, faces, colors, H, R*0.90, seg, top_face, reverse=False)
+        cls._add_disc(verts, faces, colors, -H, R*0.90, seg, bottom_face, reverse=True)
+
+        # Rim grooves / ridges create actual raised geometry, not screen-space lines.
+        relief_h = 0.010
+        line_w = 0.015
+
+        for rr in (R*0.78, R*0.86):
+            pts = cls._circle_poly(0,0,rr,64)
+            for p0,p1 in cls._polyline_segments(pts, False):
+                cls._add_strip_prism(verts,faces,colors,p0,p1,line_w,H+0.001,H+relief_h,relief_top,relief_side)
+                cls._add_strip_prism(verts,faces,colors,p0,p1,line_w,-H-0.001,-H-relief_h,relief_top,relief_side,bottom=True)
+
+        # Front: raised "1".
+        front_lines = [
+            [(-0.05, -0.105), (0.02, -0.105), (0.02, 0.100), (0.075, 0.050)],
+            [(-0.075, -0.125), (0.085, -0.125)],
+        ]
+        for poly in front_lines:
+            for p0,p1 in cls._polyline_segments(poly):
+                cls._add_strip_prism(verts,faces,colors,p0,p1,0.028,H+0.001,H+0.020,relief_top,relief_side)
+
+        # Back: original heraldic-inspired relief.
+        back_polys = [
+            [(-.050,.115),(.060,.115),(.055,-.020),(.045,-.085),(0,-.115),(-.045,-.085),(-.055,-.020)],
+            [(0,.110),(0,-.100)],
+            [(-.050,-.015),(.055,-.015)],
+            [(.125,.085),(.170,.105),(.195,.065),(.155,.010),(.190,-.010)],
+            [(.115,-.045),(.165,-.035),(.195,-.075),(.155,-.112)],
+        ]
+        for poly in back_polys:
+            for p0,p1 in cls._polyline_segments(poly):
+                cls._add_strip_prism(verts,faces,colors,p0,p1,0.016,-H-0.001,-H-0.015,relief_top,relief_side,bottom=True)
+
+        for cx,cy,rr in ((-.145,.065,.036),(-.150,-.070,.038)):
+            pts = cls._circle_poly(cx,cy,rr,32)
+            for p0,p1 in cls._polyline_segments(pts):
+                cls._add_strip_prism(verts,faces,colors,p0,p1,0.012,-H-0.001,-H-0.013,relief_top,relief_side,bottom=True)
+
+        md = gl.MeshData(
+            vertexes=np.asarray(verts, dtype=float),
+            faces=np.asarray(faces, dtype=np.int32),
+            faceColors=np.asarray(colors, dtype=float),
+        )
+        cls._coin_meshdata = md
+        return md
+
+    @classmethod
+    def stack_meshdata(cls, count):
+        count = max(1, int(count))
+        cached = cls._stack_cache.get(count)
+        if cached is not None:
+            return cached
+
+        base_md = cls.coin_meshdata()
+        # MeshData's getters are stable public API in pyqtgraph.
+        base_v = np.asarray(base_md.vertexes(), dtype=float)
+        base_f = np.asarray(base_md.faces(), dtype=np.int32)
+        try:
+            base_c = np.asarray(base_md.faceColors(), dtype=float)
+        except Exception:
+            base_c = np.tile(np.asarray((0.78,0.79,0.80,1.0),dtype=float), (len(base_f),1))
+
+        thickness = 0.051
+        all_v, all_f, all_c = [], [], []
+        offset = 0
+        for i in range(count):
+            v = base_v.copy()
+            v[:,2] += i * thickness
+            all_v.append(v)
+            all_f.append(base_f + offset)
+            all_c.append(base_c)
+            offset += len(v)
+
+        md = gl.MeshData(
+            vertexes=np.vstack(all_v),
+            faces=np.vstack(all_f),
+            faceColors=np.vstack(all_c),
+        )
+        cls._stack_cache[count] = md
+        return md
+
+
+class CoinFlipCanvas(gl.GLViewWidget):
     flipFinished = Signal(object)
     chargeChanged = Signal(float, float)
+    releaseRequested = Signal()
+    collectFinished = Signal()
 
     def __init__(self, parent=None):
+        # Keep GLViewWidget on its standard Euler camera path.
+        # PySide6 6.11.x does not accept the QVector3D overload used internally by
+        # pyqtgraph's quaternion-camera setCameraPosition implementation.
         super().__init__(parent)
-        self.setMinimumHeight(420)
-        self.setMouseTracking(True)
+        self.setMinimumHeight(430)
+        self.setBackgroundColor((7, 7, 7, 255))
+        # Fixed camera: coin throws never zoom, pan, or reframe automatically.
+        # It is chosen once to keep the enlarged arena boundary visible.
+        self.setCameraPosition(
+            pos=QVector3D(0, 0, 1.5),
+            distance=27.5,
+            elevation=24,
+            azimuth=-42
+        )
         self.setFocusPolicy(Qt.StrongFocus)
 
         self._timer = QTimer(self)
         self._timer.setInterval(16)
         self._timer.timeout.connect(self._tick)
 
+        self._release_timer = QTimer(self)
+        self._release_timer.setSingleShot(True)
+        self._release_timer.setInterval(480)
+        self._release_timer.timeout.connect(self._auto_release)
+
         self.animating = False
-        self.coins = []
-        self._started_at = 0.0
-        self._duration = 1.0
+        self.collecting = False
+        self.needs_collect = False
+        self.collection_started_at = 0.0
+        self.collection_stagger = 0.055
+        self.collection_move_time = 0.48
+        self.collection_data = []
+        self.charging = False
         self.charge = 0.0
         self.charge_started_at = None
-        self._shake_clock = 0.0
+        self.last_wheel_at = None
+        self.preview_count = 1
+        self._coin_press_pos = None
+        self._coin_press_button = None
 
-        self.front_pixmap = QPixmap()
-        self.back_pixmap = QPixmap()
-        self._load_default_faces()
+        self.coin_radius = 0.28
+        self.coin_half = 0.024
+        self.coin_thickness = self.coin_half * 2
+        self.physics_dt = 1.0 / 240.0
+        self.physics_accumulator = 0.0
+        self.last_tick = time.perf_counter()
 
-    def _load_default_faces(self):
-        self.front_pixmap = self._fallback_front()
-        self.back_pixmap = self._fallback_back()
+        self.preview_item = None
+        self.coins = []
 
-    @staticmethod
-    def _fallback_front(size=320):
-        pix = QPixmap(size, size)
-        pix.fill(Qt.transparent)
-        p = QPainter(pix)
-        p.setRenderHint(QPainter.Antialiasing, True)
-        p.setPen(QPen(QColor("#d9d9d9"), 8))
-        p.setBrush(QColor("#111111"))
-        p.drawEllipse(12, 12, size - 24, size - 24)
-        p.setPen(QColor("#f1f1f1"))
-        f = QFont("Georgia")
-        f.setPointSize(int(size * 0.43))
-        f.setBold(True)
-        p.setFont(f)
-        p.drawText(pix.rect(), Qt.AlignCenter, "1")
-        p.end()
-        return pix
+        # Coin page gets its own much larger enclosed arena.
+        # The visible grid remains transparent/dark; walls and ceiling are mostly
+        # represented by subtle boundary lines while their Jolt colliders are solid.
+        self.arena_x = 34.0
+        self.arena_y = 24.0
+        self.arena_wall_h = 20.0
+        self.arena_ceiling_z = 20.0
 
-    @staticmethod
-    def _fallback_back(size=320):
-        """Monochrome outline inspired by Icelandic coin heraldry."""
-        pix = QPixmap(size, size)
-        pix.fill(Qt.transparent)
-        p = QPainter(pix)
-        p.setRenderHint(QPainter.Antialiasing, True)
-        p.setBrush(QColor("#111111"))
-        p.setPen(QPen(QColor("#d9d9d9"), 8))
-        p.drawEllipse(12, 12, size - 24, size - 24)
+        self.floor = gl.GLGridItem()
+        self.floor.setSize(x=self.arena_x, y=self.arena_y)
+        self.floor.setSpacing(x=1, y=1)
+        self.floor.setColor((35, 35, 35, 72))
+        self.addItem(self.floor)
 
-        pen = QPen(QColor("#eeeeee"), 5)
-        pen.setJoinStyle(Qt.RoundJoin)
-        pen.setCapStyle(Qt.RoundCap)
-        p.setPen(pen)
-        p.setBrush(Qt.NoBrush)
+        # Visible arena outline; faint enough not to dominate the coins.
+        hx = self.arena_x * 0.5
+        hy = self.arena_y * 0.5
+        z0 = 0.015
+        border = np.asarray([
+            (-hx,-hy,z0),( hx,-hy,z0),( hx, hy,z0),(-hx, hy,z0),(-hx,-hy,z0)
+        ], dtype=float)
+        self.arena_border = gl.GLLinePlotItem(
+            pos=border,
+            color=(0.10,0.10,0.10,0.95),
+            width=1.4,
+            antialias=True,
+            mode="line_strip",
+        )
+        self.addItem(self.arena_border)
 
-        # Central shield with a Nordic-cross outline.
-        shield = QPainterPath()
-        shield.moveTo(size * .37, size * .30)
-        shield.lineTo(size * .63, size * .30)
-        shield.lineTo(size * .61, size * .59)
-        shield.quadTo(size * .50, size * .72, size * .39, size * .59)
-        shield.closeSubpath()
-        p.drawPath(shield)
-        p.drawLine(QPointF(size*.47, size*.31), QPointF(size*.47, size*.64))
-        p.drawLine(QPointF(size*.39, size*.43), QPointF(size*.61, size*.43))
+        # Vertical corner guides make the enclosure legible without drawing opaque
+        # walls over the scene.
+        for x, y in ((-hx,-hy),(hx,-hy),(hx,hy),(-hx,hy)):
+            guide = gl.GLLinePlotItem(
+                pos=np.asarray(((x,y,0.0),(x,y,self.arena_ceiling_z)), dtype=float),
+                color=(0.075,0.075,0.075,0.60),
+                width=1.0,
+                antialias=True,
+                mode="lines",
+            )
+            self.addItem(guide)
 
-        # Four simplified guardian outlines around the shield: deliberately
-        # original line art, not a copied coat-of-arms asset.
-        p.drawEllipse(QRectF(size*.18, size*.35, size*.13, size*.11))
-        p.drawLine(QPointF(size*.19, size*.40), QPointF(size*.13, size*.34))
-        p.drawLine(QPointF(size*.20, size*.37), QPointF(size*.15, size*.30))
+        self.world = culverin.PhysicsWorld({
+            "gravity": (0.0, 0.0, -9.81),
+            "penetration_slop": 0.0015,
+            "num_threads": 2,
+        })
+        self.floor_body = self.world.create_body(
+            pos=(0.0, 0.0, -0.08),
+            size=(self.arena_x * 0.5, self.arena_y * 0.5, 0.08),
+            shape=culverin.SHAPE_BOX,
+            motion=culverin.MOTION_STATIC,
+            mass=0.0,
+            friction=0.62,
+            restitution=0.24,
+        )
 
-        wing = QPainterPath()
-        wing.moveTo(size*.70, size*.34)
-        wing.quadTo(size*.88, size*.25, size*.80, size*.45)
-        wing.quadTo(size*.87, size*.48, size*.70, size*.50)
-        p.drawPath(wing)
+        # Invisible Jolt containment: four walls plus a ceiling. Coins can bounce
+        # around dramatically but cannot disappear into the distance or above camera.
+        wall_t = 0.12
+        wall_hh = self.arena_wall_h * 0.5
+        self.arena_bodies = [
+            self.world.create_body(
+                pos=(-self.arena_x*0.5-wall_t, 0.0, wall_hh),
+                size=(wall_t, self.arena_y*0.5+wall_t, wall_hh),
+                shape=culverin.SHAPE_BOX, motion=culverin.MOTION_STATIC,
+                mass=0.0, friction=0.50, restitution=0.42,
+            ),
+            self.world.create_body(
+                pos=( self.arena_x*0.5+wall_t, 0.0, wall_hh),
+                size=(wall_t, self.arena_y*0.5+wall_t, wall_hh),
+                shape=culverin.SHAPE_BOX, motion=culverin.MOTION_STATIC,
+                mass=0.0, friction=0.50, restitution=0.42,
+            ),
+            self.world.create_body(
+                pos=(0.0, -self.arena_y*0.5-wall_t, wall_hh),
+                size=(self.arena_x*0.5+wall_t, wall_t, wall_hh),
+                shape=culverin.SHAPE_BOX, motion=culverin.MOTION_STATIC,
+                mass=0.0, friction=0.50, restitution=0.42,
+            ),
+            self.world.create_body(
+                pos=(0.0,  self.arena_y*0.5+wall_t, wall_hh),
+                size=(self.arena_x*0.5+wall_t, wall_t, wall_hh),
+                shape=culverin.SHAPE_BOX, motion=culverin.MOTION_STATIC,
+                mass=0.0, friction=0.50, restitution=0.42,
+            ),
+            self.world.create_body(
+                pos=(0.0, 0.0, self.arena_ceiling_z + wall_t),
+                size=(self.arena_x*0.5+wall_t, self.arena_y*0.5+wall_t, wall_t),
+                shape=culverin.SHAPE_BOX, motion=culverin.MOTION_STATIC,
+                mass=0.0, friction=0.35, restitution=0.38,
+            ),
+        ]
 
-        p.drawEllipse(QRectF(size*.18, size*.57, size*.11, size*.16))
-        p.drawLine(QPointF(size*.20, size*.72), QPointF(size*.14, size*.79))
-        p.drawLine(QPointF(size*.27, size*.72), QPointF(size*.32, size*.80))
-
-        serpent = QPainterPath()
-        serpent.moveTo(size*.70, size*.60)
-        serpent.cubicTo(size*.84, size*.54, size*.86, size*.70, size*.76, size*.73)
-        serpent.cubicTo(size*.69, size*.75, size*.72, size*.82, size*.83, size*.80)
-        p.drawPath(serpent)
-        p.end()
-        return pix
+        self._rebuild_preview()
 
     def set_face_paths(self, front_path=None, back_path=None):
-        def load_or_fallback(path, fallback):
-            if path:
-                pix = QPixmap(str(path))
-                if not pix.isNull():
-                    return pix
-            return fallback()
-        self.front_pixmap = load_or_fallback(front_path, self._fallback_front)
-        self.back_pixmap = load_or_fallback(back_path, self._fallback_back)
-        self.update()
+        # Compatibility hook. The current revision intentionally uses a modeled
+        # metal coin with geometric relief instead of PNG face decals.
+        self._rebuild_preview()
+
+    def set_preview_count(self, count):
+        count = max(1, min(200, int(count)))
+        if count != self.preview_count and not self.animating and not self.collecting:
+            self.preview_count = count
+            if not self.needs_collect:
+                if self.coins:
+                    self._clear_dynamic()
+                self._rebuild_preview()
+
+    def _make_mesh_item(self):
+        item = gl.GLMeshItem(
+            meshdata=CoinMeshFactory.coin_meshdata(),
+            smooth=False,
+            drawFaces=True,
+            drawEdges=False,
+            shader="shaded",
+            computeNormals=True,
+        )
+        item.setGLOptions("opaque")
+        return item
+
+    def _rebuild_preview(self):
+        if self.preview_item is not None:
+            try:
+                self.removeItem(self.preview_item)
+            except Exception:
+                pass
+
+        self.preview_item = gl.GLMeshItem(
+            meshdata=CoinMeshFactory.stack_meshdata(self.preview_count),
+            smooth=False,
+            drawFaces=True,
+            drawEdges=False,
+            shader="shaded",
+            computeNormals=True,
+        )
+        self.preview_item.setGLOptions("opaque")
+        self.addItem(self.preview_item)
+        self._update_preview_transform()
+
+    def _update_preview_transform(self):
+        if self.preview_item is None:
+            return
+
+        shake_x = 0.0
+        tilt = 0.0
+        if self.charging and self.charge_started_at is not None:
+            held = max(0.0, time.perf_counter() - self.charge_started_at)
+            if held > 1.25:
+                amp = 0.015 + 0.12 * math.log1p(held - 1.25)
+                t = time.perf_counter()
+                shake_x = math.sin(t * 33.0) * amp
+                tilt = math.sin(t * 27.0) * min(7.0, 1.4 + math.log1p(held) * 2.5)
+
+        m = QMatrix4x4()
+        m.translate(shake_x, 0.0, 0.08)
+        m.rotate(tilt, 0, 1, 0)
+        self.preview_item.setTransform(m)
 
     def wheelEvent(self, event):
-        if self.animating:
+        # Coin-page-only camera zoom: Ctrl + wheel never charges the coin.
+        if event.modifiers() & Qt.ControlModifier:
+            self._release_timer.stop()
+            # Directly adjust GLViewWidget camera distance so behavior is stable
+            # regardless of global UI-wheel settings.
+            delta = event.angleDelta().y()
+            if delta:
+                factor = 0.88 if delta > 0 else 1.14
+                current = float(self.opts.get("distance", 27.5))
+                self.opts["distance"] = max(3.0, min(85.0, current * factor))
+                self.update()
             event.accept()
             return
+
+        if self.animating or self.collecting or self.needs_collect:
+            event.accept()
+            return
+
         delta = event.angleDelta().y()
         if delta < 0:
             now = time.perf_counter()
-            if self.charge_started_at is None:
+            if not self.charging:
+                self.charging = True
                 self.charge_started_at = now
-            # No upper cap. High-resolution wheels simply add proportionally.
+                self._timer.start()
+
+            self.last_wheel_at = now
             self.charge += max(0.10, abs(delta) / 120.0)
-            held = max(0.0, now - self.charge_started_at)
+            held = max(0.0, now - (self.charge_started_at or now))
             self.chargeChanged.emit(self.charge, held)
-            self.update()
+            self._release_timer.start()
             event.accept()
             return
+
         event.ignore()
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton and not self.animating:
-            self.parentWidget().release_requested() if hasattr(self.parentWidget(), "release_requested") else None
-            event.accept()
-            return
+        if event.button() == Qt.LeftButton and not self.animating and not self.collecting and not self.needs_collect:
+            # Do not launch on press: GLViewWidget also uses left-drag for camera
+            # orbit. We distinguish a click from a drag on release.
+            self._coin_press_pos = event.position()
+            self._coin_press_button = event.button()
         super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        should_release = False
+        if (
+            event.button() == Qt.LeftButton
+            and not self.animating
+            and not self.collecting
+            and not self.needs_collect
+            and self._coin_press_pos is not None
+        ):
+            delta = event.position() - self._coin_press_pos
+            should_release = (delta.x() * delta.x() + delta.y() * delta.y()) <= 36.0
+
+        super().mouseReleaseEvent(event)
+
+        if should_release:
+            self._release_timer.stop()
+            self.releaseRequested.emit()
+
+        self._coin_press_pos = None
+        self._coin_press_button = None
+
+    def _auto_release(self):
+        if self.charging and not self.animating:
+            self.releaseRequested.emit()
 
     def effective_power(self):
         if self.charge <= 0:
             return 1.0
-        held = 0.0 if self.charge_started_at is None else max(0.0, time.perf_counter() - self.charge_started_at)
-        # Unbounded in both scroll input and time, but the time component grows gently.
-        return self.charge * (1.0 + held * 0.045)
+        held = 0.0 if self.charge_started_at is None else max(
+            0.0, time.perf_counter() - self.charge_started_at
+        )
+        # Still has no hard ceiling, but sqrt/log growth prevents a few fast wheel
+        # strokes from producing absurd launch energy.
+        return (
+            1.0
+            + 1.20 * math.sqrt(self.charge)
+            + 0.18 * math.log1p(self.charge)
+            + 0.06 * math.log1p(held * max(1.0, self.charge))
+        )
 
     def reset_charge(self):
         self.charge = 0.0
+        self.charging = False
         self.charge_started_at = None
+        self.last_wheel_at = None
+        self._release_timer.stop()
         self.chargeChanged.emit(0.0, 0.0)
-        self.update()
+        self._update_preview_transform()
 
-    def start_flip(self, count, heads_probability=0.5, power=None):
-        if self.animating:
+    @staticmethod
+    def _quat_matrix(quat):
+        x,y,z,w=[float(q) for q in quat]
+        return np.asarray((
+            (1-2*(y*y+z*z),2*(x*y-z*w),2*(x*z+y*w)),
+            (2*(x*y+z*w),1-2*(x*x+z*z),2*(y*z-x*w)),
+            (2*(x*z-y*w),2*(y*z+x*w),1-2*(x*x+y*y))
+        ),dtype=float)
+
+    def _coin_points(self):
+        pts=[]
+        for z in (-self.coin_half,self.coin_half):
+            for i in range(32):
+                a=2*math.pi*i/32
+                pts.append((math.cos(a)*self.coin_radius,math.sin(a)*self.coin_radius,z))
+        return np.asarray(pts,dtype=np.float32)
+
+    def _clear_dynamic(self):
+        for coin in self.coins:
+            try:
+                self.world.destroy_body(coin["body"])
+            except Exception:
+                pass
+            try:
+                self.removeItem(coin["item"])
+            except Exception:
+                pass
+        self.coins=[]
+
+    def start_flip(self,count,heads_probability=.5,power=None,collisions=True):
+        if self.animating or self.collecting or self.needs_collect:
             return
-        count = max(1, min(200, int(count)))
+
+        count=max(1,min(200,int(count)))
         if power is None:
-            power = self.effective_power()
-        power = max(0.05, float(power))
+            power=self.effective_power()
+        power=max(.05,float(power))
 
-        self.coins = []
-        cols = max(1, math.ceil(math.sqrt(count * 1.65)))
-        rows = max(1, math.ceil(count / cols))
+        self._release_timer.stop()
+        self._clear_dynamic()
 
-        results = []
+        if self.preview_item is not None:
+            try:
+                self.removeItem(self.preview_item)
+            except Exception:
+                pass
+            self.preview_item=None
+
+        points=self._coin_points()
+
         for i in range(count):
-            result = 1 if random.random() < heads_probability else 0
-            results.append(result)
-            col = i % cols
-            row = i // cols
+            z=self.coin_half+i*(self.coin_thickness+.004)
+            item=self._make_mesh_item()
+            self.addItem(item)
+
+            # Physically stacked coins; tiny offsets keep the convex hull solver
+            # away from perfectly coincident contact manifolds.
+            x0=(i%3-1)*.002
+            y0=((i//3)%3-1)*.002
+
+            body=self.world.create_convex_hull(
+                pos=(x0,y0,z),
+                rot=(0.,0.,0.,1.),
+                points=points,
+                motion=culverin.MOTION_DYNAMIC,
+                mass=.12,
+                friction=.48,
+                restitution=.31 if collisions else .20,
+                ccd=True,
+            )
+
+            upward=.46+.18*math.sqrt(power)
+            lateral=.020+.013*math.sqrt(power)
+            angle=random.uniform(0,math.tau)
+            self.world.apply_impulse(
+                body,
+                math.cos(angle)*random.uniform(0.,lateral),
+                math.sin(angle)*random.uniform(0.,lateral),
+                upward*random.uniform(.92,1.08),
+            )
+
+            spin=.016+math.sqrt(power)*random.uniform(.020,.030)
+            self.world.apply_angular_impulse(
+                body,
+                random.uniform(-spin,spin),
+                random.uniform(-spin,spin),
+                random.uniform(-spin*.18,spin*.18),
+            )
+
             self.coins.append({
-                "col": col,
-                "row": row,
-                "cols": cols,
-                "rows": rows,
-                "phase": random.uniform(0, math.tau),
-                "spin": (9.0 + power * random.uniform(2.1, 3.0)) * random.choice((-1, 1)),
-                "result": result,
-                "xwave": random.uniform(.7, 1.5),
-                "ywave": random.uniform(.7, 1.4),
-                "seed": random.uniform(0, math.tau),
+                "body":body,
+                "item":item,
+                "sleep":0.,
+                "result":None,
+                "forced_probability":float(heads_probability) if not collisions else None,
             })
 
-        self._results = results
-        self._power = power
-        # More power = more revolutions. Duration grows sublinearly, never hard-capped.
-        self._duration = 0.75 + math.log1p(power) * 0.38
-        self._started_at = time.perf_counter()
-        self.animating = True
+        # Deliberately do not touch the camera here. The coin arena uses a fixed
+        # camera before, during, and after every throw.
+        self.physics_accumulator=0.
+        self.last_tick=time.perf_counter()
+        self.animating=True
         self._timer.start()
-        self.update()
+
+    def _apply_transform(self,coin,pos,quat):
+        q=QQuaternion(float(quat[3]),float(quat[0]),float(quat[1]),float(quat[2]))
+        m=QMatrix4x4()
+        m.translate(float(pos[0]),float(pos[1]),float(pos[2]))
+        m.rotate(q)
+        coin["item"].setTransform(m)
+
+    def _read_face(self,quat):
+        R=self._quat_matrix(quat)
+        return 1 if float((R@np.asarray((0.,0.,1.)))[2])>=0 else 0
+
+    def collect_coins(self):
+        """Animate landed coins back into a neat stack, one after another."""
+        if self.animating or self.collecting or not self.needs_collect or not self.coins:
+            return
+
+        self._release_timer.stop()
+        self.reset_charge()
+        self.collecting = True
+        self.needs_collect = False
+        self.collection_started_at = time.perf_counter()
+        self.collection_data = []
+
+        # Freeze physics at the exact landed transforms, then animate render meshes.
+        for i, coin in enumerate(self.coins):
+            body = coin.get("body")
+            pos = self.world.get_position(body) if body is not None else None
+            quat = self.world.get_rotation(body) if body is not None else None
+            if not pos:
+                pos = (0.0, 0.0, self.coin_half)
+            if not quat:
+                quat = (0.0, 0.0, 0.0, 1.0)
+
+            try:
+                if body is not None:
+                    self.world.destroy_body(body)
+            except Exception:
+                pass
+            coin["body"] = None
+
+            q0 = QQuaternion(float(quat[3]), float(quat[0]), float(quat[1]), float(quat[2]))
+            target_z = self.coin_half + i * (self.coin_thickness + 0.004)
+            self.collection_data.append({
+                "coin": coin,
+                "start_pos": QVector3D(float(pos[0]), float(pos[1]), float(pos[2])),
+                "start_q": q0,
+                "target_pos": QVector3D(0.0, 0.0, target_z),
+                "target_q": QQuaternion(),
+                "delay": i * self.collection_stagger,
+            })
+
+        self._timer.start()
+
+    @staticmethod
+    def _smoothstep01(t):
+        t = max(0.0, min(1.0, float(t)))
+        return t * t * (3.0 - 2.0 * t)
+
+    def _collection_tick(self):
+        elapsed = time.perf_counter() - self.collection_started_at
+        all_done = True
+
+        for data in self.collection_data:
+            local_t = (elapsed - data["delay"]) / self.collection_move_time
+            if local_t <= 0.0:
+                all_done = False
+                continue
+
+            if local_t < 1.0:
+                all_done = False
+
+            t = self._smoothstep01(local_t)
+            p0 = data["start_pos"]
+            p1 = data["target_pos"]
+            # A small lift arc prevents coins from visually cutting through each other.
+            x = p0.x() + (p1.x() - p0.x()) * t
+            y = p0.y() + (p1.y() - p0.y()) * t
+            z = p0.z() + (p1.z() - p0.z()) * t
+            z += math.sin(math.pi * t) * (0.22 + 0.08 * min(1.0, data["delay"] / 2.0))
+
+            q = QQuaternion.slerp(data["start_q"], data["target_q"], t)
+
+            m = QMatrix4x4()
+            m.translate(x, y, z)
+            m.rotate(q)
+            data["coin"]["item"].setTransform(m)
+
+        if all_done:
+            # Replace the many landed mesh items with the efficient idle-stack mesh.
+            for coin in self.coins:
+                try:
+                    self.removeItem(coin["item"])
+                except Exception:
+                    pass
+            self.coins = []
+            self.collection_data = []
+            self.collecting = False
+            self._timer.stop()
+            self._rebuild_preview()
+            self.collectFinished.emit()
 
     def _tick(self):
+        if self.collecting:
+            self._collection_tick()
+            return
+
+        if self.charging and not self.animating:
+            self._update_preview_transform()
+            held=0. if self.charge_started_at is None else max(
+                0.,time.perf_counter()-self.charge_started_at
+            )
+            self.chargeChanged.emit(self.charge,held)
+            self.update()
+            return
+
         if not self.animating:
             return
-        elapsed = time.perf_counter() - self._started_at
-        if elapsed >= self._duration:
-            self.animating = False
+
+        now=time.perf_counter()
+        frame_dt=max(.001,min(.05,now-self.last_tick))
+        self.last_tick=now
+        self.physics_accumulator+=frame_dt
+
+        steps=0
+        while self.physics_accumulator>=self.physics_dt and steps<12:
+            self.world.step(self.physics_dt)
+            self.physics_accumulator-=self.physics_dt
+            steps+=1
+
+        for coin in self.coins:
+            if coin["result"] is not None:
+                continue
+
+            pos=self.world.get_position(coin["body"])
+            quat=self.world.get_rotation(coin["body"])
+            lv=self.world.get_velocity(coin["body"])
+            av=self.world.get_angular_velocity(coin["body"])
+            if not pos or not quat or not lv or not av:
+                continue
+
+            self._apply_transform(coin,pos,quat)
+
+            linear=math.sqrt(sum(float(v)*float(v) for v in lv))
+            angular=math.sqrt(sum(float(v)*float(v) for v in av))
+
+            if float(pos[2])<-2.5:
+                try:
+                    self.world.destroy_body(coin["body"])
+                except Exception:
+                    pass
+
+                body=self.world.create_convex_hull(
+                    pos=(random.uniform(-.25,.25),random.uniform(-.25,.25),3.5),
+                    rot=quat,
+                    points=self._coin_points(),
+                    motion=culverin.MOTION_DYNAMIC,
+                    mass=.12,
+                    friction=.48,
+                    restitution=.28,
+                    ccd=True
+                )
+                self.world.apply_impulse(
+                    body,float(lv[0]),float(lv[1]),abs(float(lv[2]))+.35
+                )
+                self.world.apply_angular_impulse(
+                    body,float(av[0])*.004,float(av[1])*.004,float(av[2])*.004
+                )
+                coin["body"]=body
+                coin["sleep"]=0.
+                continue
+
+            if linear<.055 and angular<.24 and float(pos[2])<1.5:
+                coin["sleep"]+=frame_dt
+            else:
+                coin["sleep"]=max(0.,coin["sleep"]-frame_dt*1.8)
+
+            if coin["sleep"]>.42:
+                if coin["forced_probability"] is None:
+                    result=self._read_face(quat)
+                else:
+                    result=1 if random.random()<coin["forced_probability"] else 0
+                coin["result"]=result
+
+        if self.coins and all(c["result"] is not None for c in self.coins):
+            results=[int(c["result"]) for c in self.coins]
+            self.animating=False
+            self.needs_collect=True
             self._timer.stop()
-            results = list(self._results)
             self.reset_charge()
-            self.update()
             self.flipFinished.emit(results)
-            return
-        self.update()
-
-    def _draw_coin(self, p, coin, index, progress, rect):
-        cols = coin["cols"]
-        rows = coin["rows"]
-        cell_w = rect.width() / max(1, cols)
-        cell_h = rect.height() / max(1, rows)
-        base_r = min(cell_w, cell_h) * 0.34
-        r = max(5.0, min(38.0, base_r))
-
-        x = rect.left() + (coin["col"] + .5) * cell_w
-        y = rect.top() + (coin["row"] + .5) * cell_h
-
-        if self.animating:
-            arc = math.sin(progress * math.pi)
-            lift = (28.0 + math.log1p(self._power) * 20.0) * arc
-            x += math.sin(progress * math.tau * coin["xwave"] + coin["seed"]) * (8 + math.log1p(self._power) * 4) * arc
-            y -= lift
-            y += math.cos(progress * math.tau * coin["ywave"] + coin["seed"]) * 4 * arc
-            angle = coin["phase"] + coin["spin"] * (time.perf_counter() - self._started_at)
-            face_scale = abs(math.cos(angle))
-            front_visible = math.cos(angle) >= 0
-        else:
-            face_scale = 1.0
-            front_visible = coin["result"] == 1
-
-        w = max(2.5, 2 * r * face_scale)
-        h = 2 * r
-        face = self.front_pixmap if front_visible else self.back_pixmap
-        target = QRectF(x - w/2, y - h/2, w, h)
-        p.drawPixmap(target, face, QRectF(face.rect()))
-
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing, True)
-        p.fillRect(self.rect(), QColor("#070707"))
-
-        # subtle stage
-        stage = self.rect().adjusted(18, 18, -18, -18)
-        p.setPen(QPen(QColor(28, 28, 28), 1))
-        p.setBrush(QColor(9, 9, 9))
-        p.drawRoundedRect(stage, 14, 14)
-
-        if self.coins:
-            elapsed = time.perf_counter() - self._started_at if self.animating else self._duration
-            progress = min(1.0, elapsed / max(.001, self._duration))
-            content = QRectF(stage.adjusted(15, 20, -15, -20))
-            for i, coin in enumerate(self.coins):
-                self._draw_coin(p, coin, i, progress, content)
-        else:
-            cx, cy = self.width()/2, self.height()/2
-            # Charge preview coin. Shaking starts after three seconds and grows
-            # logarithmically so the amplitude keeps increasing but more slowly.
-            shake_x = shake_y = 0.0
-            held = 0.0
-            if self.charge_started_at is not None:
-                held = max(0.0, time.perf_counter() - self.charge_started_at)
-            if held > 3.0:
-                amp = 2.0 + 8.0 * math.log1p(held - 3.0)
-                t = time.perf_counter()
-                shake_x = math.sin(t * 31.0) * amp
-                shake_y = math.cos(t * 27.0) * amp * .65
-                if not self._timer.isActive():
-                    self._timer.start()
-            elif self._timer.isActive() and not self.animating:
-                self._timer.stop()
-
-            face = self.front_pixmap
-            size = min(170, max(100, min(self.width(), self.height()) * .26))
-            target = QRectF(cx-size/2+shake_x, cy-size/2+shake_y, size, size)
-            p.drawPixmap(target, face, QRectF(face.rect()))
-
-            p.setPen(QColor("#5f5f5f"))
-            p.setFont(QFont("", 10))
-            p.drawText(
-                QRectF(0, cy + size*.68, self.width(), 28),
-                Qt.AlignCenter,
-                TXT("滚轮向后蓄力 · 点击硬币释放", "Scroll down to charge · click the coin to release")
-            )
-        p.end()
 
 
 class CoinPage(QWidget):
@@ -7292,8 +7847,8 @@ class CoinPage(QWidget):
         title = QLabel(TXT("翻硬币", "Coin Flip"))
         title.setObjectName("pageTitle")
         desc = QLabel(TXT(
-            "选择正反面图像并开始翻硬币。当前提供普通模式与赚钱模式。",
-            "Choose coin-face images and start flipping. Normal and Earning modes are available."
+            "点击硬币可直接翻转；或持续向后滚动滚轮蓄力，停下片刻后自动释放。当前硬币使用立体浮雕样式。",
+            "Click the coin to flip immediately, or keep scrolling down to charge and pause briefly to auto-release. The coin currently uses a modeled embossed style."
         ))
         desc.setObjectName("pageDesc")
         text_col.addWidget(kick)
@@ -7325,12 +7880,10 @@ class CoinPage(QWidget):
         self.back_btn = QPushButton(TXT("反面 PNG", "Tails PNG"))
         self.front_btn.setObjectName("chipButton")
         self.back_btn.setObjectName("chipButton")
-        self.front_btn.clicked.connect(lambda: self._choose_face("front"))
-        self.back_btn.clicked.connect(lambda: self._choose_face("back"))
-
-        self.flip_btn = QPushButton(TXT("释放", "FLIP"))
-        self.flip_btn.setObjectName("primaryButton")
-        self.flip_btn.clicked.connect(self.release_requested)
+        self.front_btn.setEnabled(False)
+        self.back_btn.setEnabled(False)
+        self.front_btn.setToolTip(TXT("立体硬币版本暂不使用 PNG 贴图", "The modeled 3D coin does not use PNG decals yet"))
+        self.back_btn.setToolTip(TXT("立体硬币版本暂不使用 PNG 贴图", "The modeled 3D coin does not use PNG decals yet"))
 
         controls.addWidget(self.count_label)
         controls.addWidget(self.count_input)
@@ -7338,7 +7891,16 @@ class CoinPage(QWidget):
         controls.addWidget(self.front_btn)
         controls.addWidget(self.back_btn)
         controls.addStretch(1)
-        controls.addWidget(self.flip_btn)
+
+        self.collect_btn = QPushButton(TXT("整理硬币", "Collect Coins"))
+        self.collect_btn.setObjectName("collectCoinButton")
+        self.collect_btn.setMinimumSize(138, 44)
+        self.collect_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.collect_btn.setCursor(Qt.PointingHandCursor)
+        self.collect_btn.setVisible(False)
+        self.collect_btn.clicked.connect(self._collect_coins)
+        controls.addWidget(self.collect_btn)
+
         root.addLayout(controls)
 
         # Result / power strip
@@ -7358,6 +7920,10 @@ class CoinPage(QWidget):
         self.canvas = CoinFlipCanvas(self)
         self.canvas.flipFinished.connect(self._flip_finished)
         self.canvas.chargeChanged.connect(self._charge_changed)
+        self.canvas.releaseRequested.connect(self.release_requested)
+        self.canvas.collectFinished.connect(self._collection_finished)
+        self.count_input.valueChanged.connect(self.canvas.set_preview_count)
+        self.canvas.set_preview_count(self.count_input.value())
         body.addWidget(self.canvas, 1)
 
         self.earning_panel = QFrame()
@@ -7417,7 +7983,7 @@ class CoinPage(QWidget):
         root.addLayout(body, 1)
 
     def _set_mode(self, mode):
-        if self.canvas.animating:
+        if self.canvas.animating or self.canvas.collecting or self.canvas.needs_collect:
             return
         self.mode = mode
         self.mode_normal.setChecked(mode == "normal")
@@ -7431,6 +7997,7 @@ class CoinPage(QWidget):
         self.count_label.setEnabled(not earning)
         if earning:
             self.count_input.setValue(1)
+        self.canvas.set_preview_count(self.count_input.value())
         self.normal_stats.setVisible(not earning)
 
     def _find_existing_face(self, side):
@@ -7502,20 +8069,54 @@ class CoinPage(QWidget):
         else:
             self.power_label.setText(TXT(f"蓄力 {power:.1f}", f"Power {power:.1f}"))
 
+    def _collect_coins(self):
+        if not self.canvas.needs_collect or self.canvas.collecting:
+            return
+        self.collect_btn.setEnabled(False)
+        self.collect_btn.setText(TXT("整理中…", "Collecting…"))
+        self.count_input.setEnabled(False)
+        self.mode_normal.setEnabled(False)
+        self.mode_earn.setEnabled(False)
+        self.canvas.collect_coins()
+
+    def _collection_finished(self):
+        self.collect_btn.setVisible(False)
+        self.collect_btn.setEnabled(True)
+        self.collect_btn.setText(TXT("整理硬币", "Collect Coins"))
+        self.mode_normal.setEnabled(True)
+        self.mode_earn.setEnabled(True)
+        self.count_input.setEnabled(self.mode == "normal")
+        self.canvas.set_preview_count(self.count_input.value())
+        self.power_label.setText(TXT("蓄力 0.0", "Power 0.0"))
+
     def release_requested(self):
-        if self.canvas.animating:
+        if self.canvas.animating or self.canvas.collecting or self.canvas.needs_collect:
             return
         self._ensure_faces()
-        self.flip_btn.setEnabled(False)
         if self.mode == "normal":
-            self.canvas.start_flip(self.count_input.value(), 0.5)
+            self.canvas.start_flip(
+                self.count_input.value(),
+                0.5,
+                power=self.canvas.effective_power(),
+                collisions=True
+            )
         else:
-            self.canvas.start_flip(1, self._heads_probability())
+            self.canvas.start_flip(
+                1,
+                self._heads_probability(),
+                power=self.canvas.effective_power(),
+                collisions=False
+            )
 
     def _flip_finished(self, results):
-        self.flip_btn.setEnabled(True)
         heads = sum(1 for x in results if x == 1)
         tails = len(results) - heads
+
+        self.collect_btn.setVisible(True)
+        self.collect_btn.setEnabled(True)
+        self.count_input.setEnabled(False)
+        self.mode_normal.setEnabled(False)
+        self.mode_earn.setEnabled(False)
 
         if self.mode == "normal":
             self.normal_stats.setText(TXT(
@@ -7540,8 +8141,8 @@ class CoinPage(QWidget):
         self._sync_earning_ui()
 
     def _heads_probability(self):
-        # Different from Unfair Flips: starts at 25%, +5% per level, max 80%.
-        return min(.80, .25 + .05 * self.luck_level)
+        # Earning mode begins deliberately harsh at 5%; upgrades add 5% each.
+        return min(.80, .05 + .05 * self.luck_level)
 
     def _coin_value(self):
         return 1.0 + .50 * self.value_level
@@ -8131,6 +8732,42 @@ QPushButton#primaryButton {
 }
 QPushButton#primaryButton:hover { background: #ffffff; }
 QPushButton#primaryButton:pressed { background: #cfcfcf; }
+
+QPushButton#collectCoinButton {
+    color: #f4efe6;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                                stop:0 #181818,
+                                stop:0.45 #222222,
+                                stop:1 #141414);
+    border: 1px solid #4f4a40;
+    border-radius: 14px;
+    padding: 10px 18px;
+    min-width: 138px;
+    min-height: 24px;
+    font-size: 14px;
+    font-weight: 700;
+}
+QPushButton#collectCoinButton:hover {
+    color: #fff8ee;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                                stop:0 #222222,
+                                stop:0.5 #2b2b2b,
+                                stop:1 #1c1c1c);
+    border-color: #726a59;
+}
+QPushButton#collectCoinButton:pressed {
+    color: #efe7da;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                                stop:0 #111111,
+                                stop:0.55 #1b1b1b,
+                                stop:1 #101010);
+    border-color: #5e584c;
+}
+QPushButton#collectCoinButton:disabled {
+    color: #7f7a72;
+    background: #111111;
+    border-color: #2a2926;
+}
 
 QPushButton#tarotTab {
     color: #777; background: #0d0d0d; border: 1px solid #222; border-radius: 9px;
