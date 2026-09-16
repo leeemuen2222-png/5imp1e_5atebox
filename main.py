@@ -17,7 +17,7 @@ from PySide6.QtGui import QColor, QPainter, QPen, QBrush, QFont, QPainterPath, Q
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QLabel,
     QPushButton, QFrame, QButtonGroup, QStackedWidget, QSizePolicy,
-    QGraphicsDropShadowEffect, QLineEdit, QCheckBox, QComboBox, QGridLayout, QScrollArea, QBoxLayout, QProgressBar, QSlider, QFontComboBox, QSpinBox, QColorDialog, QInputDialog, QMenu, QToolTip, QDialog, QDialogButtonBox, QListWidget, QListWidgetItem, QAbstractItemView
+    QGraphicsDropShadowEffect, QLineEdit, QCheckBox, QComboBox, QGridLayout, QScrollArea, QBoxLayout, QProgressBar, QSlider, QFontComboBox, QSpinBox, QColorDialog, QInputDialog, QMenu, QToolTip, QDialog, QDialogButtonBox, QListWidget, QListWidgetItem, QAbstractItemView, QFileDialog
 )
 
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
@@ -54,7 +54,7 @@ except Exception as exc:
     JOLT_ERROR = str(exc)
 
 APP_NAME = "5imp1e 5atebox"
-APP_VERSION = "0.17.3"
+APP_VERSION = "0.18.0"
 APP_SETTINGS = {
     "language": "zh",
     "mark_back": False,
@@ -97,6 +97,9 @@ RESOURCE_DIR = BASE_DIR / "resource"
 # NOTE: when an EXE build is introduced, this path abstraction is the only place
 # that needs to change for the music library location.
 MUSIC_LIBRARY_DIR = RESOURCE_DIR / "music_lyrics"
+# Coin face PNGs currently live here. Keep this abstraction so EXE packaging can
+# redirect resources later without changing the Coin module itself.
+COIN_IMAGE_DIR = RESOURCE_DIR / "coin"
 
 
 if OPENGL_3D_AVAILABLE:
@@ -2748,6 +2751,7 @@ class SpreadChoiceCard(QFrame):
 class HomePage(QWidget):
     startTarot = Signal()
     startDice = Signal()
+    startCoin = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2774,11 +2778,12 @@ class HomePage(QWidget):
         grid.setSpacing(12)
         tarot = MethodCard(TXT("塔罗牌", "Tarot"), TXT("78 张牌 · 正位 / 逆位", "78 cards · upright / reversed"), "◇", True)
         dice = MethodCard(TXT("骰子", "Dice"), TXT("3D 骰子 · 弹跳动画", "3D die · bounce animation"), "□", True)
+        coin = MethodCard(TXT("翻硬币", "Coin Flip"), TXT("最多 200 枚 · 两种模式", "Up to 200 coins · two modes"), "○", True)
         rune = MethodCard(TXT("符文", "Runes"), TXT("开发中", "In development"), "△", False)
-        coin = MethodCard(TXT("硬币", "Coin"), TXT("开发中", "In development"), "○", False)
         tarot.clicked.connect(lambda _: self.startTarot.emit())
         dice.clicked.connect(lambda _: self.startDice.emit())
-        for card in (tarot, dice, rune, coin):
+        coin.clicked.connect(lambda _: self.startCoin.emit())
+        for card in (tarot, dice, coin, rune):
             grid.addWidget(card, 1)
         outer.addLayout(grid)
         outer.addStretch(1)
@@ -6966,6 +6971,661 @@ class MusicPage(QWidget):
 
 
 
+
+class CoinFlipCanvas(QWidget):
+    flipFinished = Signal(object)
+    chargeChanged = Signal(float, float)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(420)
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.StrongFocus)
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(16)
+        self._timer.timeout.connect(self._tick)
+
+        self.animating = False
+        self.coins = []
+        self._started_at = 0.0
+        self._duration = 1.0
+        self.charge = 0.0
+        self.charge_started_at = None
+        self._shake_clock = 0.0
+
+        self.front_pixmap = QPixmap()
+        self.back_pixmap = QPixmap()
+        self._load_default_faces()
+
+    def _load_default_faces(self):
+        self.front_pixmap = self._fallback_front()
+        self.back_pixmap = self._fallback_back()
+
+    @staticmethod
+    def _fallback_front(size=320):
+        pix = QPixmap(size, size)
+        pix.fill(Qt.transparent)
+        p = QPainter(pix)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setPen(QPen(QColor("#d9d9d9"), 8))
+        p.setBrush(QColor("#111111"))
+        p.drawEllipse(12, 12, size - 24, size - 24)
+        p.setPen(QColor("#f1f1f1"))
+        f = QFont("Georgia")
+        f.setPointSize(int(size * 0.43))
+        f.setBold(True)
+        p.setFont(f)
+        p.drawText(pix.rect(), Qt.AlignCenter, "1")
+        p.end()
+        return pix
+
+    @staticmethod
+    def _fallback_back(size=320):
+        """Monochrome outline inspired by Icelandic coin heraldry."""
+        pix = QPixmap(size, size)
+        pix.fill(Qt.transparent)
+        p = QPainter(pix)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setBrush(QColor("#111111"))
+        p.setPen(QPen(QColor("#d9d9d9"), 8))
+        p.drawEllipse(12, 12, size - 24, size - 24)
+
+        pen = QPen(QColor("#eeeeee"), 5)
+        pen.setJoinStyle(Qt.RoundJoin)
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+
+        # Central shield with a Nordic-cross outline.
+        shield = QPainterPath()
+        shield.moveTo(size * .37, size * .30)
+        shield.lineTo(size * .63, size * .30)
+        shield.lineTo(size * .61, size * .59)
+        shield.quadTo(size * .50, size * .72, size * .39, size * .59)
+        shield.closeSubpath()
+        p.drawPath(shield)
+        p.drawLine(QPointF(size*.47, size*.31), QPointF(size*.47, size*.64))
+        p.drawLine(QPointF(size*.39, size*.43), QPointF(size*.61, size*.43))
+
+        # Four simplified guardian outlines around the shield: deliberately
+        # original line art, not a copied coat-of-arms asset.
+        p.drawEllipse(QRectF(size*.18, size*.35, size*.13, size*.11))
+        p.drawLine(QPointF(size*.19, size*.40), QPointF(size*.13, size*.34))
+        p.drawLine(QPointF(size*.20, size*.37), QPointF(size*.15, size*.30))
+
+        wing = QPainterPath()
+        wing.moveTo(size*.70, size*.34)
+        wing.quadTo(size*.88, size*.25, size*.80, size*.45)
+        wing.quadTo(size*.87, size*.48, size*.70, size*.50)
+        p.drawPath(wing)
+
+        p.drawEllipse(QRectF(size*.18, size*.57, size*.11, size*.16))
+        p.drawLine(QPointF(size*.20, size*.72), QPointF(size*.14, size*.79))
+        p.drawLine(QPointF(size*.27, size*.72), QPointF(size*.32, size*.80))
+
+        serpent = QPainterPath()
+        serpent.moveTo(size*.70, size*.60)
+        serpent.cubicTo(size*.84, size*.54, size*.86, size*.70, size*.76, size*.73)
+        serpent.cubicTo(size*.69, size*.75, size*.72, size*.82, size*.83, size*.80)
+        p.drawPath(serpent)
+        p.end()
+        return pix
+
+    def set_face_paths(self, front_path=None, back_path=None):
+        def load_or_fallback(path, fallback):
+            if path:
+                pix = QPixmap(str(path))
+                if not pix.isNull():
+                    return pix
+            return fallback()
+        self.front_pixmap = load_or_fallback(front_path, self._fallback_front)
+        self.back_pixmap = load_or_fallback(back_path, self._fallback_back)
+        self.update()
+
+    def wheelEvent(self, event):
+        if self.animating:
+            event.accept()
+            return
+        delta = event.angleDelta().y()
+        if delta < 0:
+            now = time.perf_counter()
+            if self.charge_started_at is None:
+                self.charge_started_at = now
+            # No upper cap. High-resolution wheels simply add proportionally.
+            self.charge += max(0.10, abs(delta) / 120.0)
+            held = max(0.0, now - self.charge_started_at)
+            self.chargeChanged.emit(self.charge, held)
+            self.update()
+            event.accept()
+            return
+        event.ignore()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and not self.animating:
+            self.parentWidget().release_requested() if hasattr(self.parentWidget(), "release_requested") else None
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def effective_power(self):
+        if self.charge <= 0:
+            return 1.0
+        held = 0.0 if self.charge_started_at is None else max(0.0, time.perf_counter() - self.charge_started_at)
+        # Unbounded in both scroll input and time, but the time component grows gently.
+        return self.charge * (1.0 + held * 0.045)
+
+    def reset_charge(self):
+        self.charge = 0.0
+        self.charge_started_at = None
+        self.chargeChanged.emit(0.0, 0.0)
+        self.update()
+
+    def start_flip(self, count, heads_probability=0.5, power=None):
+        if self.animating:
+            return
+        count = max(1, min(200, int(count)))
+        if power is None:
+            power = self.effective_power()
+        power = max(0.05, float(power))
+
+        self.coins = []
+        cols = max(1, math.ceil(math.sqrt(count * 1.65)))
+        rows = max(1, math.ceil(count / cols))
+
+        results = []
+        for i in range(count):
+            result = 1 if random.random() < heads_probability else 0
+            results.append(result)
+            col = i % cols
+            row = i // cols
+            self.coins.append({
+                "col": col,
+                "row": row,
+                "cols": cols,
+                "rows": rows,
+                "phase": random.uniform(0, math.tau),
+                "spin": (9.0 + power * random.uniform(2.1, 3.0)) * random.choice((-1, 1)),
+                "result": result,
+                "xwave": random.uniform(.7, 1.5),
+                "ywave": random.uniform(.7, 1.4),
+                "seed": random.uniform(0, math.tau),
+            })
+
+        self._results = results
+        self._power = power
+        # More power = more revolutions. Duration grows sublinearly, never hard-capped.
+        self._duration = 0.75 + math.log1p(power) * 0.38
+        self._started_at = time.perf_counter()
+        self.animating = True
+        self._timer.start()
+        self.update()
+
+    def _tick(self):
+        if not self.animating:
+            return
+        elapsed = time.perf_counter() - self._started_at
+        if elapsed >= self._duration:
+            self.animating = False
+            self._timer.stop()
+            results = list(self._results)
+            self.reset_charge()
+            self.update()
+            self.flipFinished.emit(results)
+            return
+        self.update()
+
+    def _draw_coin(self, p, coin, index, progress, rect):
+        cols = coin["cols"]
+        rows = coin["rows"]
+        cell_w = rect.width() / max(1, cols)
+        cell_h = rect.height() / max(1, rows)
+        base_r = min(cell_w, cell_h) * 0.34
+        r = max(5.0, min(38.0, base_r))
+
+        x = rect.left() + (coin["col"] + .5) * cell_w
+        y = rect.top() + (coin["row"] + .5) * cell_h
+
+        if self.animating:
+            arc = math.sin(progress * math.pi)
+            lift = (28.0 + math.log1p(self._power) * 20.0) * arc
+            x += math.sin(progress * math.tau * coin["xwave"] + coin["seed"]) * (8 + math.log1p(self._power) * 4) * arc
+            y -= lift
+            y += math.cos(progress * math.tau * coin["ywave"] + coin["seed"]) * 4 * arc
+            angle = coin["phase"] + coin["spin"] * (time.perf_counter() - self._started_at)
+            face_scale = abs(math.cos(angle))
+            front_visible = math.cos(angle) >= 0
+        else:
+            face_scale = 1.0
+            front_visible = coin["result"] == 1
+
+        w = max(2.5, 2 * r * face_scale)
+        h = 2 * r
+        face = self.front_pixmap if front_visible else self.back_pixmap
+        target = QRectF(x - w/2, y - h/2, w, h)
+        p.drawPixmap(target, face, QRectF(face.rect()))
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.fillRect(self.rect(), QColor("#070707"))
+
+        # subtle stage
+        stage = self.rect().adjusted(18, 18, -18, -18)
+        p.setPen(QPen(QColor(28, 28, 28), 1))
+        p.setBrush(QColor(9, 9, 9))
+        p.drawRoundedRect(stage, 14, 14)
+
+        if self.coins:
+            elapsed = time.perf_counter() - self._started_at if self.animating else self._duration
+            progress = min(1.0, elapsed / max(.001, self._duration))
+            content = QRectF(stage.adjusted(15, 20, -15, -20))
+            for i, coin in enumerate(self.coins):
+                self._draw_coin(p, coin, i, progress, content)
+        else:
+            cx, cy = self.width()/2, self.height()/2
+            # Charge preview coin. Shaking starts after three seconds and grows
+            # logarithmically so the amplitude keeps increasing but more slowly.
+            shake_x = shake_y = 0.0
+            held = 0.0
+            if self.charge_started_at is not None:
+                held = max(0.0, time.perf_counter() - self.charge_started_at)
+            if held > 3.0:
+                amp = 2.0 + 8.0 * math.log1p(held - 3.0)
+                t = time.perf_counter()
+                shake_x = math.sin(t * 31.0) * amp
+                shake_y = math.cos(t * 27.0) * amp * .65
+                if not self._timer.isActive():
+                    self._timer.start()
+            elif self._timer.isActive() and not self.animating:
+                self._timer.stop()
+
+            face = self.front_pixmap
+            size = min(170, max(100, min(self.width(), self.height()) * .26))
+            target = QRectF(cx-size/2+shake_x, cy-size/2+shake_y, size, size)
+            p.drawPixmap(target, face, QRectF(face.rect()))
+
+            p.setPen(QColor("#5f5f5f"))
+            p.setFont(QFont("", 10))
+            p.drawText(
+                QRectF(0, cy + size*.68, self.width(), 28),
+                Qt.AlignCenter,
+                TXT("滚轮向后蓄力 · 点击硬币释放", "Scroll down to charge · click the coin to release")
+            )
+        p.end()
+
+
+class CoinPage(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        COIN_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+        self.settings = QSettings("5imp1e 5atebox", "Coin")
+        self.mode = "normal"
+
+        self.front_path = str(self.settings.value("front_path", "") or "")
+        self.back_path = str(self.settings.value("back_path", "") or "")
+
+        # Earning-mode progression. Inspired by Unfair Flips but intentionally
+        # simplified and mechanically distinct.
+        self.money = float(self.settings.value("earn_money", 0.0))
+        self.streak = int(self.settings.value("earn_streak", 0))
+        self.best_streak = int(self.settings.value("earn_best", 0))
+        self.luck_level = int(self.settings.value("earn_luck_level", 0))
+        self.value_level = int(self.settings.value("earn_value_level", 0))
+        self.combo_level = int(self.settings.value("earn_combo_level", 0))
+
+        self._build_ui()
+        self.canvas.set_face_paths(self.front_path or None, self.back_path or None)
+        self._sync_mode()
+        self._sync_earning_ui()
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(34, 22, 34, 22)
+        root.setSpacing(10)
+
+        header = QHBoxLayout()
+        text_col = QVBoxLayout()
+        text_col.setSpacing(3)
+        kick = QLabel("COIN / PHYSICAL FLIP")
+        kick.setObjectName("kicker")
+        title = QLabel(TXT("翻硬币", "Coin Flip"))
+        title.setObjectName("pageTitle")
+        desc = QLabel(TXT(
+            "选择正反面图像并开始翻硬币。当前提供普通模式与赚钱模式。",
+            "Choose coin-face images and start flipping. Normal and Earning modes are available."
+        ))
+        desc.setObjectName("pageDesc")
+        text_col.addWidget(kick)
+        text_col.addWidget(title)
+        text_col.addWidget(desc)
+        header.addLayout(text_col, 1)
+
+        self.mode_normal = QPushButton(TXT("普通", "Normal"))
+        self.mode_earn = QPushButton(TXT("赚钱", "Earning"))
+        for b in (self.mode_normal, self.mode_earn):
+            b.setCheckable(True)
+            b.setObjectName("chipButton")
+            header.addWidget(b)
+        self.mode_normal.setChecked(True)
+        self.mode_normal.clicked.connect(lambda: self._set_mode("normal"))
+        self.mode_earn.clicked.connect(lambda: self._set_mode("earning"))
+        root.addLayout(header)
+
+        controls = QHBoxLayout()
+        controls.setSpacing(8)
+
+        self.count_label = QLabel(TXT("硬币数量", "Coins"))
+        self.count_input = QSpinBox()
+        self.count_input.setRange(1, 200)
+        self.count_input.setValue(1)
+        self.count_input.setFixedWidth(74)
+
+        self.front_btn = QPushButton(TXT("正面 PNG", "Heads PNG"))
+        self.back_btn = QPushButton(TXT("反面 PNG", "Tails PNG"))
+        self.front_btn.setObjectName("chipButton")
+        self.back_btn.setObjectName("chipButton")
+        self.front_btn.clicked.connect(lambda: self._choose_face("front"))
+        self.back_btn.clicked.connect(lambda: self._choose_face("back"))
+
+        self.flip_btn = QPushButton(TXT("释放", "FLIP"))
+        self.flip_btn.setObjectName("primaryButton")
+        self.flip_btn.clicked.connect(self.release_requested)
+
+        controls.addWidget(self.count_label)
+        controls.addWidget(self.count_input)
+        controls.addSpacing(8)
+        controls.addWidget(self.front_btn)
+        controls.addWidget(self.back_btn)
+        controls.addStretch(1)
+        controls.addWidget(self.flip_btn)
+        root.addLayout(controls)
+
+        # Result / power strip
+        strip = QHBoxLayout()
+        self.power_label = QLabel(TXT("蓄力 0.0", "Power 0.0"))
+        self.power_label.setObjectName("statusText")
+        self.normal_stats = QLabel(TXT("正面 0 · 反面 0", "Heads 0 · Tails 0"))
+        self.normal_stats.setObjectName("statusText")
+        strip.addWidget(self.power_label)
+        strip.addStretch(1)
+        strip.addWidget(self.normal_stats)
+        root.addLayout(strip)
+
+        body = QHBoxLayout()
+        body.setSpacing(12)
+
+        self.canvas = CoinFlipCanvas(self)
+        self.canvas.flipFinished.connect(self._flip_finished)
+        self.canvas.chargeChanged.connect(self._charge_changed)
+        body.addWidget(self.canvas, 1)
+
+        self.earning_panel = QFrame()
+        self.earning_panel.setFixedWidth(290)
+        self.earning_panel.setObjectName("configPanel")
+        ep = QVBoxLayout(self.earning_panel)
+        ep.setContentsMargins(14, 14, 14, 14)
+        ep.setSpacing(9)
+
+        earn_title = QLabel(TXT("赚钱模式", "EARNING MODE"))
+        earn_title.setObjectName("settingCategory")
+        ep.addWidget(earn_title)
+
+        self.money_label = QLabel()
+        self.money_label.setStyleSheet("font-size:24px; font-weight:800;")
+        ep.addWidget(self.money_label)
+
+        self.earn_stats = QLabel()
+        self.earn_stats.setWordWrap(True)
+        self.earn_stats.setObjectName("statusText")
+        ep.addWidget(self.earn_stats)
+
+        ep.addSpacing(6)
+        up_title = QLabel(TXT("基础升级", "Basic upgrades"))
+        up_title.setStyleSheet("font-weight:700;")
+        ep.addWidget(up_title)
+
+        self.luck_btn = QPushButton()
+        self.value_btn = QPushButton()
+        self.combo_btn = QPushButton()
+        for b in (self.luck_btn, self.value_btn, self.combo_btn):
+            b.setObjectName("chipButton")
+            b.setMinimumHeight(38)
+            ep.addWidget(b)
+
+        self.luck_btn.clicked.connect(lambda: self._buy_upgrade("luck"))
+        self.value_btn.clicked.connect(lambda: self._buy_upgrade("value"))
+        self.combo_btn.clicked.connect(lambda: self._buy_upgrade("combo"))
+
+        self.reset_earn_btn = QPushButton(TXT("重置赚钱进度", "Reset earning progress"))
+        self.reset_earn_btn.setObjectName("chipButton")
+        self.reset_earn_btn.clicked.connect(self._reset_earning)
+        ep.addWidget(self.reset_earn_btn)
+        ep.addStretch(1)
+
+        credit = QLabel(
+            TXT(
+                "玩法灵感：Unfair Flips — HEATHER FLOWERS\n本模式使用原创界面、数值与规则变体。",
+                "Gameplay inspiration: Unfair Flips — HEATHER FLOWERS\nThis mode uses original UI, tuning, and rule variations."
+            )
+        )
+        credit.setWordWrap(True)
+        credit.setStyleSheet("font-size:10px; color:#565656;")
+        ep.addWidget(credit)
+
+        body.addWidget(self.earning_panel)
+        root.addLayout(body, 1)
+
+    def _set_mode(self, mode):
+        if self.canvas.animating:
+            return
+        self.mode = mode
+        self.mode_normal.setChecked(mode == "normal")
+        self.mode_earn.setChecked(mode == "earning")
+        self._sync_mode()
+
+    def _sync_mode(self):
+        earning = self.mode == "earning"
+        self.earning_panel.setVisible(earning)
+        self.count_input.setEnabled(not earning)
+        self.count_label.setEnabled(not earning)
+        if earning:
+            self.count_input.setValue(1)
+        self.normal_stats.setVisible(not earning)
+
+    def _find_existing_face(self, side):
+        candidates = []
+        roots = [
+            COIN_IMAGE_DIR,
+            RESOURCE_DIR / "coins",
+            RESOURCE_DIR / "coin_faces",
+            RESOURCE_DIR / "coin_flip",
+        ]
+        names = (
+            ["heads.png", "head.png", "front.png", "obverse.png", "正面.png"]
+            if side == "front"
+            else ["tails.png", "tail.png", "back.png", "reverse.png", "反面.png"]
+        )
+        for root in roots:
+            for name in names:
+                p = root / name
+                if p.exists():
+                    return p
+            if root.exists():
+                candidates.extend(sorted(root.glob("*.png")))
+        if len(candidates) >= 2:
+            return candidates[0] if side == "front" else candidates[1]
+        return None
+
+    def _choose_face(self, side):
+        start = str(COIN_IMAGE_DIR)
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            TXT("选择硬币 PNG", "Choose coin PNG"),
+            start,
+            "PNG (*.png)"
+        )
+        if not path:
+            return
+        # Copy selected art into the project resource folder so the development
+        # build does not depend on arbitrary external file locations.
+        target = COIN_IMAGE_DIR / ("heads.png" if side == "front" else "tails.png")
+        try:
+            shutil.copy2(path, target)
+            path = str(target)
+        except Exception:
+            pass
+        if side == "front":
+            self.front_path = path
+            self.settings.setValue("front_path", path)
+        else:
+            self.back_path = path
+            self.settings.setValue("back_path", path)
+        self.canvas.set_face_paths(self.front_path or None, self.back_path or None)
+
+    def _ensure_faces(self):
+        if not self.front_path or not Path(self.front_path).exists():
+            p = self._find_existing_face("front")
+            self.front_path = str(p) if p else ""
+        if not self.back_path or not Path(self.back_path).exists():
+            p = self._find_existing_face("back")
+            self.back_path = str(p) if p else ""
+        self.canvas.set_face_paths(self.front_path or None, self.back_path or None)
+
+    def _charge_changed(self, charge, held):
+        power = self.canvas.effective_power()
+        if held > 3.0:
+            self.power_label.setText(TXT(
+                f"蓄力 {power:.1f} · 手抖 {held-3.0:.1f}s",
+                f"Power {power:.1f} · shake {held-3.0:.1f}s"
+            ))
+        else:
+            self.power_label.setText(TXT(f"蓄力 {power:.1f}", f"Power {power:.1f}"))
+
+    def release_requested(self):
+        if self.canvas.animating:
+            return
+        self._ensure_faces()
+        self.flip_btn.setEnabled(False)
+        if self.mode == "normal":
+            self.canvas.start_flip(self.count_input.value(), 0.5)
+        else:
+            self.canvas.start_flip(1, self._heads_probability())
+
+    def _flip_finished(self, results):
+        self.flip_btn.setEnabled(True)
+        heads = sum(1 for x in results if x == 1)
+        tails = len(results) - heads
+
+        if self.mode == "normal":
+            self.normal_stats.setText(TXT(
+                f"正面 {heads} · 反面 {tails}",
+                f"Heads {heads} · Tails {tails}"
+            ))
+            return
+
+        # Earning mode: single-coin outcome.
+        if heads:
+            self.streak += 1
+            self.best_streak = max(self.best_streak, self.streak)
+            base = self._coin_value()
+            multiplier = 1.0 + max(0, self.streak - 1) * self._combo_bonus()
+            self.money += base * multiplier
+            if self.streak >= 8:
+                self.money += 25.0
+                self.streak = 0
+        else:
+            self.streak = 0
+        self._save_earning()
+        self._sync_earning_ui()
+
+    def _heads_probability(self):
+        # Different from Unfair Flips: starts at 25%, +5% per level, max 80%.
+        return min(.80, .25 + .05 * self.luck_level)
+
+    def _coin_value(self):
+        return 1.0 + .50 * self.value_level
+
+    def _combo_bonus(self):
+        return .15 + .10 * self.combo_level
+
+    def _upgrade_cost(self, kind):
+        level = {
+            "luck": self.luck_level,
+            "value": self.value_level,
+            "combo": self.combo_level,
+        }[kind]
+        base = {"luck": 4.0, "value": 3.0, "combo": 5.0}[kind]
+        return base * (1.75 ** level)
+
+    def _buy_upgrade(self, kind):
+        cost = self._upgrade_cost(kind)
+        if self.money + 1e-9 < cost:
+            return
+        if kind == "luck" and self._heads_probability() >= .80:
+            return
+        self.money -= cost
+        if kind == "luck":
+            self.luck_level += 1
+        elif kind == "value":
+            self.value_level += 1
+        else:
+            self.combo_level += 1
+        self._save_earning()
+        self._sync_earning_ui()
+
+    def _save_earning(self):
+        self.settings.setValue("earn_money", self.money)
+        self.settings.setValue("earn_streak", self.streak)
+        self.settings.setValue("earn_best", self.best_streak)
+        self.settings.setValue("earn_luck_level", self.luck_level)
+        self.settings.setValue("earn_value_level", self.value_level)
+        self.settings.setValue("earn_combo_level", self.combo_level)
+
+    def _reset_earning(self):
+        self.money = 0.0
+        self.streak = 0
+        self.best_streak = 0
+        self.luck_level = 0
+        self.value_level = 0
+        self.combo_level = 0
+        self._save_earning()
+        self._sync_earning_ui()
+
+    def _sync_earning_ui(self):
+        self.money_label.setText(f"${self.money:,.2f}")
+        self.earn_stats.setText(TXT(
+            f"正面概率 {self._heads_probability()*100:.0f}%\n"
+            f"当前连胜 {self.streak}/8 · 最佳 {self.best_streak}\n"
+            f"硬币价值 ${self._coin_value():.2f} · 连胜加成 +{self._combo_bonus():.2f}×/次",
+            f"Heads chance {self._heads_probability()*100:.0f}%\n"
+            f"Current streak {self.streak}/8 · best {self.best_streak}\n"
+            f"Coin value ${self._coin_value():.2f} · streak bonus +{self._combo_bonus():.2f}×/head"
+        ))
+
+        luck_cost = self._upgrade_cost("luck")
+        value_cost = self._upgrade_cost("value")
+        combo_cost = self._upgrade_cost("combo")
+        luck_max = self._heads_probability() >= .80
+
+        self.luck_btn.setText(TXT(
+            "偏向正面：已满级" if luck_max else f"偏向正面 +5%   ${luck_cost:.2f}",
+            "Heads bias: MAX" if luck_max else f"Heads bias +5%   ${luck_cost:.2f}"
+        ))
+        self.luck_btn.setEnabled(not luck_max and self.money >= luck_cost)
+        self.value_btn.setText(TXT(
+            f"硬币价值 +$0.50   ${value_cost:.2f}",
+            f"Coin value +$0.50   ${value_cost:.2f}"
+        ))
+        self.value_btn.setEnabled(self.money >= value_cost)
+        self.combo_btn.setText(TXT(
+            f"连胜倍率 +0.10×   ${combo_cost:.2f}",
+            f"Streak bonus +0.10×   ${combo_cost:.2f}"
+        ))
+        self.combo_btn.setEnabled(self.money >= combo_cost)
+
+
+
 class PlaceholderPage(QWidget):
     def __init__(self, title, parent=None):
         super().__init__(parent)
@@ -7027,8 +7687,8 @@ class MainWindow(QMainWindow):
             (TXT("首页", "Home"), "⌂"),
             (TXT("塔罗牌", "Tarot"), "◇"),
             (TXT("骰子", "Dice"), "□"),
+            (TXT("翻硬币", "Coin Flip"), "○"),
             (TXT("符文", "Runes"), "△"),
-            (TXT("硬币", "Coin"), "○"),
             (TXT("抽签", "Lots"), "│"),
         ]
         self.nav_buttons = []
@@ -7096,12 +7756,14 @@ class MainWindow(QMainWindow):
         self.tarot = TarotPage()
         self.home.startTarot.connect(lambda: self._navigate(1))
         self.home.startDice.connect(lambda: self._navigate(2))
+        self.home.startCoin.connect(lambda: self._navigate(3))
         self.stack.addWidget(self.home)
         self.stack.addWidget(self.tarot)
         self.dice = DicePage()
         self.stack.addWidget(self.dice)
+        self.coin_page = CoinPage()
+        self.stack.addWidget(self.coin_page)
         self.stack.addWidget(PlaceholderPage(TXT("符文", "Runes")))
-        self.stack.addWidget(PlaceholderPage(TXT("硬币", "Coin")))
         self.stack.addWidget(PlaceholderPage(TXT("抽签", "Lots")))
         self.stack.addWidget(PlaceholderPage(TXT("卡牌游戏", "Card Games")))
         self.music_page = MusicPage()
@@ -7201,8 +7863,8 @@ class MainWindow(QMainWindow):
             TXT("首页", "Home"),
             TXT("塔罗牌", "Tarot"),
             TXT("骰子", "Dice"),
+            TXT("翻硬币", "Coin Flip"),
             TXT("符文", "Runes"),
-            TXT("硬币", "Coin"),
             TXT("抽签", "Lots"),
             TXT("卡牌游戏", "Card Games"),
             TXT("听点音乐？", "Listen to some music?"),
