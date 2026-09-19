@@ -54,7 +54,7 @@ except Exception as exc:
     JOLT_ERROR = str(exc)
 
 APP_NAME = "5imp1e 5atebox"
-APP_VERSION = "0.26.4"
+APP_VERSION = "0.26.6"
 APP_SETTINGS = {
     "language": "zh",
     "mark_back": False,
@@ -5751,6 +5751,80 @@ class MusicTrackRow(QFrame):
         super().mousePressEvent(event)
 
 
+class MusicAlbumHeader(QFrame):
+    """Visual header for a group of tracks sharing the same album metadata."""
+
+    def __init__(self, album_name, tracks, cover_pixmap, parent=None):
+        super().__init__(parent)
+        self.setObjectName("musicAlbumHeader")
+        self.setStyleSheet("""
+            QFrame#musicAlbumHeader {
+                background: rgba(255,255,255,0.030);
+                border: 1px solid rgba(255,255,255,0.055);
+                border-radius: 10px;
+                margin-top: 8px;
+            }
+        """)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(8, 8, 10, 8)
+        lay.setSpacing(10)
+
+        cover = QLabel()
+        cover.setFixedSize(56, 56)
+        cover.setPixmap(
+            cover_pixmap.scaled(
+                56, 56,
+                Qt.KeepAspectRatioByExpanding,
+                Qt.SmoothTransformation
+            )
+        )
+        cover.setStyleSheet("border-radius: 7px;")
+        lay.addWidget(cover)
+
+        words = QVBoxLayout()
+        words.setContentsMargins(0, 0, 0, 0)
+        words.setSpacing(2)
+
+        title = QLabel(str(album_name))
+        title.setStyleSheet(
+            "font-size: 14px; font-weight: 700; color: #eeeeee;"
+        )
+        title.setWordWrap(True)
+        words.addWidget(title)
+
+        artists = []
+        for track in tracks:
+            artist = str(track.get("artist", "") or "").strip()
+            if artist and artist not in artists:
+                artists.append(artist)
+
+        if len(artists) == 1:
+            detail = TXT(
+                f"{artists[0]} · {len(tracks)} 首",
+                f"{artists[0]} · {len(tracks)} tracks"
+            )
+        elif artists:
+            detail = TXT(
+                f"{len(tracks)} 首 · 多位艺术家",
+                f"{len(tracks)} tracks · Various Artists"
+            )
+        else:
+            detail = TXT(
+                f"{len(tracks)} 首",
+                f"{len(tracks)} tracks"
+            )
+
+        subtitle = QLabel(detail)
+        subtitle.setStyleSheet(
+            "font-size: 11px; color: #858585;"
+        )
+        words.addWidget(subtitle)
+        words.addStretch(1)
+
+        lay.addLayout(words, 1)
+
+
 class DesktopLyricsWindow(QWidget):
     def __init__(self, parent=None):
         super().__init__(None)
@@ -5950,7 +6024,14 @@ class MusicPage(QWidget):
             for x in self.library_state.get("custom_categories", [])
             if str(x).strip()
         }
-        self.batch_add_btn.setVisible(self.active_category in custom_categories)
+        is_custom = self.active_category in custom_categories
+        self.batch_add_btn.setVisible(is_custom)
+
+        # Built-in views (All Songs / Favorites / Uncategorized) are protected.
+        # Only user-created playlists/categories may be deleted.
+        if hasattr(self, "delete_category_btn"):
+            self.delete_category_btn.setVisible(is_custom)
+            self.delete_category_btn.setEnabled(is_custom)
 
     def _batch_add_to_active_category(self):
         """Assign multiple tracks to the currently selected custom category."""
@@ -6075,6 +6156,69 @@ class MusicPage(QWidget):
             cats.append(name)
             self._save_library_state()
         self.active_category = name
+        self._rebuild_category_combo()
+        self._rebuild_playlist()
+
+    def _delete_active_category(self):
+        custom_categories = [
+            str(x).strip()
+            for x in self.library_state.get("custom_categories", [])
+            if str(x).strip()
+        ]
+        category = str(self.active_category or "").strip()
+        if category not in custom_categories:
+            return
+
+        member_count = sum(
+            1
+            for track in self.tracks
+            if str(track.get("category", "")) == category
+        )
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle(TXT("删除歌单", "Delete Playlist"))
+        box.setText(TXT(
+            f"确定删除歌单「{category}」吗？",
+            f"Delete playlist “{category}”?"
+        ))
+        box.setInformativeText(TXT(
+            f"其中的 {member_count} 首歌曲不会从电脑中删除，只会回到“未分类”。此操作无法撤销。",
+            f"The {member_count} track(s) will not be deleted from your computer; they will return to Uncategorized. This cannot be undone."
+        ))
+
+        delete_btn = box.addButton(
+            TXT("删除", "Delete"),
+            QMessageBox.DestructiveRole
+        )
+        box.addButton(
+            TXT("取消", "Cancel"),
+            QMessageBox.RejectRole
+        )
+        box.exec()
+
+        if box.clickedButton() is not delete_btn:
+            return
+
+        # Remove the category definition.
+        self.library_state["custom_categories"] = [
+            name for name in custom_categories
+            if name != category
+        ]
+
+        # Remove all track -> category assignments pointing at it.
+        categories = self.library_state.setdefault("categories", {})
+        for key in list(categories.keys()):
+            if str(categories.get(key, "")) == category:
+                categories.pop(key, None)
+
+        # Keep the in-memory track objects in sync immediately.
+        for track in self.tracks:
+            if str(track.get("category", "")) == category:
+                track["category"] = ""
+
+        self.active_category = "__all__"
+        self._save_library_state()
         self._rebuild_category_combo()
         self._rebuild_playlist()
 
@@ -6236,6 +6380,31 @@ class MusicPage(QWidget):
         self.batch_add_btn.clicked.connect(self._batch_add_to_active_category)
         self.batch_add_btn.hide()
         playlist_head.addWidget(self.batch_add_btn)
+
+        self.delete_category_btn = QPushButton("−")
+        self.delete_category_btn.setFixedSize(30, 28)
+        self.delete_category_btn.setObjectName("chipButton")
+        self.delete_category_btn.setToolTip(
+            TXT("删除当前歌单 / 分类", "Delete Current Playlist / Category")
+        )
+        self.delete_category_btn.setStyleSheet(
+            """
+            QPushButton {
+                font-size: 18px;
+                font-weight: 700;
+                padding: 0;
+            }
+            QPushButton:hover {
+                background: #2a1212;
+                border-color: #5c2525;
+            }
+            """
+        )
+        self.delete_category_btn.clicked.connect(
+            self._delete_active_category
+        )
+        self.delete_category_btn.hide()
+        playlist_head.addWidget(self.delete_category_btn)
 
         ll.addLayout(playlist_head)
         self._rebuild_category_combo()
@@ -6714,6 +6883,52 @@ class MusicPage(QWidget):
         if self.current_index < 0 and self.tracks:
             self.select_track(0)
 
+    @staticmethod
+    def _album_key(track):
+        # Album grouping is intentionally based on the Album metadata field, as
+        # requested. Whitespace/case differences are normalized.
+        album = str(track.get("album", "") or "").strip()
+        if not album:
+            return ""
+        return " ".join(album.split()).casefold()
+
+    @staticmethod
+    def _album_track_order(track):
+        """Return a stable sortable key from common track-number metadata.
+
+        Handles values such as: 1, 01, 3/12, "Track 4", A1, or missing data.
+        Tracks without a usable number are placed after numbered tracks while
+        retaining their original library order through the caller's index.
+        """
+        raw = str(track.get("track", "") or "").strip()
+        if not raw:
+            return (1, 10**9, raw.casefold())
+
+        # Prefer the first integer because common tags are "3/12".
+        m = re.search(r"\d+", raw)
+        if m:
+            try:
+                return (0, int(m.group(0)), raw.casefold())
+            except Exception:
+                pass
+
+        return (1, 10**9, raw.casefold())
+
+    def _track_visible_in_active_category(self, track):
+        category = track.get("category", "")
+        favorite = bool(track.get("favorite", False))
+
+        if self.active_category == "__favorites__" and not favorite:
+            return False
+        if self.active_category == "__uncategorized__" and category:
+            return False
+        if self.active_category not in (
+            "__all__", "__favorites__", "__uncategorized__"
+        ):
+            if category != self.active_category:
+                return False
+        return True
+
     def _rebuild_playlist(self):
         while self.playlist_layout.count() > 1:
             item = self.playlist_layout.takeAt(0)
@@ -6721,31 +6936,113 @@ class MusicPage(QWidget):
             if w is not None:
                 w.deleteLater()
 
+        visible = [
+            (i, track)
+            for i, track in enumerate(self.tracks)
+            if self._track_visible_in_active_category(track)
+        ]
+
+        # Gather visible tracks by normalized album metadata.
+        album_members = {}
+        for i, track in visible:
+            key = self._album_key(track)
+            if key:
+                album_members.setdefault(key, []).append((i, track))
+
+        # Only albums with at least two visible tracks become visual groups.
+        grouped_keys = {
+            key
+            for key, members in album_members.items()
+            if len(members) >= 2
+        }
+
+        # Preserve the natural library order for groups/singles. The first visible
+        # member determines where an album appears in the list.
+        rendered_album_keys = set()
         shown = 0
-        for i, track in enumerate(self.tracks):
-            category = track.get("category", "")
-            favorite = bool(track.get("favorite", False))
 
-            if self.active_category == "__favorites__" and not favorite:
-                continue
-            if self.active_category == "__uncategorized__" and category:
-                continue
-            if self.active_category not in ("__all__", "__favorites__", "__uncategorized__"):
-                if category != self.active_category:
+        for i, track in visible:
+            album_key = self._album_key(track)
+
+            if album_key in grouped_keys:
+                if album_key in rendered_album_keys:
                     continue
+                rendered_album_keys.add(album_key)
 
-            row = MusicTrackRow(i, track, self._pixmap_for_track(track, 64))
+                members = list(album_members[album_key])
+                members.sort(
+                    key=lambda pair: (
+                        self._album_track_order(pair[1]),
+                        pair[0],
+                    )
+                )
+
+                # "First song" means the first song after album-track sorting.
+                first_index, first_track = members[0]
+                album_name = str(
+                    first_track.get("album", "") or ""
+                ).strip()
+
+                header = MusicAlbumHeader(
+                    album_name,
+                    [member_track for _, member_track in members],
+                    self._pixmap_for_track(first_track, 80),
+                )
+                self.playlist_layout.insertWidget(
+                    self.playlist_layout.count() - 1,
+                    header
+                )
+
+                for member_index, member_track in members:
+                    row = MusicTrackRow(
+                        member_index,
+                        member_track,
+                        self._pixmap_for_track(member_track, 64)
+                    )
+                    row.setContentsMargins(10, 0, 0, 0)
+                    row.clicked.connect(self.select_track)
+                    row.favoriteToggled.connect(self._set_track_favorite)
+                    row.categoryRequested.connect(
+                        self._set_track_category_dialog
+                    )
+                    self.playlist_layout.insertWidget(
+                        self.playlist_layout.count() - 1,
+                        row
+                    )
+                    shown += 1
+                continue
+
+            # Albumless songs and albums represented by only one visible track
+            # remain normal standalone rows.
+            row = MusicTrackRow(
+                i,
+                track,
+                self._pixmap_for_track(track, 64)
+            )
             row.clicked.connect(self.select_track)
             row.favoriteToggled.connect(self._set_track_favorite)
             row.categoryRequested.connect(self._set_track_category_dialog)
-            self.playlist_layout.insertWidget(self.playlist_layout.count() - 1, row)
+            self.playlist_layout.insertWidget(
+                self.playlist_layout.count() - 1,
+                row
+            )
             shown += 1
 
         if shown == 0:
-            empty = QLabel(TXT("这个分类里还没有歌曲", "No tracks in this category"))
+            empty = QLabel(
+                TXT(
+                    "这个分类里还没有歌曲",
+                    "No tracks in this category"
+                )
+            )
             empty.setAlignment(Qt.AlignCenter)
-            empty.setStyleSheet("color:#606060; padding:24px 4px; border:0;")
-            self.playlist_layout.insertWidget(self.playlist_layout.count() - 1, empty)
+            empty.setStyleSheet(
+                "color:#606060; padding:24px 4px; border:0;"
+            )
+            self.playlist_layout.insertWidget(
+                self.playlist_layout.count() - 1,
+                empty
+            )
 
 
     def _sync_hero_favorite(self):
